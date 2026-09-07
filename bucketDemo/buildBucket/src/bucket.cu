@@ -2217,7 +2217,13 @@ struct ChunkedKnnAccumulator {
 
     // 每轮结束后调用一次: 对每个 chunk 做"读 running -> 顺序扫这一轮 arrival
     // 文件逐条就地合并 -> 写回 running"，chunk 之间用 OpenMP 并行。
+    //
+    // 每个点确定性地产生: 读 arrival 记录(record_bytes) + 写 running(2*M*4B)
+    // + (iter>0 时还要) 读 running(2*M*4B)。这个量是精确算出来的，不是估计
+    // 的——所以下面打印的 GB/s 就是这一步磁盘读写的真实吞吐，可以直接用来判断
+    // merge 这一段是不是被磁盘带宽/IOPS 卡住了。
     void merge_iteration(int iter) {
+        auto t_merge_start = std::chrono::high_resolution_clock::now();
         size_t rec_bytes = record_bytes(M);
         #pragma omp parallel num_threads(merge_parallelism)
         {
@@ -2290,6 +2296,16 @@ struct ChunkedKnnAccumulator {
                     throw std::runtime_error("ChunkedKnnAccumulator: write failed for running chunk " + std::to_string(c));
             }
         }
+
+        double secs = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - t_merge_start).count();
+        // 每点: 读 arrival 记录 + 写 running(nbrs+dists); iter>0 时还要读 running
+        size_t running_rw_bytes = static_cast<size_t>(M) * sizeof(int32_t) * 2;  // nbrs+dists 各 M*4B
+        size_t per_point_bytes = rec_bytes + running_rw_bytes + (iter > 0 ? running_rw_bytes : 0);
+        double total_gb = static_cast<double>(N) * static_cast<double>(per_point_bytes) / 1e9;
+        std::cout << "[ChunkedKNN] merge_iteration(iter=" << iter << "): "
+                  << total_gb << " GB moved in " << secs << "s => "
+                  << (total_gb / std::max(1e-9, secs)) << " GB/s\n";
     }
 
     // 全部 iteration 跑完后调用一次: 按 chunk 顺序把 running_chunk_* 顺序拼
