@@ -2053,119 +2053,287 @@ static inline void launch_extract_topM(
 #undef LAUNCH_KOUT
 }
 
-// ============== Disk-backed running per-vector KNN (row read-merge-write) ==============
+// ============== Chunked disk-backed running per-vector KNN ==============
 //
-// running_vector_knn/dists 不再是常驻内存的 (N, M) 数组。build_vector_knn_with_
-// tensorcore 每算完一个 bucket 的结果，就对该 bucket 里的每个点：读它在磁盘上
-// 现有的一行 -> 跟这一轮新算出来的候选合并去重 -> 写回同一行。文件在第一轮开始
-// 前用 sentinel (-1 / +inf) 填满，所以"这个点还没有旧结果"不需要特殊处理——
-// 跟全 sentinel 的一行合并，等价于直接取新候选，第 0 轮和后续轮走同一条代码路径。
+// 把 [0, N) 切成若干个固定大小、连续的 id 区间 (chunk)。Step 6 阶段每个点
+// 算出的 M 个候选，按 (gid / chunk_size) 路由到对应 chunk 的内存 write buffer
+// 里 (只按到达顺序追加，不要求有序)；buffer 攒满就整块顺序 flush 到这一轮专属
+// 的 chunk 文件 (chunk_<c>_iter<t>.bin)——全程只有顺序追加写，没有随机 seek。
 //
-// 代价：原来跨 iteration 的合并是整体一次性、且用 std::async 跟下一轮 GPU 计算
-// 重叠；现在合并变成了每个 bucket 结束时同步做的小块磁盘 I/O（读+写各 M*8 字节/
-// 点），发生在 scatter_pending 里，不再和"下一轮"重叠，而是跟同一轮里其他 bucket
-// 的 GPU 计算竞争 CPU 时间。多数情况下这点 I/O 应该远小于 GEMM+topM 的耗时、能被
-// 现有的 double-buffer 流水线掩盖掉，但如果磁盘慢（非 NVMe）或 bucket 很小、M 很
-// 大，可能会看到吞吐下降——这是用内存换来的一个真实的性能取舍，如果 profiling
-// 发现这里成为瓶颈，可以再把每个 bucket 的 merge 扔进后台线程池重新做重叠。
-struct RunningKnnFile {
-    std::fstream neighbors_f;
-    std::fstream dists_f;
-    int M = 0;
+// 每轮 iteration 结束后 (merge_iteration)：对每个 chunk，把磁盘上已有的
+// running 结果 (running_chunk_<c>_{nbrs,dists}.bin，是前面所有轮合并去重后
+// 的状态) 整块顺序读进内存；再顺序扫一遍这一轮的 arrival-order 文件，每条
+// 记录按 (gid - chunk_start) 算出的位置，跟 running 里对应位置的 M 个候选就
+// 地合并去重、取 top-M；最后把更新后的 running 整块顺序写回磁盘，删掉这一轮
+// 的 arrival 文件。第 0 轮没有已有的 running，直接当成全 sentinel (-1/+inf)
+// 处理，走同一条合并逻辑。不同 chunk 相互独立，用 OpenMP 并行处理。
+//
+// 内存峰值只跟 chunk_size 有关 (running 的两个 dense 数组，各 chunk_size*M*
+// 4 字节)，与 N 无关——只要 chunk_size 选得够小，数据集多大都不会撑爆内存；
+// 用磁盘换内存的同时，全程没有随机 I/O。
+struct ChunkedKnnAccumulator {
+    std::string dir;
+    int64_t N = 0;
+    int     M = 0;
+    int64_t chunk_size = 1;
+    int64_t num_chunks = 1;
+    int     merge_parallelism = 1;
 
-    static constexpr size_t header_bytes() { return sizeof(int64_t) + sizeof(int32_t); }
+    static constexpr size_t record_bytes(int M) {
+        return sizeof(int64_t) + static_cast<size_t>(M) * (sizeof(int32_t) + sizeof(float));
+    }
 
-    // 建文件 + 写 header + 分块用 sentinel 填满 body（只在第 0 轮之前调用一次）。
-    static RunningKnnFile create(const std::string& knn_path, const std::string& dist_path,
-                                 int64_t N, int M, size_t chunk_bytes_budget) {
-        RunningKnnFile f;
-        f.M = M;
-        int32_t M32 = static_cast<int32_t>(M);
+    struct ChunkBuf {
+        std::vector<char> data;     // capacity_records * record_bytes(M)
+        size_t capacity_records = 0;
+        size_t count = 0;
+        std::ofstream file;
+    };
+    std::vector<ChunkBuf> bufs;
 
-        for (const auto& path : {knn_path, dist_path}) {
-            std::ofstream out(path, std::ios::binary | std::ios::trunc);
-            if (!out.is_open()) throw std::runtime_error("RunningKnnFile: cannot create " + path);
-            out.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
-            out.write(reinterpret_cast<const char*>(&M32), sizeof(int32_t));
+    static std::string iter_path(const std::string& dir, int64_t c, int iter) {
+        return dir + "/chunk_" + std::to_string(c) + "_iter" + std::to_string(iter) + ".bin";
+    }
+    static std::string running_nbrs_path(const std::string& dir, int64_t c) {
+        return dir + "/running_chunk_" + std::to_string(c) + "_nbrs.bin";
+    }
+    static std::string running_dists_path(const std::string& dir, int64_t c) {
+        return dir + "/running_chunk_" + std::to_string(c) + "_dists.bin";
+    }
+
+    // dir 必须已存在 (调用方负责创建); cpu_mem_budget_bytes 用来限制 merge
+    // 阶段并行处理多少个 chunk (每个 chunk 需要 chunk_size*M*4B*2 常驻内存)。
+    static ChunkedKnnAccumulator create(const std::string& dir, int64_t N, int M,
+                                        size_t cpu_mem_budget_bytes) {
+        ChunkedKnnAccumulator acc;
+        acc.dir = dir;
+        acc.N = N;
+        acc.M = M;
+
+        // chunk 数量目标 ~500k 点/chunk，但不超过 512 个 (同时打开的文件句柄
+        // 数上限，避免撞 ulimit -n)；N 很大时 chunk_size 会自动放大来满足这
+        // 个上限。
+        constexpr int64_t kTargetChunkPoints = 500000;
+        constexpr int64_t kMaxOpenChunks = 512;
+        int64_t n_by_target = std::max<int64_t>(1, (N + kTargetChunkPoints - 1) / kTargetChunkPoints);
+        acc.num_chunks = std::min(n_by_target, kMaxOpenChunks);
+        acc.chunk_size = (N + acc.num_chunks - 1) / acc.num_chunks;
+
+        size_t per_chunk_bytes = static_cast<size_t>(acc.chunk_size) * M * 2 * sizeof(int32_t);
+        int max_threads = omp_get_max_threads();
+        int budget_threads = static_cast<int>(std::max<size_t>(1,
+            cpu_mem_budget_bytes / std::max<size_t>(1, per_chunk_bytes)));
+        acc.merge_parallelism = std::max(1, std::min(max_threads, budget_threads));
+
+        constexpr size_t kBufferBytes = 256 * 1024;
+        size_t rec_bytes = record_bytes(M);
+        size_t cap_records = std::max<size_t>(1, kBufferBytes / rec_bytes);
+
+        acc.bufs.resize(static_cast<size_t>(acc.num_chunks));
+        for (auto& b : acc.bufs) {
+            b.capacity_records = cap_records;
+            b.data.resize(cap_records * rec_bytes);
         }
 
-        f.neighbors_f.open(knn_path, std::ios::binary | std::ios::in | std::ios::out);
-        f.dists_f.open(dist_path, std::ios::binary | std::ios::in | std::ios::out);
-        if (!f.neighbors_f.is_open() || !f.dists_f.is_open())
-            throw std::runtime_error("RunningKnnFile: cannot reopen for read/write");
+        std::cout << "[ChunkedKNN] N=" << N << " M=" << M
+                  << " num_chunks=" << acc.num_chunks
+                  << " chunk_size=" << acc.chunk_size
+                  << " write_buffer=" << (cap_records * rec_bytes) / 1024 << "KB/chunk"
+                  << " merge_parallelism=" << acc.merge_parallelism << "\n";
+        return acc;
+    }
 
-        int64_t chunk_rows = std::max<int64_t>(1,
-            static_cast<int64_t>(chunk_bytes_budget / (static_cast<size_t>(M) * sizeof(int32_t))));
-        chunk_rows = std::min(chunk_rows, N);
-        std::vector<int32_t> nbuf(static_cast<size_t>(chunk_rows) * M, -1);
-        std::vector<float>   dbuf(static_cast<size_t>(chunk_rows) * M,
-                                  std::numeric_limits<float>::infinity());
-
-        f.neighbors_f.seekp(header_bytes());
-        f.dists_f.seekp(header_bytes());
-        for (int64_t start = 0; start < N; start += chunk_rows) {
-            int64_t cur = std::min(chunk_rows, N - start);
-            f.neighbors_f.write(reinterpret_cast<const char*>(nbuf.data()),
-                                static_cast<std::streamsize>(cur * M * sizeof(int32_t)));
-            f.dists_f.write(reinterpret_cast<const char*>(dbuf.data()),
-                            static_cast<std::streamsize>(cur * M * sizeof(float)));
+    void start_iteration(int iter) {
+        for (int64_t c = 0; c < num_chunks; ++c) {
+            auto& b = bufs[static_cast<size_t>(c)];
+            b.count = 0;
+            b.file.open(iter_path(dir, c, iter),
+                       std::ios::binary | std::ios::out | std::ios::trunc);
+            if (!b.file.is_open())
+                throw std::runtime_error("ChunkedKnnAccumulator: cannot open " + iter_path(dir, c, iter));
         }
-        if (!f.neighbors_f.good() || !f.dists_f.good())
-            throw std::runtime_error("RunningKnnFile: failed sentinel-filling " + knn_path);
-        return f;
     }
 
-    void read_row(int64_t gid, int32_t* n_out, float* d_out) {
-        neighbors_f.seekg(static_cast<std::streamoff>(header_bytes())
-                          + static_cast<std::streamoff>(gid) * M * sizeof(int32_t));
-        neighbors_f.read(reinterpret_cast<char*>(n_out), static_cast<std::streamsize>(M * sizeof(int32_t)));
-        dists_f.seekg(static_cast<std::streamoff>(header_bytes())
-                      + static_cast<std::streamoff>(gid) * M * sizeof(float));
-        dists_f.read(reinterpret_cast<char*>(d_out), static_cast<std::streamsize>(M * sizeof(float)));
+    void flush_chunk(int64_t c) {
+        auto& b = bufs[static_cast<size_t>(c)];
+        if (b.count == 0) return;
+        size_t rec_bytes = record_bytes(M);
+        b.file.write(b.data.data(), static_cast<std::streamsize>(b.count * rec_bytes));
+        if (!b.file.good())
+            throw std::runtime_error("ChunkedKnnAccumulator: flush failed for chunk " + std::to_string(c));
+        b.count = 0;
     }
 
-    void write_row(int64_t gid, const int32_t* n_in, const float* d_in) {
-        neighbors_f.seekp(static_cast<std::streamoff>(header_bytes())
-                          + static_cast<std::streamoff>(gid) * M * sizeof(int32_t));
-        neighbors_f.write(reinterpret_cast<const char*>(n_in), static_cast<std::streamsize>(M * sizeof(int32_t)));
-        dists_f.seekp(static_cast<std::streamoff>(header_bytes())
-                      + static_cast<std::streamoff>(gid) * M * sizeof(float));
-        dists_f.write(reinterpret_cast<const char*>(d_in), static_cast<std::streamsize>(M * sizeof(float)));
+    // Step 6 的 scatter_pending 里，每个点调用一次。nbrs/dists 长度均为 M
+    // (已按距离升序排列，不足 M 的部分是 -1/+inf sentinel)。只做内存追加 +
+    // 偶尔的整块顺序 flush，没有 seek。
+    void add(int64_t gid, const int32_t* nbrs, const float* dists) {
+        int64_t c = std::min(gid / chunk_size, num_chunks - 1);
+        auto& b = bufs[static_cast<size_t>(c)];
+        size_t rec_bytes = record_bytes(M);
+        size_t off = b.count * rec_bytes;
+        std::memcpy(b.data.data() + off, &gid, sizeof(int64_t));
+        std::memcpy(b.data.data() + off + sizeof(int64_t), nbrs,
+                   static_cast<size_t>(M) * sizeof(int32_t));
+        std::memcpy(b.data.data() + off + sizeof(int64_t) + static_cast<size_t>(M) * sizeof(int32_t),
+                   dists, static_cast<size_t>(M) * sizeof(float));
+        if (++b.count == b.capacity_records) flush_chunk(c);
     }
-};
 
-// 读一个点现有的一行、跟新算出来的候选合并去重、写回同一行。逻辑跟
-// merge_two_per_vector_knn 完全一样，只是作用范围是单独一行而不是整块 (N,M)
-// 数组，因为 running 状态现在活在磁盘上而不是内存里。
-inline void merge_row_into_disk(RunningKnnFile& f, int64_t gid, int M,
-                                const int32_t* new_n, const float* new_d) {
-    std::vector<int32_t> old_n(M);
-    std::vector<float>   old_d(M);
-    f.read_row(gid, old_n.data(), old_d.data());
+    void finish_iteration_writes() {
+        for (int64_t c = 0; c < num_chunks; ++c) {
+            flush_chunk(c);
+            bufs[static_cast<size_t>(c)].file.close();
+        }
+    }
 
-    std::vector<std::pair<float, int32_t>> cand;
-    cand.reserve(static_cast<size_t>(2) * M);
-    for (int m = 0; m < M; ++m) if (old_n[m] >= 0) cand.push_back({old_d[m], old_n[m]});
-    for (int m = 0; m < M; ++m) if (new_n[m] >= 0) cand.push_back({new_d[m], new_n[m]});
-
-    std::vector<int32_t> merged_n(M, -1);
-    std::vector<float>   merged_d(M, std::numeric_limits<float>::infinity());
-    if (!cand.empty()) {
-        std::sort(cand.begin(), cand.end(),
+    // 把新算出的 M 个候选(new_*)就地合并进 running 位置的 M 个候选(run_*)，
+    // 去重、按距离升序取前 M。scratch/seen 由调用方按线程复用，避免每点分配。
+    static void merge_one_record(
+        int32_t* run_nbrs, float* run_dists,
+        const int32_t* new_nbrs, const float* new_dists, int M,
+        std::vector<std::pair<float,int32_t>>& scratch,
+        std::unordered_set<int32_t>& seen) {
+        scratch.clear();
+        for (int m = 0; m < M; ++m) if (run_nbrs[m] >= 0) scratch.push_back({run_dists[m], run_nbrs[m]});
+        for (int m = 0; m < M; ++m) if (new_nbrs[m] >= 0) scratch.push_back({new_dists[m], new_nbrs[m]});
+        if (scratch.empty()) return;
+        std::sort(scratch.begin(), scratch.end(),
                  [](const auto& a, const auto& b) { return a.first < b.first; });
-        std::unordered_set<int32_t> seen;
-        seen.reserve(static_cast<size_t>(M) * 2);
+        seen.clear();
         int written = 0;
-        for (const auto& [dist, id] : cand) {
+        for (const auto& [dist, id] : scratch) {
             if (seen.insert(id).second) {
-                merged_n[written] = id;
-                merged_d[written] = dist;
+                run_nbrs[written] = id;
+                run_dists[written] = dist;
                 if (++written >= M) break;
             }
         }
+        for (; written < M; ++written) {
+            run_nbrs[written] = -1;
+            run_dists[written] = std::numeric_limits<float>::infinity();
+        }
     }
-    f.write_row(gid, merged_n.data(), merged_d.data());
-}
+
+    // 每轮结束后调用一次: 对每个 chunk 做"读 running -> 顺序扫这一轮 arrival
+    // 文件逐条就地合并 -> 写回 running"，chunk 之间用 OpenMP 并行。
+    void merge_iteration(int iter) {
+        size_t rec_bytes = record_bytes(M);
+        #pragma omp parallel num_threads(merge_parallelism)
+        {
+            std::vector<std::pair<float,int32_t>> scratch;
+            scratch.reserve(static_cast<size_t>(2) * M);
+            std::unordered_set<int32_t> seen;
+            seen.reserve(static_cast<size_t>(2) * M);
+            std::vector<char> rec(rec_bytes);
+            std::vector<int32_t> new_nbrs(static_cast<size_t>(M));
+            std::vector<float>   new_dists(static_cast<size_t>(M));
+
+            #pragma omp for schedule(dynamic)
+            for (int64_t c = 0; c < num_chunks; ++c) {
+                int64_t chunk_start = c * chunk_size;
+                int64_t chunk_c_size = std::min(chunk_size, N - chunk_start);
+                if (chunk_c_size <= 0) continue;
+
+                std::vector<int32_t> run_nbrs(static_cast<size_t>(chunk_c_size) * M);
+                std::vector<float>   run_dists(static_cast<size_t>(chunk_c_size) * M);
+
+                std::string np = running_nbrs_path(dir, c);
+                std::string dp = running_dists_path(dir, c);
+                if (iter == 0) {
+                    std::fill(run_nbrs.begin(), run_nbrs.end(), -1);
+                    std::fill(run_dists.begin(), run_dists.end(),
+                              std::numeric_limits<float>::infinity());
+                } else {
+                    std::ifstream nin(np, std::ios::binary);
+                    std::ifstream din(dp, std::ios::binary);
+                    if (!nin.is_open() || !din.is_open())
+                        throw std::runtime_error("ChunkedKnnAccumulator: cannot read running chunk " + std::to_string(c));
+                    nin.read(reinterpret_cast<char*>(run_nbrs.data()),
+                             static_cast<std::streamsize>(run_nbrs.size() * sizeof(int32_t)));
+                    din.read(reinterpret_cast<char*>(run_dists.data()),
+                             static_cast<std::streamsize>(run_dists.size() * sizeof(float)));
+                    if (!nin.good() || !din.good())
+                        throw std::runtime_error("ChunkedKnnAccumulator: short read on running chunk " + std::to_string(c));
+                }
+
+                std::string ip = iter_path(dir, c, iter);
+                std::ifstream in(ip, std::ios::binary);
+                if (in.is_open()) {
+                    while (in.read(rec.data(), static_cast<std::streamsize>(rec_bytes))) {
+                        int64_t gid;
+                        std::memcpy(&gid, rec.data(), sizeof(int64_t));
+                        std::memcpy(new_nbrs.data(), rec.data() + sizeof(int64_t),
+                                   static_cast<size_t>(M) * sizeof(int32_t));
+                        std::memcpy(new_dists.data(),
+                                   rec.data() + sizeof(int64_t) + static_cast<size_t>(M) * sizeof(int32_t),
+                                   static_cast<size_t>(M) * sizeof(float));
+                        int64_t pos = gid - chunk_start;
+                        if (pos < 0 || pos >= chunk_c_size) continue;  // 不应该发生，保险起见
+                        merge_one_record(
+                            run_nbrs.data() + static_cast<size_t>(pos) * M,
+                            run_dists.data() + static_cast<size_t>(pos) * M,
+                            new_nbrs.data(), new_dists.data(), M,
+                            scratch, seen);
+                    }
+                    in.close();
+                    std::filesystem::remove(ip);
+                }
+
+                std::ofstream nout(np, std::ios::binary | std::ios::trunc);
+                std::ofstream dout(dp, std::ios::binary | std::ios::trunc);
+                nout.write(reinterpret_cast<const char*>(run_nbrs.data()),
+                          static_cast<std::streamsize>(run_nbrs.size() * sizeof(int32_t)));
+                dout.write(reinterpret_cast<const char*>(run_dists.data()),
+                          static_cast<std::streamsize>(run_dists.size() * sizeof(float)));
+                if (!nout.good() || !dout.good())
+                    throw std::runtime_error("ChunkedKnnAccumulator: write failed for running chunk " + std::to_string(c));
+            }
+        }
+    }
+
+    // 全部 iteration 跑完后调用一次: 按 chunk 顺序把 running_chunk_* 顺序拼
+    // 接成最终的 vector_knn.bin / vector_dists.bin (格式跟原来 RunningKnnFile
+    // 的输出完全一致: int64 N + int32 M header，后面跟 (N,M) flat body)。
+    void finalize_to_file(const std::string& knn_path, const std::string& dist_path) {
+        std::ofstream kout(knn_path, std::ios::binary | std::ios::trunc);
+        std::ofstream dout(dist_path, std::ios::binary | std::ios::trunc);
+        int32_t M32 = static_cast<int32_t>(M);
+        kout.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
+        kout.write(reinterpret_cast<const char*>(&M32), sizeof(int32_t));
+        dout.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
+        dout.write(reinterpret_cast<const char*>(&M32), sizeof(int32_t));
+
+        for (int64_t c = 0; c < num_chunks; ++c) {
+            int64_t chunk_start = c * chunk_size;
+            int64_t chunk_c_size = std::min(chunk_size, N - chunk_start);
+            if (chunk_c_size <= 0) continue;
+            std::string np = running_nbrs_path(dir, c);
+            std::string dp = running_dists_path(dir, c);
+            std::vector<int32_t> run_nbrs(static_cast<size_t>(chunk_c_size) * M);
+            std::vector<float>   run_dists(static_cast<size_t>(chunk_c_size) * M);
+            std::ifstream nin(np, std::ios::binary);
+            std::ifstream din(dp, std::ios::binary);
+            if (!nin.is_open() || !din.is_open())
+                throw std::runtime_error("ChunkedKnnAccumulator: cannot read running chunk " + std::to_string(c) + " for finalize");
+            nin.read(reinterpret_cast<char*>(run_nbrs.data()),
+                     static_cast<std::streamsize>(run_nbrs.size() * sizeof(int32_t)));
+            din.read(reinterpret_cast<char*>(run_dists.data()),
+                     static_cast<std::streamsize>(run_dists.size() * sizeof(float)));
+            nin.close(); din.close();
+            kout.write(reinterpret_cast<const char*>(run_nbrs.data()),
+                      static_cast<std::streamsize>(run_nbrs.size() * sizeof(int32_t)));
+            dout.write(reinterpret_cast<const char*>(run_dists.data()),
+                      static_cast<std::streamsize>(run_dists.size() * sizeof(float)));
+            std::filesystem::remove(np);
+            std::filesystem::remove(dp);
+        }
+        if (!kout.good() || !dout.good())
+            throw std::runtime_error("ChunkedKnnAccumulator: finalize write failed");
+    }
+};
+
+constexpr size_t knn_file_header_bytes() { return sizeof(int64_t) + sizeof(int32_t); }
 
 // 把 vector_knn.bin (RunningKnnFile 的 int64 N + int32 M header, flat int32
 // body) 顺序分块转换成 neighbors.npy (int64)，给 Python 端评测用。纯顺序拷贝
@@ -2175,7 +2343,7 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
                                       int64_t N, int M, size_t chunk_bytes_budget) {
     std::ifstream in(knn_path, std::ios::binary);
     if (!in.is_open()) throw std::runtime_error("Cannot open: " + knn_path);
-    in.seekg(static_cast<std::streamoff>(RunningKnnFile::header_bytes()));
+    in.seekg(static_cast<std::streamoff>(knn_file_header_bytes()));
 
     size_t header_bytes = load::create_npy_int64_2d(npy_path, N, M);
     std::fstream out(npy_path, std::ios::binary | std::ios::in | std::ios::out);
@@ -2220,11 +2388,11 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
  * @param K                   centroid KNN 图度数
  * @param M                   每个向量要找的邻居数
  *
- * @param running             磁盘上的 running per-vector KNN 文件（read_row/write_row）。
- *                            每算完一个 bucket，就把该 bucket 里每个点的新候选跟
- *                            running 里现有的一行合并写回——不再攒进内存里的
- *                            (N, M) 数组，也不再单独返回结果，见文件顶部
- *                            RunningKnnFile 的说明。
+ * @param acc                 分块的 disk-backed 累积器 (见文件顶部 ChunkedKnnAccumulator
+ *                            的说明)。每算完一个 bucket，就把该 bucket 里每个点新算出
+ *                            的 M 个候选，按 gid 路由进对应 chunk 的内存 write buffer
+ *                            (纯追加，不读旧值)；真正的跨 iteration 合并延后到调用方
+ *                            在每轮结束后调 acc.merge_iteration() 时才做。
  *
  * 距离对合并是必需的 (要按距离排序去重)，所以内部始终按 want_distances=true
  * 的路径跑；不再对外暴露"不算距离"这个选项。
@@ -2240,9 +2408,9 @@ void build_vector_knn_with_tensorcore(
     int64_t n_centroids,
     uint32_t K,
     int M,
-    RunningKnnFile& running)
+    ChunkedKnnAccumulator& acc)
 {
-    constexpr bool want_distances = true;  // merge_row_into_disk 总是需要距离
+    constexpr bool want_distances = true;  // 合并去重总是需要距离
     // ============= Stage 2 路径选择（INT8 IMMA / fp32 fallback）=============
     // - int8/uint8 → 走 INT8 IMMA Tensor Core（uint8 入口先减 128 转 int8）
     // - 其它 (float/half/uint32/int32 等) → 走 fp32 cuBLAS GEMM（原行为）
@@ -2540,8 +2708,9 @@ void build_vector_knn_with_tensorcore(
         gemm_evt_valid[slot] = false;
     };
 
-    // 每个点的新候选先铺成 M 宽（不足 aM 的部分补 -1/inf），再跟磁盘上现有的
-    // 一行合并写回 —— 复用同一块 scratch buffer，避免每个点都分配一次。
+    // 每个点的新候选先铺成 M 宽（不足 aM 的部分补 -1/inf），再追加进对应 chunk
+    // 的内存 write buffer —— 复用同一块 scratch buffer，避免每个点都分配一次；
+    // acc.add() 只做内存 memcpy + 偶尔的整块顺序 flush，不读旧值、没有 seek。
     std::vector<int32_t> scatter_new_n(M);
     std::vector<float>   scatter_new_d(M);
 
@@ -2561,7 +2730,7 @@ void build_vector_knn_with_tensorcore(
                 scatter_new_n[m] = hp[static_cast<size_t>(i) * aM + m];
                 scatter_new_d[m] = hd[static_cast<size_t>(i) * aM + m];
             }
-            merge_row_into_disk(running, gid, M, scatter_new_n.data(), scatter_new_d.data());
+            acc.add(gid, scatter_new_n.data(), scatter_new_d.data());
         }
         pending[slot].c = -1;
     };
@@ -3186,17 +3355,20 @@ int run_pipeline_impl(
         // ================================================================
         // Per-iteration outer loop (Steps 2-6 may repeat with varying seed)
         // ================================================================
-        // running per-vector KNN 现在活在磁盘上 (见 RunningKnnFile)，不再是
-        // 内存里的 (N,M) 数组，也不再需要 merge_future 这个跨 iteration 的
-        // 后台任务 —— 合并已经下沉到 build_vector_knn_with_tensorcore 内部,
-        // 逐 bucket 同步做掉了 (scatter_pending -> merge_row_into_disk)。
-        std::unique_ptr<RunningKnnFile> running_knn_file;
+        // running per-vector KNN 现在活在磁盘上，按固定连续 id 区间分 chunk
+        // (见文件顶部 ChunkedKnnAccumulator 的说明)。Step 6 内部
+        // (scatter_pending -> acc.add) 只做按 chunk 路由的内存追加写；每轮
+        // iteration 结束后在这里调 acc.merge_iteration()，把这一轮的结果跟
+        // 磁盘上的 running 状态就地合并——不再是内存里的 (N,M) 数组，也不需要
+        // merge_future 这个跨 iteration 的后台任务。
+        std::unique_ptr<ChunkedKnnAccumulator> knn_acc;
+        std::string knn_chunk_tmp_dir = output_dir + "/knn_chunks_tmp";
         if (neighbors_m > 0) {
-            running_knn_file = std::make_unique<RunningKnnFile>(
-                RunningKnnFile::create(
-                    output_dir + "/vector_knn.bin",
-                    output_dir + "/vector_dists.bin",
-                    N, neighbors_m, config.cpu_limit_bytes / 4));
+            std::filesystem::create_directories(knn_chunk_tmp_dir);
+            knn_acc = std::make_unique<ChunkedKnnAccumulator>(
+                ChunkedKnnAccumulator::create(
+                    knn_chunk_tmp_dir, N, static_cast<int>(neighbors_m),
+                    config.cpu_limit_bytes / 4));
         }
 
         // 这些值由最后一次 iteration 决定 (用于 Step 5/7)
@@ -3306,10 +3478,10 @@ int run_pipeline_impl(
         auto t4 = Clock::now();
 
         // Step 6 需要 centroid 坐标做邻居扩展; 在 Step 4 释放 GPU centroids 前先存 CPU
-        // (nprobe != knn_k 时都需要; nprobe == 0 表示用 knn_k, 此时也不需要)
+        // (centroid KNN 图是 CAGRA-pruned navigable graph, 不是 sorted KNN, 即使
+        //  effective_nprobe == K 也必须重新 search, 因此只要 Step 6 会跑就都需要)
         std::vector<float> centroids_host_for_step6;
-        bool need_centroids_for_step6 =
-            (neighbors_m > 0) && (nprobe > 0) && (nprobe != config.knn_k);
+        bool need_centroids_for_step6 = (neighbors_m > 0);
         if (need_centroids_for_step6) {
             centroids_host_for_step6.resize(static_cast<size_t>(n_centroids) * D);
             CUDA_CHECK(cudaMemcpy(centroids_host_for_step6.data(), d_centroids_f32,
@@ -3434,16 +3606,24 @@ int run_pipeline_impl(
             const uint32_t* graph_ptr = centroid_topK.data();
             uint32_t graph_K = effective_nprobe;
 
-            // 结果直接 merge 进 running_knn_file (磁盘上)，不再返回整块数组；
-            // 不管 iterations 是 1 还是多轮，都是同一条代码路径 —— 第 0 轮
-            // 跟全 sentinel 的文件合并，等价于直接写入,不需要为它单独分支。
+            // 这一轮的写入目标是专属的 chunk 文件 (chunk_<c>_iter<iter>.bin)，
+            // 每轮开始前先开新文件。
+            knn_acc->start_iteration(iter);
+
             build_vector_knn_with_tensorcore(
                 X_full.data(), N, D,
                 assignments,
                 centroid_global_indices,
                 graph_ptr,
                 n_centroids, graph_K, neighbors_m,
-                *running_knn_file);
+                *knn_acc);
+
+            // flush 掉这一轮剩余的 write buffer，再把这一轮的结果跟磁盘上的
+            // running 状态就地合并 (chunk 间用 OpenMP 并行)；不管 iterations
+            // 是 1 还是多轮，都是同一条代码路径——第 0 轮直接当全 sentinel
+            // 处理，不需要为它单独分支。
+            knn_acc->finish_iteration_writes();
+            knn_acc->merge_iteration(iter);
 
             cudaDeviceSynchronize();
             double iter_step6 = std::chrono::duration<double>(Clock::now() - t6).count();
@@ -3453,12 +3633,13 @@ int run_pipeline_impl(
 
         }   // end of per-iteration loop
 
-        // vector_knn.bin / vector_dists.bin 已经在每一轮 Step 6 里被增量写完了
-        // (running_knn_file)，这里不需要再整块写一次——只要把文件关掉 (flush)。
+        // 把按 chunk 分片的 running 状态 (跨全部 iteration 合并去重后的最终
+        // 结果) 按 chunk 顺序拼接成 vector_knn.bin / vector_dists.bin。
         if (neighbors_m > 0) {
             auto t_write = Clock::now();
-            running_knn_file->neighbors_f.close();
-            running_knn_file->dists_f.close();
+            knn_acc->finalize_to_file(
+                output_dir + "/vector_knn.bin", output_dir + "/vector_dists.bin");
+            std::filesystem::remove(knn_chunk_tmp_dir);  // 此时应已清空
 
             // 分块把 vector_knn.bin 转成 neighbors.npy，给 Python 端评测用
             // (纯顺序拷贝+类型转换，不需要整份常驻内存)
@@ -3512,7 +3693,7 @@ int run_pipeline_impl(
                 std::ifstream in(output_dir + "/vector_knn.bin", std::ios::binary);
                 if (!in.is_open())
                     throw std::runtime_error("Cannot open vector_knn.bin for reorder");
-                in.seekg(static_cast<std::streamoff>(RunningKnnFile::header_bytes()));
+                in.seekg(static_cast<std::streamoff>(knn_file_header_bytes()));
                 vector_knn.resize(static_cast<size_t>(N) * neighbors_m);
                 in.read(reinterpret_cast<char*>(vector_knn.data()),
                        static_cast<std::streamsize>(vector_knn.size() * sizeof(int32_t)));
