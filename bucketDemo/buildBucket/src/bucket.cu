@@ -2222,18 +2222,20 @@ struct ChunkedKnnAccumulator {
     // + (iter>0 时还要) 读 running(2*M*4B)。这个量是精确算出来的，不是估计
     // 的——所以下面打印的 GB/s 就是这一步磁盘读写的真实吞吐，可以直接用来判断
     // merge 这一段是不是被磁盘带宽/IOPS 卡住了。
+    // 每个 chunk 自己的耗时明细，按 c 直接索引写入 (不同线程处理不同 c，天然
+    // 无竞争，不需要原子操作/锁)——不再用"总和除以线程数"这种在 chunk 数量比
+    // 线程数少时会严重失真的平均法，每个 chunk 到底花了多少时间一目了然。
+    struct ChunkTiming {
+        double alloc = 0, read_running = 0, read_arrival = 0, merge_cpu = 0, write_running = 0, total = 0;
+        int64_t n_records = 0;
+    };
+
     void merge_iteration(int iter) {
         auto t_merge_start = std::chrono::high_resolution_clock::now();
         size_t rec_bytes = record_bytes(M);
+        std::vector<ChunkTiming> timing(static_cast<size_t>(num_chunks));
 
-        // 按阶段分别计时 (跨所有 chunk/线程累加，用 reduction 汇总)，把"读/写
-        // 磁盘"和"merge_one_record 的 CPU 排序去重"分开算，这样才能看出 91MB/s
-        // 这类数字里，磁盘真的慢，还是 CPU 排序/哈希占了大头。
-        double t_read_running = 0.0, t_read_arrival = 0.0;
-        double t_merge_cpu = 0.0, t_write_running = 0.0;
-
-        #pragma omp parallel num_threads(merge_parallelism) \
-            reduction(+:t_read_running,t_read_arrival,t_merge_cpu,t_write_running)
+        #pragma omp parallel num_threads(merge_parallelism)
         {
             std::vector<std::pair<float,int32_t>> scratch;
             scratch.reserve(static_cast<size_t>(2) * M);
@@ -2243,19 +2245,23 @@ struct ChunkedKnnAccumulator {
             std::vector<float>   new_dists(static_cast<size_t>(M));
             std::vector<char>    arrival_buf;
             auto now = [] { return std::chrono::high_resolution_clock::now(); };
+            auto secs_between = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
 
             #pragma omp for schedule(dynamic)
             for (int64_t c = 0; c < num_chunks; ++c) {
+                auto t0 = now();
                 int64_t chunk_start = c * chunk_size;
                 int64_t chunk_c_size = std::min(chunk_size, N - chunk_start);
                 if (chunk_c_size <= 0) continue;
+                ChunkTiming& tm = timing[static_cast<size_t>(c)];
 
                 std::vector<int32_t> run_nbrs(static_cast<size_t>(chunk_c_size) * M);
                 std::vector<float>   run_dists(static_cast<size_t>(chunk_c_size) * M);
+                auto t1 = now();
+                tm.alloc = secs_between(t0, t1);
 
                 std::string np = running_nbrs_path(dir, c);
                 std::string dp = running_dists_path(dir, c);
-                auto ta = now();
                 if (iter == 0) {
                     std::fill(run_nbrs.begin(), run_nbrs.end(), -1);
                     std::fill(run_dists.begin(), run_dists.end(),
@@ -2272,8 +2278,8 @@ struct ChunkedKnnAccumulator {
                     if (!nin.good() || !din.good())
                         throw std::runtime_error("ChunkedKnnAccumulator: short read on running chunk " + std::to_string(c));
                 }
-                auto tb = now();
-                t_read_running += std::chrono::duration<double>(tb - ta).count();
+                auto t2 = now();
+                tm.read_running = secs_between(t1, t2);
 
                 // 整个 arrival 文件一次性读进内存 (一次 read 系统调用，而不是
                 // 每条记录一次)，读磁盘和后面逐条 merge 的 CPU 计算彻底分开计时。
@@ -2289,8 +2295,9 @@ struct ChunkedKnnAccumulator {
                     in.close();
                     n_records = arrival_buf.size() / rec_bytes;
                 }
-                auto tc = now();
-                t_read_arrival += std::chrono::duration<double>(tc - tb).count();
+                tm.n_records = static_cast<int64_t>(n_records);
+                auto t3 = now();
+                tm.read_arrival = secs_between(t2, t3);
 
                 for (size_t r = 0; r < n_records; ++r) {
                     const char* rp = arrival_buf.data() + r * rec_bytes;
@@ -2310,8 +2317,8 @@ struct ChunkedKnnAccumulator {
                         scratch, seen);
                 }
                 if (n_records > 0) std::filesystem::remove(ip);
-                auto td = now();
-                t_merge_cpu += std::chrono::duration<double>(td - tc).count();
+                auto t4 = now();
+                tm.merge_cpu = secs_between(t3, t4);
 
                 std::ofstream nout(np, std::ios::binary | std::ios::trunc);
                 std::ofstream dout(dp, std::ios::binary | std::ios::trunc);
@@ -2321,33 +2328,56 @@ struct ChunkedKnnAccumulator {
                           static_cast<std::streamsize>(run_dists.size() * sizeof(float)));
                 if (!nout.good() || !dout.good())
                     throw std::runtime_error("ChunkedKnnAccumulator: write failed for running chunk " + std::to_string(c));
-                auto te = now();
-                t_write_running += std::chrono::duration<double>(te - td).count();
+                nout.close(); dout.close();
+                auto t5 = now();
+                tm.write_running = secs_between(t4, t5);
+                tm.total = secs_between(t0, t5);
             }
         }
 
         double secs = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t_merge_start).count();
-        // 每点: 读 arrival 记录 + 写 running(nbrs+dists); iter>0 时还要读 running
         size_t running_rw_bytes = static_cast<size_t>(M) * sizeof(int32_t) * 2;  // nbrs+dists 各 M*4B
         size_t per_point_bytes = rec_bytes + running_rw_bytes + (iter > 0 ? running_rw_bytes : 0);
         double total_gb = static_cast<double>(N) * static_cast<double>(per_point_bytes) / 1e9;
-        double io_gb = static_cast<double>(N) *
-            static_cast<double>(rec_bytes + (iter > 0 ? running_rw_bytes : 0)) / 1e9;
-        double write_gb = static_cast<double>(N) * static_cast<double>(running_rw_bytes) / 1e9;
-        // 上面 4 个 t_* 是所有线程累加的 CPU-seconds，除以并行度换算回墙钟时间，
-        // 方便跟 secs (墙钟总耗时) 直接比较。
-        double par = std::max(1, merge_parallelism);
+
+        // 汇总: 每个阶段跨 chunk 求和 (sum) 和取最慢的一个 chunk (max，用来看
+        // 负载是否均衡)。sum 是"如果单线程串行跑完所有 chunk"需要的时间，不
+        // 是墙钟时间——真正的墙钟时间是上面的 secs，两者的差距 (secs 明显小于
+        // sum) 说明并行确实生效了；如果 secs 接近甚至大于 sum，说明没并行起来
+        // 或者有锁/资源争用。
+        ChunkTiming sum, mx;
+        for (int64_t c = 0; c < num_chunks; ++c) {
+            const auto& t = timing[static_cast<size_t>(c)];
+            sum.alloc += t.alloc; sum.read_running += t.read_running;
+            sum.read_arrival += t.read_arrival; sum.merge_cpu += t.merge_cpu;
+            sum.write_running += t.write_running; sum.total += t.total;
+            mx.alloc = std::max(mx.alloc, t.alloc); mx.read_running = std::max(mx.read_running, t.read_running);
+            mx.read_arrival = std::max(mx.read_arrival, t.read_arrival); mx.merge_cpu = std::max(mx.merge_cpu, t.merge_cpu);
+            mx.write_running = std::max(mx.write_running, t.write_running); mx.total = std::max(mx.total, t.total);
+        }
         std::cout << "[ChunkedKNN] merge_iteration(iter=" << iter << "): "
-                  << total_gb << " GB moved in " << secs << "s => "
-                  << (total_gb / std::max(1e-9, secs)) << " GB/s (naive)\n"
-                  << "  breakdown (wall-clock, /" << merge_parallelism << " threads): "
-                  << "read_running=" << (t_read_running / par) << "s, "
-                  << "read_arrival=" << (t_read_arrival / par)
-                  << "s (" << (io_gb / std::max(1e-9, t_read_running + t_read_arrival) * par) << " GB/s), "
-                  << "merge_cpu=" << (t_merge_cpu / par) << "s, "
-                  << "write_running=" << (t_write_running / par)
-                  << "s (" << (write_gb / std::max(1e-9, t_write_running) * par) << " GB/s)\n";
+                  << total_gb << " GB moved, wall=" << secs << "s "
+                  << "(num_chunks=" << num_chunks << ", merge_parallelism=" << merge_parallelism << ")\n"
+                  << "  sum-over-chunks (serial-equivalent): alloc=" << sum.alloc
+                  << "s read_running=" << sum.read_running << "s read_arrival=" << sum.read_arrival
+                  << "s merge_cpu=" << sum.merge_cpu << "s write_running=" << sum.write_running
+                  << "s total=" << sum.total << "s\n"
+                  << "  slowest single chunk:                 alloc=" << mx.alloc
+                  << "s read_running=" << mx.read_running << "s read_arrival=" << mx.read_arrival
+                  << "s merge_cpu=" << mx.merge_cpu << "s write_running=" << mx.write_running
+                  << "s total=" << mx.total << "s\n";
+        // chunk 数不多时 (通常是小数据集测试)，直接把每个 chunk 的明细打出来，
+        // 不需要靠猜。
+        if (num_chunks <= 16) {
+            for (int64_t c = 0; c < num_chunks; ++c) {
+                const auto& t = timing[static_cast<size_t>(c)];
+                std::cout << "    chunk " << c << ": n_records=" << t.n_records
+                          << " alloc=" << t.alloc << "s read_running=" << t.read_running
+                          << "s read_arrival=" << t.read_arrival << "s merge_cpu=" << t.merge_cpu
+                          << "s write_running=" << t.write_running << "s total=" << t.total << "s\n";
+            }
+        }
     }
 
     // 全部 iteration 跑完后调用一次: 按 chunk 顺序把 running_chunk_* 顺序拼
