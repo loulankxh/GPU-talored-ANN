@@ -2188,23 +2188,28 @@ struct ChunkedKnnAccumulator {
     }
 
     // 把新算出的 M 个候选(new_*)就地合并进 running 位置的 M 个候选(run_*)，
-    // 去重、按距离升序取前 M。scratch/seen 由调用方按线程复用，避免每点分配。
+    // 去重、按距离升序取前 M。scratch 由调用方按线程复用，避免每点分配。
     //
     // run_*/new_* 两边各自都已经是"有效候选在前、按距离升序排列，多余的槽位
     // 是 -1/+inf sentinel"的布局(GPU top-M 输出和上一次 merge_one_record 的
     // 输出都保证这一点)——所以不需要拼一起整体 std::sort (O(2M log 2M))，
-    // 直接对两个已排序列表做双指针归并 (O(M)) 就够了，去重仍然靠 seen 复用。
+    // 直接对两个已排序列表做双指针归并 (O(M)) 就够了。
+    //
+    // 去重故意不用 unordered_set: M 很小 (通常几十到一百多，上限 1024)，
+    // node-based 的 unordered_set 每次 insert 都会 malloc 一个新节点——即使
+    // 复用同一个 set 对象、每次调用后 clear()，clear() 也会把内部节点整个
+    // 释放掉，下次 insert 照样重新 malloc。实测这才是 merge_cpu 里的真正大头
+    // (排序反而是小头)。M 这么小时，直接在 scratch (连续内存、缓存友好) 里
+    // 线性扫描找重复，比哈希表的分配开销划算得多。
     static void merge_one_record(
         int32_t* run_nbrs, float* run_dists,
         const int32_t* new_nbrs, const float* new_dists, int M,
-        std::vector<std::pair<float,int32_t>>& scratch,
-        std::unordered_set<int32_t>& seen) {
+        std::vector<std::pair<float,int32_t>>& scratch) {
         int na = 0; while (na < M && run_nbrs[na] >= 0) ++na;
         int nb = 0; while (nb < M && new_nbrs[nb] >= 0) ++nb;
         if (na == 0 && nb == 0) return;
 
         scratch.clear();
-        seen.clear();
         int i = 0, j = 0;
         while (static_cast<int>(scratch.size()) < M && (i < na || j < nb)) {
             bool take_a = (j >= nb) || (i < na && run_dists[i] <= new_dists[j]);
@@ -2212,7 +2217,9 @@ struct ChunkedKnnAccumulator {
             float d;
             if (take_a) { id = run_nbrs[i]; d = run_dists[i]; ++i; }
             else        { id = new_nbrs[j]; d = new_dists[j]; ++j; }
-            if (seen.insert(id).second) scratch.push_back({d, id});
+            bool dup = false;
+            for (const auto& p : scratch) if (p.second == id) { dup = true; break; }
+            if (!dup) scratch.push_back({d, id});
         }
 
         int written = static_cast<int>(scratch.size());
@@ -2250,8 +2257,6 @@ struct ChunkedKnnAccumulator {
         {
             std::vector<std::pair<float,int32_t>> scratch;
             scratch.reserve(static_cast<size_t>(2) * M);
-            std::unordered_set<int32_t> seen;
-            seen.reserve(static_cast<size_t>(2) * M);
             std::vector<int32_t> new_nbrs(static_cast<size_t>(M));
             std::vector<float>   new_dists(static_cast<size_t>(M));
             std::vector<char>    arrival_buf;
@@ -2325,7 +2330,7 @@ struct ChunkedKnnAccumulator {
                         run_nbrs.data() + static_cast<size_t>(pos) * M,
                         run_dists.data() + static_cast<size_t>(pos) * M,
                         new_nbrs.data(), new_dists.data(), M,
-                        scratch, seen);
+                        scratch);
                 }
                 if (n_records > 0) std::filesystem::remove(ip);
                 auto t4 = now();
