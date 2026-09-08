@@ -2189,29 +2189,40 @@ struct ChunkedKnnAccumulator {
 
     // 把新算出的 M 个候选(new_*)就地合并进 running 位置的 M 个候选(run_*)，
     // 去重、按距离升序取前 M。scratch/seen 由调用方按线程复用，避免每点分配。
+    //
+    // run_*/new_* 两边各自都已经是"有效候选在前、按距离升序排列，多余的槽位
+    // 是 -1/+inf sentinel"的布局(GPU top-M 输出和上一次 merge_one_record 的
+    // 输出都保证这一点)——所以不需要拼一起整体 std::sort (O(2M log 2M))，
+    // 直接对两个已排序列表做双指针归并 (O(M)) 就够了，去重仍然靠 seen 复用。
     static void merge_one_record(
         int32_t* run_nbrs, float* run_dists,
         const int32_t* new_nbrs, const float* new_dists, int M,
         std::vector<std::pair<float,int32_t>>& scratch,
         std::unordered_set<int32_t>& seen) {
+        int na = 0; while (na < M && run_nbrs[na] >= 0) ++na;
+        int nb = 0; while (nb < M && new_nbrs[nb] >= 0) ++nb;
+        if (na == 0 && nb == 0) return;
+
         scratch.clear();
-        for (int m = 0; m < M; ++m) if (run_nbrs[m] >= 0) scratch.push_back({run_dists[m], run_nbrs[m]});
-        for (int m = 0; m < M; ++m) if (new_nbrs[m] >= 0) scratch.push_back({new_dists[m], new_nbrs[m]});
-        if (scratch.empty()) return;
-        std::sort(scratch.begin(), scratch.end(),
-                 [](const auto& a, const auto& b) { return a.first < b.first; });
         seen.clear();
-        int written = 0;
-        for (const auto& [dist, id] : scratch) {
-            if (seen.insert(id).second) {
-                run_nbrs[written] = id;
-                run_dists[written] = dist;
-                if (++written >= M) break;
-            }
+        int i = 0, j = 0;
+        while (static_cast<int>(scratch.size()) < M && (i < na || j < nb)) {
+            bool take_a = (j >= nb) || (i < na && run_dists[i] <= new_dists[j]);
+            int32_t id;
+            float d;
+            if (take_a) { id = run_nbrs[i]; d = run_dists[i]; ++i; }
+            else        { id = new_nbrs[j]; d = new_dists[j]; ++j; }
+            if (seen.insert(id).second) scratch.push_back({d, id});
         }
-        for (; written < M; ++written) {
-            run_nbrs[written] = -1;
-            run_dists[written] = std::numeric_limits<float>::infinity();
+
+        int written = static_cast<int>(scratch.size());
+        for (int k = 0; k < written; ++k) {
+            run_dists[k] = scratch[k].first;
+            run_nbrs[k]  = scratch[k].second;
+        }
+        for (int k = written; k < M; ++k) {
+            run_nbrs[k] = -1;
+            run_dists[k] = std::numeric_limits<float>::infinity();
         }
     }
 
