@@ -2273,15 +2273,21 @@ struct ChunkedKnnAccumulator {
     struct ChunkTiming {
         double alloc = 0, read_running = 0, read_arrival = 0, merge_cpu = 0, write_running = 0, total = 0;
         int64_t n_records = 0;
+        int thread_id = -1;
+        double start_ms = 0, end_ms = 0;  // 相对 t_merge_start 的偏移，用来肉眼判断
+                                           // 不同 chunk 的执行区间在墙钟上有没有真的重叠
     };
 
     void merge_iteration(int iter) {
         auto t_merge_start = std::chrono::high_resolution_clock::now();
         size_t rec_bytes = record_bytes(M);
         std::vector<ChunkTiming> timing(static_cast<size_t>(num_chunks));
+        int actual_num_threads = 0;
 
         #pragma omp parallel num_threads(merge_parallelism)
         {
+            #pragma omp single
+            { actual_num_threads = omp_get_num_threads(); }
             std::vector<std::pair<float,int32_t>> scratch;
             scratch.reserve(static_cast<size_t>(2) * M);
             std::vector<int32_t> id_sort_buf;
@@ -2308,6 +2314,8 @@ struct ChunkedKnnAccumulator {
                 int64_t chunk_c_size = std::min(chunk_size, N - chunk_start);
                 if (chunk_c_size <= 0) continue;
                 ChunkTiming& tm = timing[static_cast<size_t>(c)];
+                tm.thread_id = omp_get_thread_num();
+                tm.start_ms = secs_between(t_merge_start, t0) * 1000.0;
 
                 run_nbrs.resize(static_cast<size_t>(chunk_c_size) * M);
                 run_dists.resize(static_cast<size_t>(chunk_c_size) * M);
@@ -2386,6 +2394,7 @@ struct ChunkedKnnAccumulator {
                 auto t5 = now();
                 tm.write_running = secs_between(t4, t5);
                 tm.total = secs_between(t0, t5);
+                tm.end_ms = secs_between(t_merge_start, t5) * 1000.0;
             }
         }
 
@@ -2412,7 +2421,8 @@ struct ChunkedKnnAccumulator {
         }
         std::cout << "[ChunkedKNN] merge_iteration(iter=" << iter << "): "
                   << total_gb << " GB moved, wall=" << secs << "s "
-                  << "(num_chunks=" << num_chunks << ", merge_parallelism=" << merge_parallelism << ")\n"
+                  << "(num_chunks=" << num_chunks << ", merge_parallelism=" << merge_parallelism
+                  << ", actual_num_threads=" << actual_num_threads << ")\n"
                   << "  sum-over-chunks (serial-equivalent): alloc=" << sum.alloc
                   << "s read_running=" << sum.read_running << "s read_arrival=" << sum.read_arrival
                   << "s merge_cpu=" << sum.merge_cpu << "s write_running=" << sum.write_running
@@ -2426,7 +2436,8 @@ struct ChunkedKnnAccumulator {
         if (num_chunks <= 16) {
             for (int64_t c = 0; c < num_chunks; ++c) {
                 const auto& t = timing[static_cast<size_t>(c)];
-                std::cout << "    chunk " << c << ": n_records=" << t.n_records
+                std::cout << "    chunk " << c << ": thread=" << t.thread_id
+                          << " [" << t.start_ms << "ms - " << t.end_ms << "ms] n_records=" << t.n_records
                           << " alloc=" << t.alloc << "s read_running=" << t.read_running
                           << "s read_arrival=" << t.read_arrival << "s merge_cpu=" << t.merge_cpu
                           << "s write_running=" << t.write_running << "s total=" << t.total << "s\n";
@@ -3500,10 +3511,19 @@ int run_pipeline_impl(
         // running per-vector KNN 现在活在磁盘上，按固定连续 id 区间分 chunk
         // (见文件顶部 ChunkedKnnAccumulator 的说明)。Step 6 内部
         // (scatter_pending -> acc.add) 只做按 chunk 路由的内存追加写；每轮
-        // iteration 结束后在这里调 acc.merge_iteration()，把这一轮的结果跟
-        // 磁盘上的 running 状态就地合并——不再是内存里的 (N,M) 数组，也不需要
-        // merge_future 这个跨 iteration 的后台任务。
+        // iteration 结束后调 acc.merge_iteration()，把这一轮的结果跟磁盘上的
+        // running 状态就地合并。
+        //
+        // merge_iteration 是纯 CPU/磁盘操作，跟下一轮的 GPU 计算 (Step 2~6
+        // 的 build 部分) 完全没有数据依赖 (下一轮的 acc.add() 写的是这一轮
+        // 专属的 chunk_<c>_iter<t>.bin，跟 merge_iteration 读写的
+        // running_chunk_<c>_*.bin 是两组不同的文件)——所以用 pending_knn_merge
+        // 这个 future 把当前这一轮的 merge 扔到后台线程，主线程立刻去跑下一轮
+        // 的 Step 2~6，把 merge 的耗时藏到下一轮 GPU 计算的背后。唯一需要同步
+        // 的地方是:下一轮真正要发起自己的 merge 之前，必须先等上一轮的 merge
+        // 跑完(两轮的 merge 都会读写同一份 running_chunk 文件，不能同时跑)。
         std::unique_ptr<ChunkedKnnAccumulator> knn_acc;
+        std::future<void> pending_knn_merge;
         std::string knn_chunk_tmp_dir = output_dir + "/knn_chunks_tmp";
         if (neighbors_m > 0) {
             std::filesystem::create_directories(knn_chunk_tmp_dir);
@@ -3760,12 +3780,25 @@ int run_pipeline_impl(
                 n_centroids, graph_K, neighbors_m,
                 *knn_acc);
 
-            // flush 掉这一轮剩余的 write buffer，再把这一轮的结果跟磁盘上的
-            // running 状态就地合并 (chunk 间用 OpenMP 并行)；不管 iterations
-            // 是 1 还是多轮，都是同一条代码路径——第 0 轮直接当全 sentinel
-            // 处理，不需要为它单独分支。
+            // flush 掉这一轮剩余的 write buffer；merge_iteration 本身扔到
+            // 后台线程做，让下一轮的 Step 2~6 立刻开始跑，不用等 merge 跑完
+            // ——两轮的 merge 不能同时跑 (都要读写同一份 running_chunk 文件)，
+            // 所以先等上一轮的 merge (如果还没完) 再发起这一轮的。不管
+            // iterations 是 1 还是多轮，都是同一条代码路径——第 0 轮直接当
+            // 全 sentinel 处理，不需要为它单独分支。
             knn_acc->finish_iteration_writes();
-            knn_acc->merge_iteration(iter);
+            if (pending_knn_merge.valid()) {
+                auto t_wait = Clock::now();
+                pending_knn_merge.get();
+                double wait_s = std::chrono::duration<double>(Clock::now() - t_wait).count();
+                std::cout << "  [ChunkedKNN] waited " << wait_s
+                          << "s for previous iteration's background merge\n";
+            }
+            {
+                ChunkedKnnAccumulator* acc_ptr = knn_acc.get();
+                pending_knn_merge = std::async(std::launch::async,
+                    [acc_ptr, iter]() { acc_ptr->merge_iteration(iter); });
+            }
 
             cudaDeviceSynchronize();
             double iter_step6 = std::chrono::duration<double>(Clock::now() - t6).count();
@@ -3774,6 +3807,16 @@ int run_pipeline_impl(
         }
 
         }   // end of per-iteration loop
+
+        // 最后一轮的 merge 还在后台跑，finalize 之前必须等它跑完，否则
+        // running_chunk_*.bin 可能还没写完整就被读走。
+        if (pending_knn_merge.valid()) {
+            auto t_wait = Clock::now();
+            pending_knn_merge.get();
+            double wait_s = std::chrono::duration<double>(Clock::now() - t_wait).count();
+            std::cout << "[ChunkedKNN] waited " << wait_s
+                      << "s for the last iteration's background merge\n";
+        }
 
         // 把按 chunk 分片的 running 状态 (跨全部 iteration 合并去重后的最终
         // 结果) 按 chunk 顺序拼接成 vector_knn.bin / vector_dists.bin。
