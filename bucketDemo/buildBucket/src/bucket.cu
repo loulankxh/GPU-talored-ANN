@@ -2207,7 +2207,20 @@ struct ChunkedKnnAccumulator {
         std::vector<std::pair<float,int32_t>>& scratch) {
         int na = 0; while (na < M && run_nbrs[na] >= 0) ++na;
         int nb = 0; while (nb < M && new_nbrs[nb] >= 0) ++nb;
-        if (na == 0 && nb == 0) return;
+        if (nb == 0) return;  // 这一轮没算出新候选 (bucket 被跳过等)，running 保持不变
+        if (na == 0) {
+            // running 侧还没有数据 (常见于 iter==0，或者这个点之前某轮所在的
+            // bucket 被跳过)。new_* 本身保证无重复 id (bucket 互不相交 +
+            // search pool 不重复，见 batch_assign_with_cagra_anns 的说明)，
+            // 直接拷贝即可，不需要去重扫描这一步 O(M^2) 的开销。
+            std::memcpy(run_nbrs, new_nbrs, static_cast<size_t>(nb) * sizeof(int32_t));
+            std::memcpy(run_dists, new_dists, static_cast<size_t>(nb) * sizeof(float));
+            for (int k = nb; k < M; ++k) {
+                run_nbrs[k] = -1;
+                run_dists[k] = std::numeric_limits<float>::infinity();
+            }
+            return;
+        }
 
         scratch.clear();
         int i = 0, j = 0;
