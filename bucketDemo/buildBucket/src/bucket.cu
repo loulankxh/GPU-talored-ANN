@@ -2198,13 +2198,22 @@ struct ChunkedKnnAccumulator {
     // 去重故意不用 unordered_set: M 很小 (通常几十到一百多，上限 1024)，
     // node-based 的 unordered_set 每次 insert 都会 malloc 一个新节点——即使
     // 复用同一个 set 对象、每次调用后 clear()，clear() 也会把内部节点整个
-    // 释放掉，下次 insert 照样重新 malloc。实测这才是 merge_cpu 里的真正大头
-    // (排序反而是小头)。M 这么小时，直接在 scratch (连续内存、缓存友好) 里
-    // 线性扫描找重复，比哈希表的分配开销划算得多。
+    // 释放掉，下次 insert 照样重新 malloc。实测这才是 merge_cpu 里的真正大头。
+    //
+    // na>0 且 nb>0 时(两边都有数据，只有这种情况才需要真正判重复)：run_*
+    // 侧自己没有内部重复(它本身就是上一次 merge_one_record 的输出)，所以把
+    // 它的 id 排序一份，new_* 侧每个 id 用二分查找判断是否在 run_* 里出现过
+    // 即可——重复只可能是"同一个 id 两边都有"，不会是 run_* 或 new_* 内部
+    // 自己有重复。run_* 侧的元素直接按距离顺序原样取用，不需要查重(它是否
+    // 重复，会在 new_* 那一侧的二分查找里被发现并跳过)；两边距离值对同一个
+    // id 是确定性复现的(相同公式)，所以留哪一侧的副本不影响结果。这样只需
+    // 一次 O(na log na) 排序 + 最多 nb 次 O(log na) 二分查找，比对 scratch
+    // 做 O(M^2) 线性扫描快得多。
     static void merge_one_record(
         int32_t* run_nbrs, float* run_dists,
         const int32_t* new_nbrs, const float* new_dists, int M,
-        std::vector<std::pair<float,int32_t>>& scratch) {
+        std::vector<std::pair<float,int32_t>>& scratch,
+        std::vector<int32_t>& id_sort_buf) {
         int na = 0; while (na < M && run_nbrs[na] >= 0) ++na;
         int nb = 0; while (nb < M && new_nbrs[nb] >= 0) ++nb;
         if (nb == 0) return;  // 这一轮没算出新候选 (bucket 被跳过等)，running 保持不变
@@ -2212,7 +2221,7 @@ struct ChunkedKnnAccumulator {
             // running 侧还没有数据 (常见于 iter==0，或者这个点之前某轮所在的
             // bucket 被跳过)。new_* 本身保证无重复 id (bucket 互不相交 +
             // search pool 不重复，见 batch_assign_with_cagra_anns 的说明)，
-            // 直接拷贝即可，不需要去重扫描这一步 O(M^2) 的开销。
+            // 直接拷贝即可，不需要判重。
             std::memcpy(run_nbrs, new_nbrs, static_cast<size_t>(nb) * sizeof(int32_t));
             std::memcpy(run_dists, new_dists, static_cast<size_t>(nb) * sizeof(float));
             for (int k = nb; k < M; ++k) {
@@ -2222,17 +2231,22 @@ struct ChunkedKnnAccumulator {
             return;
         }
 
+        id_sort_buf.assign(run_nbrs, run_nbrs + na);
+        std::sort(id_sort_buf.begin(), id_sort_buf.end());
+
         scratch.clear();
         int i = 0, j = 0;
         while (static_cast<int>(scratch.size()) < M && (i < na || j < nb)) {
             bool take_a = (j >= nb) || (i < na && run_dists[i] <= new_dists[j]);
-            int32_t id;
-            float d;
-            if (take_a) { id = run_nbrs[i]; d = run_dists[i]; ++i; }
-            else        { id = new_nbrs[j]; d = new_dists[j]; ++j; }
-            bool dup = false;
-            for (const auto& p : scratch) if (p.second == id) { dup = true; break; }
-            if (!dup) scratch.push_back({d, id});
+            if (take_a) {
+                scratch.push_back({run_dists[i], run_nbrs[i]});
+                ++i;
+            } else {
+                int32_t id = new_nbrs[j];
+                bool dup = std::binary_search(id_sort_buf.begin(), id_sort_buf.end(), id);
+                if (!dup) scratch.push_back({new_dists[j], id});
+                ++j;
+            }
         }
 
         int written = static_cast<int>(scratch.size());
@@ -2270,9 +2284,20 @@ struct ChunkedKnnAccumulator {
         {
             std::vector<std::pair<float,int32_t>> scratch;
             scratch.reserve(static_cast<size_t>(2) * M);
+            std::vector<int32_t> id_sort_buf;
+            id_sort_buf.reserve(static_cast<size_t>(M));
             std::vector<int32_t> new_nbrs(static_cast<size_t>(M));
             std::vector<float>   new_dists(static_cast<size_t>(M));
             std::vector<char>    arrival_buf;
+            // 按线程复用的 running 缓冲区，容量按最大 chunk (chunk_size) 一次
+            // 分配到位；后面每个 chunk 只 resize (只有第一次真正触发分配，
+            // 之后 resize 到更小/相等的大小不会重新分配)，避免每个 chunk 都
+            // 重新 malloc 这两块大内存——chunk 数一多 (真实规模下有几百个)，
+            // 这笔重复分配的开销不是小数。
+            std::vector<int32_t> run_nbrs;
+            std::vector<float>   run_dists;
+            run_nbrs.reserve(static_cast<size_t>(chunk_size) * M);
+            run_dists.reserve(static_cast<size_t>(chunk_size) * M);
             auto now = [] { return std::chrono::high_resolution_clock::now(); };
             auto secs_between = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
 
@@ -2284,8 +2309,8 @@ struct ChunkedKnnAccumulator {
                 if (chunk_c_size <= 0) continue;
                 ChunkTiming& tm = timing[static_cast<size_t>(c)];
 
-                std::vector<int32_t> run_nbrs(static_cast<size_t>(chunk_c_size) * M);
-                std::vector<float>   run_dists(static_cast<size_t>(chunk_c_size) * M);
+                run_nbrs.resize(static_cast<size_t>(chunk_c_size) * M);
+                run_dists.resize(static_cast<size_t>(chunk_c_size) * M);
                 auto t1 = now();
                 tm.alloc = secs_between(t0, t1);
 
@@ -2343,7 +2368,7 @@ struct ChunkedKnnAccumulator {
                         run_nbrs.data() + static_cast<size_t>(pos) * M,
                         run_dists.data() + static_cast<size_t>(pos) * M,
                         new_nbrs.data(), new_dists.data(), M,
-                        scratch);
+                        scratch, id_sort_buf);
                 }
                 if (n_records > 0) std::filesystem::remove(ip);
                 auto t4 = now();
