@@ -101,6 +101,24 @@ set_target_properties(bucket2 PROPERTIES
     BUILD_RPATH ${CONDA_LIB}
 )
 
+# TEMP DIAGNOSTIC: isolates whether linking raft::raft (e.g. RMM's custom
+# allocator) breaks OpenMP's num_threads() clause, independent of calling
+# any RAFT algorithm. Remove once the actual_num_threads=1 root cause is
+# found and fixed. See bucketDemo/debug/omp_probe_raft.cu.
+add_executable(omp_probe_raft ${CMAKE_CURRENT_SOURCE_DIR}/../debug/omp_probe_raft.cu)
+
+target_link_libraries(omp_probe_raft
+    PRIVATE
+    CUDA::cudart
+    OpenMP::OpenMP_CXX
+    raft::raft
+    fmt
+)
+
+set_target_properties(omp_probe_raft PROPERTIES
+    BUILD_RPATH ${CONDA_LIB}
+)
+
 # optimize: standalone tool that runs CAGRA sort_knn_graph + optimize on
 # the vector_knn.bin produced by bucket.cu, yielding a pruned CAGRA graph.
 add_executable(optimize ${BUILD_SRC_PATH}/optimize.cu)
