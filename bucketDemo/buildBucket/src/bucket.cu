@@ -18,6 +18,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <sched.h>
 
 // Boost
 #include <boost/program_options.hpp>
@@ -56,6 +57,32 @@
 
 namespace po = boost::program_options;
 using namespace bucket;
+
+// ============== TEMP DIAGNOSTIC: actual_num_threads=1 investigation ==============
+// Bisects whether OpenMP's num_threads() clause still works after CUDA/RAFT have
+// been initialized. Remove once the root cause of merge_iteration's
+// actual_num_threads=1 is found and fixed.
+static void omp_diag_probe(const char* label) {
+    int affinity_cpus = -1;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        affinity_cpus = CPU_COUNT(&set);
+    }
+    std::atomic<int> actual{0};
+    #pragma omp parallel num_threads(11)
+    {
+        #pragma omp single
+        { actual = omp_get_num_threads(); }
+    }
+    std::cout << "[OMP_DIAG] " << label
+              << ": omp_get_max_threads()=" << omp_get_max_threads()
+              << " omp_get_num_procs()=" << omp_get_num_procs()
+              << " sched_getaffinity_cpu_count=" << affinity_cpus
+              << " actual_num_threads(requested 11)=" << actual.load()
+              << std::endl;
+}
+// ============== END TEMP DIAGNOSTIC ==============
 
 // ============== Phase 1: LoadConfig & Memory Management ==============
 
@@ -3794,6 +3821,8 @@ int run_pipeline_impl(
                 std::cout << "  [ChunkedKNN] waited " << wait_s
                           << "s for previous iteration's background merge\n";
             }
+            omp_diag_probe(("main thread, right before dispatching merge for iter="
+                            + std::to_string(iter)).c_str());
             {
                 ChunkedKnnAccumulator* acc_ptr = knn_acc.get();
                 pending_knn_merge = std::async(std::launch::async,
@@ -3957,6 +3986,7 @@ int run_pipeline_impl(
 //   .ibin      → int32_t
 //   .ubin      → uint32_t
 int main(int argc, char** argv) {
+    omp_diag_probe("main() entry, before any CUDA/RAFT call");
     try {
         // ---- CLI parsing ----
         po::options_description desc("Bucket Builder Options");
