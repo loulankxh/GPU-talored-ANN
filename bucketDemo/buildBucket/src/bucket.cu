@@ -2891,15 +2891,31 @@ void build_vector_knn_with_tensorcore(
     int64_t processed_buckets = 0;
     auto loop_t0 = std::chrono::high_resolution_clock::now();
 
+    // ---- TEMP DIAGNOSTIC: fine-grained bucket-loop breakdown ----
+    // pure GEMM is already timed via cudaEvent above; this splits the
+    // remaining ~88-91% of loop wall-time into: stream-sync wait,
+    // scatter_pending (CPU merge of previous slot's results into acc),
+    // CPU-side pool_ids assembly (up to K memcpy's per bucket), and GPU
+    // submission (H2D + gather kernels + GEMM launch + select_k launch +
+    // D2H enqueue). Remove once we know where the time actually goes.
+    auto diag_now = [] { return std::chrono::high_resolution_clock::now(); };
+    auto diag_secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    double t_sync = 0, t_scatter = 0, t_poolbuild = 0, t_submit = 0;
+
     for (int64_t c = 0; c < n_centroids; ++c) {
         if (buckets[c].empty()) continue;
 
         int slot = static_cast<int>(c % num_slots);
 
         // ---- 3a: 等本 slot 上一轮 D2H 落地，scatter 老结果，腾出 buffer ----
+        auto dt0 = diag_now();
         CUDA_CHECK(cudaStreamSynchronize(streams[slot]));
+        auto dt1 = diag_now();
+        t_sync += diag_secs(dt0, dt1);
         consume_gemm_timing(slot);
         scatter_pending(slot);
+        auto dt2 = diag_now();
+        t_scatter += diag_secs(dt1, dt2);
 
         // ---- 3b: CPU 端拼 pool_ids ----
         // BatchAssign 里 line 791 强制 assignments[centroid_global_indices[c]] = c,
@@ -2920,9 +2936,14 @@ void build_vector_knn_with_tensorcore(
         int pool_size   = static_cast<int>(ofs);
         int bucket_size = static_cast<int>(bk.size());
         int actual_M    = std::min(M, pool_size - 1);
-        if (actual_M <= 0) continue;
+        if (actual_M <= 0) {
+            t_poolbuild += diag_secs(dt2, diag_now());
+            continue;
+        }
 
         std::memcpy(h_ids_bucket[slot], bk.data(), bk.size() * sizeof(int32_t));
+        auto dt3 = diag_now();
+        t_poolbuild += diag_secs(dt2, dt3);
 
         // ---- 3c: 上传 id 列表 (async on slot stream) ----
         CUDA_CHECK(cudaMemcpyAsync(d_ids_bucket[slot], h_ids_bucket[slot],
@@ -3051,6 +3072,8 @@ void build_vector_knn_with_tensorcore(
                                        cudaMemcpyDeviceToHost, streams[slot]));
         }
 
+        t_submit += diag_secs(dt3, diag_now());
+
         pending[slot] = {c, bucket_size, actual_M};
         ++processed_buckets;
     }
@@ -3073,6 +3096,15 @@ void build_vector_knn_with_tensorcore(
               << " ms/bucket avg, "
               << (gemm_total_ms / std::max(1e-6, loop_ms) * 100.0)
               << "% of loop wall-time\n";
+    {
+        double loop_s = loop_ms / 1000.0;
+        double sum_s = t_sync + t_scatter + t_poolbuild + t_submit;
+        std::cout << "  [VectorKNN] bucket loop breakdown: stream_sync=" << t_sync
+                  << "s scatter_pending=" << t_scatter
+                  << "s pool_build=" << t_poolbuild
+                  << "s gpu_submit=" << t_submit
+                  << "s (sum=" << sum_s << "s, loop_wall=" << loop_s << "s)\n";
+    }
 
     // ---- 释放 ----
     cudaFree(d_X_full);
