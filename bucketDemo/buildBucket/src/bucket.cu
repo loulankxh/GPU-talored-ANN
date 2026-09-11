@@ -18,7 +18,6 @@
 #include <chrono>
 #include <future>
 #include <memory>
-#include <sched.h>
 
 // Boost
 #include <boost/program_options.hpp>
@@ -57,32 +56,6 @@
 
 namespace po = boost::program_options;
 using namespace bucket;
-
-// ============== TEMP DIAGNOSTIC: actual_num_threads=1 investigation ==============
-// Bisects whether OpenMP's num_threads() clause still works after CUDA/RAFT have
-// been initialized. Remove once the root cause of merge_iteration's
-// actual_num_threads=1 is found and fixed.
-static void omp_diag_probe(const char* label) {
-    int affinity_cpus = -1;
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-        affinity_cpus = CPU_COUNT(&set);
-    }
-    std::atomic<int> actual{0};
-    #pragma omp parallel num_threads(11)
-    {
-        #pragma omp single
-        { actual = omp_get_num_threads(); }
-    }
-    std::cout << "[OMP_DIAG] " << label
-              << ": omp_get_max_threads()=" << omp_get_max_threads()
-              << " omp_get_num_procs()=" << omp_get_num_procs()
-              << " sched_getaffinity_cpu_count=" << affinity_cpus
-              << " actual_num_threads(requested 11)=" << actual.load()
-              << std::endl;
-}
-// ============== END TEMP DIAGNOSTIC ==============
 
 // ============== Phase 1: LoadConfig & Memory Management ==============
 
@@ -3821,8 +3794,6 @@ int run_pipeline_impl(
                 std::cout << "  [ChunkedKNN] waited " << wait_s
                           << "s for previous iteration's background merge\n";
             }
-            omp_diag_probe(("main thread, right before dispatching merge for iter="
-                            + std::to_string(iter)).c_str());
             {
                 ChunkedKnnAccumulator* acc_ptr = knn_acc.get();
                 pending_knn_merge = std::async(std::launch::async,
@@ -3838,13 +3809,16 @@ int run_pipeline_impl(
         }   // end of per-iteration loop
 
         // 最后一轮的 merge 还在后台跑，finalize 之前必须等它跑完，否则
-        // running_chunk_*.bin 可能还没写完整就被读走。
+        // running_chunk_*.bin 可能还没写完整就被读走。这段等待没有下一轮 GPU
+        // 工作可以覆盖，是完成 Step 6 全部工作必须付出的代价，因此计入
+        // elapsed_step6 (否则 Timing Summary 里各 Step 之和会小于 Total)。
         if (pending_knn_merge.valid()) {
             auto t_wait = Clock::now();
             pending_knn_merge.get();
             double wait_s = std::chrono::duration<double>(Clock::now() - t_wait).count();
             std::cout << "[ChunkedKNN] waited " << wait_s
                       << "s for the last iteration's background merge\n";
+            elapsed_step6 += wait_s;
         }
 
         // 把按 chunk 分片的 running 状态 (跨全部 iteration 合并去重后的最终
@@ -3986,7 +3960,6 @@ int run_pipeline_impl(
 //   .ibin      → int32_t
 //   .ubin      → uint32_t
 int main(int argc, char** argv) {
-    omp_diag_probe("main() entry, before any CUDA/RAFT call");
     try {
         // ---- CLI parsing ----
         po::options_description desc("Bucket Builder Options");
