@@ -18,6 +18,7 @@
 #include <chrono>
 #include <future>
 #include <memory>
+#include <sys/resource.h>
 
 // Boost
 #include <boost/program_options.hpp>
@@ -2113,11 +2114,25 @@ struct ChunkedKnnAccumulator {
         acc.N = N;
         acc.M = M;
 
-        // chunk 数量目标 ~500k 点/chunk，但不超过 512 个 (同时打开的文件句柄
-        // 数上限，避免撞 ulimit -n)；N 很大时 chunk_size 会自动放大来满足这
-        // 个上限。
-        constexpr int64_t kTargetChunkPoints = 500000;
-        constexpr int64_t kMaxOpenChunks = 512;
+        // chunk 数量目标 ~50k 点/chunk (kMaxOpenChunks 撞顶前)。
+        //
+        // num_chunks 撞到硬顶时 chunk_size = ceil(N/num_chunks) 会反过来自动
+        // 放大——如果硬顶写死一个较小的值 (比如旧版本的 512)，N 很大时
+        // chunk_size 会远超目标粒度，单个 chunk 常驻内存膨胀，merge 阶段能
+        // 塞进内存预算的并发 chunk 数反而变少。所以硬顶不再写死，而是按当前
+        // 进程实际的 RLIMIT_NOFILE 软限制动态算 (main() 已经尽量把这个软限制
+        // 提到硬限制附近)，只留一点余量给 stdin/stdout/stderr/共享库/GPU
+        // driver 等本来就占用的句柄。
+        constexpr int64_t kTargetChunkPoints = 50000;
+        int64_t kMaxOpenChunks = 512;  // getrlimit 失败时的兜底默认值
+        {
+            struct rlimit rl;
+            if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+                constexpr rlim_t kFdReserve = 64;
+                rlim_t usable = (rl.rlim_cur > kFdReserve) ? (rl.rlim_cur - kFdReserve) : 1;
+                kMaxOpenChunks = std::max<int64_t>(1, static_cast<int64_t>(usable));
+            }
+        }
         int64_t n_by_target = std::max<int64_t>(1, (N + kTargetChunkPoints - 1) / kTargetChunkPoints);
         acc.num_chunks = std::min(n_by_target, kMaxOpenChunks);
         acc.chunk_size = (N + acc.num_chunks - 1) / acc.num_chunks;
@@ -3999,6 +4014,32 @@ int run_pipeline_impl(
 //   .ubin      → uint32_t
 int main(int argc, char** argv) {
     try {
+        // ---- 提高 RLIMIT_NOFILE ----
+        // ChunkedKnnAccumulator 在 Step 6 build 期间给每个 chunk 常驻打开一个
+        // arrival 文件句柄 (num_chunks 个)。默认 soft limit 常常只有 1024，
+        // 但 hard limit 通常大得多；soft limit 在 hard limit 范围内可以无需
+        // root 权限直接提升，只影响本进程。这里尽量提到 hard limit (封顶
+        // 65536)，让 ChunkedKnnAccumulator::create 算出来的 kMaxOpenChunks
+        // 能有足够余量，不用再手动 `ulimit -n` 之后才跑。
+        {
+            struct rlimit rl;
+            if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+                rlim_t target = std::min<rlim_t>(65536, rl.rlim_max);
+                if (rl.rlim_cur < target) {
+                    rlim_t old_cur = rl.rlim_cur;
+                    rl.rlim_cur = target;
+                    if (setrlimit(RLIMIT_NOFILE, &rl) == 0) {
+                        std::cout << "[main] Raised RLIMIT_NOFILE soft limit: "
+                                  << old_cur << " -> " << target << "\n";
+                    } else {
+                        std::cout << "[main] Warning: failed to raise RLIMIT_NOFILE "
+                                     "(soft=" << old_cur << ", hard=" << rl.rlim_max
+                                  << "); num_chunks will be sized conservatively.\n";
+                    }
+                }
+            }
+        }
+
         // ---- RMM 内存池 ----
         // RAFT 内部 (select_k / KMeans / CAGRA 等) 大量用 rmm::device_uvector
         // 做临时 scratch 分配；不装内存池的话，默认每次都是裸的
