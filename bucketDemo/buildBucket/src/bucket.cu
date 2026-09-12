@@ -2114,16 +2114,30 @@ struct ChunkedKnnAccumulator {
         acc.N = N;
         acc.M = M;
 
-        // chunk 数量目标 ~50k 点/chunk (kMaxOpenChunks 撞顶前)。
+        // ---- chunk 数量/大小：由内存预算 + 本机核心数反推，不再写死常量 ----
         //
-        // num_chunks 撞到硬顶时 chunk_size = ceil(N/num_chunks) 会反过来自动
-        // 放大——如果硬顶写死一个较小的值 (比如旧版本的 512)，N 很大时
-        // chunk_size 会远超目标粒度，单个 chunk 常驻内存膨胀，merge 阶段能
-        // 塞进内存预算的并发 chunk 数反而变少。所以硬顶不再写死，而是按当前
-        // 进程实际的 RLIMIT_NOFILE 软限制动态算 (main() 已经尽量把这个软限制
-        // 提到硬限制附近)，只留一点余量给 stdin/stdout/stderr/共享库/GPU
-        // driver 等本来就占用的句柄。
-        constexpr int64_t kTargetChunkPoints = 50000;
+        // 目标 chunk_size 反过来算：如果想让 merge 阶段真的能同时调动
+        // desired_parallelism (= 本机 omp_get_max_threads()) 个线程各自处理
+        // 一个 chunk，在 cpu_mem_budget_bytes 这个总预算下，每个 chunk 能分
+        // 到多少常驻内存 (每点 M*2*4B，nbrs+dists)？反推出 chunk_size，再算
+        // num_chunks = ceil(N/chunk_size)。这样 chunk 粒度会随数据集大小、
+        // --cpu-limit、以及机器核心数自动变化，不需要手调常量。
+        //
+        // kMinChunkPoints 是下限，防止内存预算特别紧或核心数特别多时 chunk
+        // 碎成不合理的小块 (per-chunk 固定开销、文件数量会失控)；这种情况下
+        // 实际能达到的并发数会小于核心数，这是合理的降级，比强行切碎更好。
+        //
+        // num_chunks 还要再按 RLIMIT_NOFILE 的实际余量封顶 (Step 6 build 期间
+        // 每个 chunk 常驻打开一个 arrival 文件句柄；main() 已尽量把软限制提到
+        // 硬限制附近)。撞顶时 chunk_size 会相应放大，这是唯一还需要的兜底。
+        constexpr int64_t kMinChunkPoints = 10000;
+        int desired_parallelism = std::max(1, omp_get_max_threads());
+        size_t bytes_per_point = static_cast<size_t>(M) * 2 * sizeof(int32_t);  // nbrs+dists
+        size_t mem_per_chunk_budget = std::max<size_t>(1,
+            cpu_mem_budget_bytes / static_cast<size_t>(desired_parallelism));
+        int64_t chunk_size_from_mem = std::max<int64_t>(kMinChunkPoints,
+            static_cast<int64_t>(mem_per_chunk_budget / std::max<size_t>(1, bytes_per_point)));
+
         int64_t kMaxOpenChunks = 512;  // getrlimit 失败时的兜底默认值
         {
             struct rlimit rl;
@@ -2133,15 +2147,15 @@ struct ChunkedKnnAccumulator {
                 kMaxOpenChunks = std::max<int64_t>(1, static_cast<int64_t>(usable));
             }
         }
-        int64_t n_by_target = std::max<int64_t>(1, (N + kTargetChunkPoints - 1) / kTargetChunkPoints);
-        acc.num_chunks = std::min(n_by_target, kMaxOpenChunks);
+        int64_t n_by_mem = std::max<int64_t>(1,
+            (N + chunk_size_from_mem - 1) / chunk_size_from_mem);
+        acc.num_chunks = std::min(n_by_mem, kMaxOpenChunks);
         acc.chunk_size = (N + acc.num_chunks - 1) / acc.num_chunks;
 
-        size_t per_chunk_bytes = static_cast<size_t>(acc.chunk_size) * M * 2 * sizeof(int32_t);
-        int max_threads = omp_get_max_threads();
+        size_t per_chunk_bytes = static_cast<size_t>(acc.chunk_size) * bytes_per_point;
         int budget_threads = static_cast<int>(std::max<size_t>(1,
             cpu_mem_budget_bytes / std::max<size_t>(1, per_chunk_bytes)));
-        acc.merge_parallelism = std::max(1, std::min(max_threads, budget_threads));
+        acc.merge_parallelism = std::max(1, std::min(desired_parallelism, budget_threads));
 
         constexpr size_t kBufferBytes = 256 * 1024;
         size_t rec_bytes = record_bytes(M);
