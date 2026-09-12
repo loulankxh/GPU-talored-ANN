@@ -3444,6 +3444,7 @@ int run_pipeline_impl(
         double elapsed_step3p5 = 0, elapsed_step4 = 0, elapsed_step5 = 0;
         double elapsed_step6 = 0, elapsed_step7 = 0;
         double elapsed_write_knn = 0;
+        double elapsed_final_merge_wait = 0;
 
         // ================================================================
         // Step 1: Read header + prepare sampled data for centroid selection
@@ -3845,15 +3846,16 @@ int run_pipeline_impl(
 
         // 最后一轮的 merge 还在后台跑，finalize 之前必须等它跑完，否则
         // running_chunk_*.bin 可能还没写完整就被读走。这段等待没有下一轮 GPU
-        // 工作可以覆盖，是完成 Step 6 全部工作必须付出的代价，因此计入
-        // elapsed_step6 (否则 Timing Summary 里各 Step 之和会小于 Total)。
+        // 工作可以覆盖，是结构性的尾部开销，单独算一项 (不并入 Step 6)，这样
+        // Step 6 的数字反映的是"build+pipeline 后仍暴露出来的 merge 时间"，
+        // 跟这段"收尾必须等的时间"分开看。
         if (pending_knn_merge.valid()) {
             auto t_wait = Clock::now();
             pending_knn_merge.get();
             double wait_s = std::chrono::duration<double>(Clock::now() - t_wait).count();
             std::cout << "[ChunkedKNN] waited " << wait_s
                       << "s for the last iteration's background merge\n";
-            elapsed_step6 += wait_s;
+            elapsed_final_merge_wait = wait_s;
         }
 
         // 把按 chunk 分片的 running 状态 (跨全部 iteration 合并去重后的最终
@@ -3950,6 +3952,7 @@ int run_pipeline_impl(
         std::cout << "  Step 5   (Write buckets):       " << elapsed_step5 << "s\n";
         if (neighbors_m > 0) {
             std::cout << "  Step 6   (Per-vector KNN, merge included):      " << elapsed_step6 << "s\n";
+            std::cout << "  Wait     (final iteration's background merge):  " << elapsed_final_merge_wait << "s\n";
             std::cout << "  Write    (close + .npy convert):    " << elapsed_write_knn << "s\n";
         }
         if (do_reorder)
