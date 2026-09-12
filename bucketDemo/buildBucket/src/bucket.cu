@@ -42,6 +42,9 @@
 #include <raft/random/rng.cuh>
 #include <raft/matrix/select_k.cuh>
 #include <rmm/device_uvector.hpp>
+#include <rmm/mr/device/cuda_memory_resource.hpp>
+#include <rmm/mr/device/pool_memory_resource.hpp>
+#include <rmm/mr/device/per_device_resource.hpp>
 #include <thrust/copy.h>
 #include <thrust/reduce.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -3993,6 +3996,23 @@ int run_pipeline_impl(
 //   .ubin      → uint32_t
 int main(int argc, char** argv) {
     try {
+        // ---- RMM 内存池 ----
+        // RAFT 内部 (select_k / KMeans / CAGRA 等) 大量用 rmm::device_uvector
+        // 做临时 scratch 分配；不装内存池的话，默认每次都是裸的
+        // cudaMalloc/cudaFree —— 这两个调用同步且昂贵。Step 6 的 bucket 循环
+        // 每 iteration 调用 10000 次 select_k，profiling 显示这段"提交 GPU
+        // 工作"的耗时占了 loop wall time 的 65-78%，远超纯 kernel launch 应有
+        // 的开销，怀疑就是这里。池子选比较保守的初始/上限大小，避免跟
+        // build_vector_knn_with_tensorcore 里基于 cudaMemGetInfo 做的显存
+        // 预算打架 (那部分是裸 cudaMalloc，不走 RMM，不受这个池影响)。
+        static auto cuda_mr = std::make_shared<rmm::mr::cuda_memory_resource>();
+        static auto pool_mr = std::make_shared<
+            rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>(
+                cuda_mr.get(),
+                256UL * 1024 * 1024,        // initial pool size: 256MB
+                2UL * 1024 * 1024 * 1024);  // max pool size: 2GB, grows on demand
+        rmm::mr::set_current_device_resource(pool_mr.get());
+
         // ---- CLI parsing ----
         po::options_description desc("Bucket Builder Options");
         desc.add_options()
