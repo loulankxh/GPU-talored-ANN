@@ -746,8 +746,6 @@ __global__ void greedy_graph_search_topK_kernel(
 // 目的: Step 4 算完每个点的 bucket 分配后，把它的原始向量 (D 个 DataT 分量)
 // 连同 gid 一起顺序追加写进"这个 bucket 专属"的文件里——数据只经过一次磁盘
 // 读 (batch 读入原始数据) + 一次磁盘写 (追加进 bucket 文件)，不会被重复读。
-// Step 6 需要某个 bucket (或它的邻居 bucket) 的原始向量时，直接顺序整块读这
-// 一个文件即可，不用碰原始输入文件、不用等 GPU 从整份常驻显存里 gather。
 //
 // 每条记录格式: int64_t gid + D 个 DataT 分量。记录自带 gid，Step 6/7 读回
 // 来的时候不需要依赖"文件第 i 行对应某个外部列表第 i 个 id"这种隐式顺序假设。
@@ -756,6 +754,15 @@ __global__ void greedy_graph_search_topK_kernel(
 // 因为 num_chunks 量级是几十；这里 n_centroids 可能是几千上万)，而是先定一个
 // 总缓冲区内存预算，再除以 n_centroids 分给每个 bucket，这样总内存不会随桶数
 // 线性暴涨。
+//
+// 读侧 (合并进单文件): Step 6 对每个 bucket c 要读它自己 + centroid KNN 图上
+// K 个邻居 bucket 的向量，而同一个 bucket 平均会被 ~K 个不同的 c 当作邻居
+// 读到——如果像写侧那样每个 bucket 各自一个小文件、每次读都重新 open，
+// n_centroids * (1+K) 量级的 open()/close() 系统调用开销才是真正的瓶颈
+// (远超实际读盘字节数对应的带宽耗时)。所以 finish_iteration() 末尾会把所有
+// 小文件顺序拷贝合并成一个大文件 + 只有 n_centroids 个 int64 的 offset 表
+// (任何规模都不是内存问题)，之后 Step 6/7 全程只在这一个已经打开的句柄上
+// seekg+read，不再重复 open。
 template <typename DataT>
 struct BucketVectorAccumulator {
     std::string dir;
@@ -770,6 +777,10 @@ struct BucketVectorAccumulator {
         std::ofstream file;
     };
     std::vector<BucketBuf> bufs;
+
+    std::string merged_path;
+    std::vector<int64_t> merged_offset;  // 每个 bucket 在合并文件里的起始字节偏移
+    std::ifstream merged_in;             // Step 6/7 共用的持久读句柄
 
     static constexpr size_t record_bytes(int64_t D) {
         return sizeof(int64_t) + static_cast<size_t>(D) * sizeof(DataT);
@@ -787,6 +798,7 @@ struct BucketVectorAccumulator {
         acc.dir = dir;
         acc.n_centroids = n_centroids;
         acc.D = D;
+        acc.merged_path = dir + "/bucket_vecs_merged.bin";
 
         constexpr size_t kMinBufferBytesPerBucket = 4096;  // ~1 个文件系统块，下限
         size_t rec_bytes = record_bytes(D);
@@ -840,31 +852,68 @@ struct BucketVectorAccumulator {
         if (b.count == b.capacity_records) flush_bucket(bucket_id);
     }
 
+    // 1) flush + 关闭所有 per-bucket 写文件; 2) 按 bucket 顺序把它们的内容
+    // 顺序拷贝进一个合并文件 (纯顺序 I/O，磁盘带宽 bound，不是 open 开销
+    // bound)，记录每个 bucket 的字节偏移，随后删掉对应的小文件; 3) 打开一个
+    // 持久的读句柄供 Step 6/7 使用。
     void finish_iteration() {
         for (int64_t c = 0; c < n_centroids; ++c) {
             flush_bucket(c);
             bufs[static_cast<size_t>(c)].file.close();
         }
+
+        merged_offset.assign(static_cast<size_t>(n_centroids), 0);
+        std::ofstream mout(merged_path, std::ios::binary | std::ios::trunc);
+        if (!mout.is_open())
+            throw std::runtime_error("BucketVectorAccumulator: cannot open " + merged_path + " for write");
+
+        size_t rec_bytes = record_bytes(D);
+        int64_t pos = 0;
+        std::vector<char> copy_buf;
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            merged_offset[static_cast<size_t>(c)] = pos;
+            int64_t cnt = bufs[static_cast<size_t>(c)].total_count;
+            if (cnt == 0) continue;
+
+            std::string p = bucket_path(dir, c);
+            size_t nbytes = static_cast<size_t>(cnt) * rec_bytes;
+            copy_buf.resize(nbytes);
+            {
+                std::ifstream in(p, std::ios::binary);
+                if (!in.is_open())
+                    throw std::runtime_error("BucketVectorAccumulator: cannot open " + p + " for merge");
+                in.read(copy_buf.data(), static_cast<std::streamsize>(nbytes));
+                if (!in.good())
+                    throw std::runtime_error("BucketVectorAccumulator: merge-read failed for bucket " + std::to_string(c));
+            }
+            mout.write(copy_buf.data(), static_cast<std::streamsize>(nbytes));
+            if (!mout.good())
+                throw std::runtime_error("BucketVectorAccumulator: merge-write failed for bucket " + std::to_string(c));
+            pos += static_cast<int64_t>(nbytes);
+
+            std::filesystem::remove(p);
+        }
+        mout.close();
+
+        merged_in.open(merged_path, std::ios::binary);
+        if (!merged_in.is_open())
+            throw std::runtime_error("BucketVectorAccumulator: cannot open " + merged_path + " for read");
     }
 
     int64_t count(int64_t c) const { return bufs[static_cast<size_t>(c)].total_count; }
 
-    // 顺序整块读出 bucket c 的全部 (gid, vector) 记录。
-    void read_bucket(int64_t c, std::vector<int64_t>& ids_out, std::vector<DataT>& vecs_out) const {
+    // 顺序整块读出 bucket c 的全部 (gid, vector) 记录 (从合并文件里按已知偏移 seek)。
+    void read_bucket(int64_t c, std::vector<int64_t>& ids_out, std::vector<DataT>& vecs_out) {
         int64_t cnt = count(c);
         ids_out.resize(static_cast<size_t>(cnt));
         vecs_out.resize(static_cast<size_t>(cnt) * static_cast<size_t>(D));
         if (cnt == 0) return;
 
-        std::string path = bucket_path(dir, c);
-        std::ifstream in(path, std::ios::binary);
-        if (!in.is_open())
-            throw std::runtime_error("BucketVectorAccumulator: cannot open " + path + " for read");
-
         size_t rec_bytes = record_bytes(D);
         std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
-        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
-        if (!in.good())
+        merged_in.seekg(static_cast<std::streamoff>(merged_offset[static_cast<size_t>(c)]));
+        merged_in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+        if (!merged_in.good())
             throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
 
         for (int64_t i = 0; i < cnt; ++i) {
@@ -878,19 +927,15 @@ struct BucketVectorAccumulator {
     // 跟 read_bucket 一样，但直接写进调用方提供的缓冲区 (ids_out_ptr 至少
     // count(c) 个 int64_t，vecs_out_ptr 至少 count(c)*D 个 DataT)，省掉每次
     // 调用都新分配 vector 的开销——热循环 (Step 6 逐 bucket) 里用这个。
-    void read_bucket_into(int64_t c, int64_t* ids_out_ptr, DataT* vecs_out_ptr) const {
+    void read_bucket_into(int64_t c, int64_t* ids_out_ptr, DataT* vecs_out_ptr) {
         int64_t cnt = count(c);
         if (cnt == 0) return;
 
-        std::string path = bucket_path(dir, c);
-        std::ifstream in(path, std::ios::binary);
-        if (!in.is_open())
-            throw std::runtime_error("BucketVectorAccumulator: cannot open " + path + " for read");
-
         size_t rec_bytes = record_bytes(D);
         std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
-        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
-        if (!in.good())
+        merged_in.seekg(static_cast<std::streamoff>(merged_offset[static_cast<size_t>(c)]));
+        merged_in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+        if (!merged_in.good())
             throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
 
         for (int64_t i = 0; i < cnt; ++i) {
@@ -902,9 +947,8 @@ struct BucketVectorAccumulator {
     }
 
     void remove_all_files() {
-        for (int64_t c = 0; c < n_centroids; ++c) {
-            std::filesystem::remove(bucket_path(dir, c));
-        }
+        merged_in.close();
+        std::filesystem::remove(merged_path);
     }
 };
 
