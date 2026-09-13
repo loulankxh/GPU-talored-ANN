@@ -3675,13 +3675,17 @@ int run_pipeline_impl(
     try {
         init_gpu_limit_if_needed(config);
 
-        // 在 output_root 下建子目录: k<knn_k>p<nprobe>m<neighbors_m>
-        // knn_k = 图度数 K; nprobe = Step 6 邻居扩展数 (0 时回退到 knn_k)
+        // 在 output_root 下建子目录: k<knn_k>p<nprobe>m<neighbors_m>t<iterations>
+        // knn_k = 图度数 K; nprobe = Step 6 邻居扩展数 (0 时回退到 knn_k);
+        // iterations (t) 必须编码进目录名——它决定了 Step2-6 重复轮数/去重
+        // 合并结果，跟 k/p/m 一样是影响 vector_knn.bin 内容的参数，否则不同
+        // --iterations 的两次跑会覆盖同一个目录。
         uint32_t output_nprobe = (nprobe > 0) ? nprobe : config.knn_k;
         std::string output_dir = output_root
                                + "/k" + std::to_string(config.knn_k)
                                + "p" + std::to_string(output_nprobe)
-                               + "m" + std::to_string(neighbors_m);
+                               + "m" + std::to_string(neighbors_m)
+                               + "t" + std::to_string(iterations);
         std::filesystem::create_directories(output_dir);
         std::cout << "Output subdir: " << output_dir << "\n";
 

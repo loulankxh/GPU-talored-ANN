@@ -111,7 +111,7 @@ python3 generate_test_data.py
 | 参数 | 必需/可选（默认值） | 说明 |
 |---|---|---|
 | `-i, --input` | 必需 | 输入数据文件（.fbin/.bin/.u8bin/.i8bin/.ibin/.ubin） |
-| `-o, --output` | 必需 | 输出目录 |
+| `-o, --output` | 必需 | 输出根目录；实际产出文件会写在其下自动创建的 `k<knn-k>p<nprobe或knn-k>m<neighbors-m>t<iterations>/` 子目录里（例如下面示例参数会产出 `output/bucket2_test/k32p32m32t1/`），因为这几个参数都会实质性影响 `vector_knn.bin` 的内容，编码进目录名可以避免不同参数组合的跑批互相覆盖 |
 | `--cpu-limit` | 可选（16GB） | CPU 内存限制（字节） |
 | `--gpu-limit` | 可选（0=自动检测可用显存的 95%） | GPU 内存限制（字节） |
 | `--bucket-vec-buffer` | 可选（1GB） | Step4 按 bucket 缓存原始向量 (BucketVectorAccumulator) 的写缓冲区**总**预算（字节），会按 n_centroids 平摊到每个桶，不是每个桶单独这么多；数据集越大、桶数越多，单个桶分到的缓冲区越小 |
@@ -134,8 +134,8 @@ python3 generate_test_data.py
 ```bash
 ./build/optimize \
     -i test_data/vectors_100k_128d.fbin \
-    -g output/bucket2_test/vector_knn.bin \
-    -o output/bucket2_test/cagra_graph.bin \
+    -g output/bucket2_test/k32p32m32t1/vector_knn.bin \
+    -o output/bucket2_test/k32p32m32t1/cagra_graph.bin \
     --output-degree 32
 ```
 
@@ -153,10 +153,10 @@ python3 generate_test_data.py
 ```bash
 # 方案3 = Method C，需要先跑过 --reorder 或 reorder 得到 bucket_offsets.bin
 ./build/optimize_chunked \
-    -g output/bucket2_test/cagra_graph.bin \
-    -o output/bucket2_test/cagra_graph_merged.bin \
+    -g output/bucket2_test/k32p32m32t1/cagra_graph.bin \
+    -o output/bucket2_test/k32p32m32t1/cagra_graph_merged.bin \
     -m C \
-    --bucket-offsets output/bucket2_test/bucket_offsets.bin \
+    --bucket-offsets output/bucket2_test/k32p32m32t1/bucket_offsets.bin \
     --gpu-budget-mb 8000 \
     --rev-degree-cap 0
 ```
@@ -176,12 +176,12 @@ python3 generate_test_data.py
 ```bash
 ./build/reorder \
     -i test_data/vectors_100k_128d.fbin \
-    -x output/bucket2_test/bucket_index.bin \
-    -d output/bucket2_test/bucket_data.bin \
-    -k output/bucket2_test/vector_knn.bin \
-    -c output/bucket2_test/centroid_knn.bin \
+    -x output/bucket2_test/k32p32m32t1/bucket_index.bin \
+    -d output/bucket2_test/k32p32m32t1/bucket_data.bin \
+    -k output/bucket2_test/k32p32m32t1/vector_knn.bin \
+    -c output/bucket2_test/k32p32m32t1/centroid_knn.bin \
     --order-window 0 \
-    -o output/bucket2_test/reordered
+    -o output/bucket2_test/k32p32m32t1/reordered
 ```
 
 | 参数 | 必需/可选（默认值） | 说明 |
@@ -198,10 +198,10 @@ python3 generate_test_data.py
 
 ```bash
 # search 子命令：算召回率
-../search search \
+./build search \
     --base test_data/vectors_100k_128d.fbin \
     --query <query_file> \
-    --index output/bucket2_test/neighbors.npy \
+    --index output/bucket2_test/k32p32m32t1/neighbors.npy \
     --gt <ground_truth.ibin> \
     --topk 10 --ef 200 --num-entry 4
 
