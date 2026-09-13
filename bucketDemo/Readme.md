@@ -114,6 +114,7 @@ python3 generate_test_data.py
 | `-o, --output` | 必需 | 输出目录 |
 | `--cpu-limit` | 可选（16GB） | CPU 内存限制（字节） |
 | `--gpu-limit` | 可选（0=自动检测可用显存的 95%） | GPU 内存限制（字节） |
+| `--bucket-vec-buffer` | 可选（1GB） | Step4 按 bucket 缓存原始向量 (BucketVectorAccumulator) 的写缓冲区**总**预算（字节），会按 n_centroids 平摊到每个桶，不是每个桶单独这么多；数据集越大、桶数越多，单个桶分到的缓冲区越小 |
 | `--sample-rate` | 可选（0.1） | 采样比例 [0,1] |
 | `--centroid-ratio` | 可选（0.01） | 桶心比例（相对采样数据），决定桶数/平均桶大小 |
 | `--use-pq` | 可选（false） | 强制 PQ 量化 —— **注意**：这里是 `po::value<bool>`，必须显式传值，如 `--use-pq true`（不同于 `bucket` 的开关式 `--use-pq`） |

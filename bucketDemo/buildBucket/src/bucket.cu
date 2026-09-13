@@ -71,6 +71,9 @@ struct LoadConfig {
     // Memory limits
     size_t cpu_limit_bytes;        // CPU memory limit, default 16GB
     size_t gpu_limit_bytes;        // GPU memory limit, default 0 (auto-detect via cudaMemGetInfo)
+    size_t bucket_vec_buffer_bytes; // Step 4 BucketVectorAccumulator total write-buffer budget,
+                                    // default 1GB. Not per-bucket -- split across all n_centroids
+                                    // buckets, so it stays flat regardless of dataset/bucket count.
 
     // Sampling and Centroid parameters
     float sample_rate;             // Sampling ratio [0, 1], default 0.1 (10%)
@@ -99,6 +102,7 @@ struct LoadConfig {
     LoadConfig() :
         cpu_limit_bytes(16UL << 30),    // 16GB
         gpu_limit_bytes(0),             // Auto-detect
+        bucket_vec_buffer_bytes(1UL << 30),  // 1GB
         sample_rate(0.1f),
         centroid_ratio(0.01f),
         pq_bits_start(8),
@@ -507,6 +511,9 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
     }
     if (vm.count("gpu-limit")) {
         config.gpu_limit_bytes = vm["gpu-limit"].as<size_t>();
+    }
+    if (vm.count("bucket-vec-buffer")) {
+        config.bucket_vec_buffer_bytes = vm["bucket-vec-buffer"].as<size_t>();
     }
     if (vm.count("sample-rate")) {
         config.sample_rate = vm["sample-rate"].as<float>();
@@ -3861,7 +3868,7 @@ int run_pipeline_impl(
         // 用到的都 truncate 掉，不用手动清上一轮的。
         bucket_vecs_ptr = std::make_unique<BucketVectorAccumulator<DataT>>(
             BucketVectorAccumulator<DataT>::create(
-                bucket_vec_dir, n_centroids, D, config.cpu_limit_bytes / 8));
+                bucket_vec_dir, n_centroids, D, config.bucket_vec_buffer_bytes));
         bucket_vecs_ptr->start_iteration();
 
         cudaDeviceSynchronize();
@@ -4288,6 +4295,7 @@ int main(int argc, char** argv) {
                 "Output directory for bucket files")
             ("cpu-limit",     po::value<size_t>(),     "CPU memory limit (bytes)")
             ("gpu-limit",     po::value<size_t>(),     "GPU memory limit (bytes, 0=auto)")
+            ("bucket-vec-buffer", po::value<size_t>(),  "Step 4 bucket-vector-cache total write-buffer budget across all buckets (bytes, default 1GB)")
             ("sample-rate",   po::value<float>(),      "Sampling ratio (default 0.1)")
             ("centroid-ratio", po::value<float>(),     "Centroid ratio (default 0.01)")
             ("use-pq",        po::value<bool>(),       "Force PQ quantization")
