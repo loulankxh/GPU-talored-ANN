@@ -275,6 +275,35 @@ inline void read_bigann_raw_sampled(const std::string& path,
     }
 }
 
+// 从 BIGANN 文件里读一段连续的行 [start_row, start_row+num_rows)（不做类型
+// 转换，element type = T）。一次 seek + 一次顺序 bulk read，用于"这批 id 基本
+// 连续"的场景 (比如按升序处理的 batch)，比逐行 seek 快得多。out 按行序排列，
+// 调用方自己按 (global_id - start_row) 换算行内偏移。
+template <typename T>
+inline void read_bigann_raw_range(const std::string& path,
+                                  int64_t start_row, int64_t num_rows,
+                                  std::vector<T>& out,
+                                  int32_t& N, int32_t& D) {
+    std::ifstream in(path, std::ios::binary);
+    require(in.is_open(), "Cannot open file: " + path);
+
+    auto [n, d] = read_bigann_header(in);
+    N = n; D = d;
+    require(start_row >= 0 && start_row + num_rows <= n,
+            "read_bigann_raw_range: row range out of bounds");
+
+    constexpr std::streamoff header_bytes = 2 * sizeof(int32_t);
+    std::streamoff offset = header_bytes +
+        static_cast<std::streamoff>(start_row) * static_cast<std::streamoff>(d) * sizeof(T);
+    in.seekg(offset);
+
+    const uint64_t cnt = static_cast<uint64_t>(num_rows) * static_cast<uint64_t>(d);
+    out.resize(cnt);
+    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(cnt * sizeof(T)));
+    require(in.good(), "read_bigann_raw_range: failed to read rows ["
+                       + std::to_string(start_row) + ", " + std::to_string(start_row + num_rows) + ")");
+}
+
 // 推断 BIGANN 文件扩展名对应的元素类型大小（字节数）。
 inline size_t element_size_for_ext(const std::string& ext) {
     if (ext == ".fbin" || ext == ".bin")    return sizeof(float);

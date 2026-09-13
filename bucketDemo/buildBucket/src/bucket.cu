@@ -744,11 +744,14 @@ __global__ void greedy_graph_search_topK_kernel(
  *
  * @tparam T                     原始数据元素类型 (float, uint8_t, uint32_t 等)
  * @tparam CentroidT             centroid 在 GPU 上的数据类型 (float 或 uint8_t)
- * @param X_full                 完整原始数据集 (N * D, T, row-major, CPU)
+ * @param input_path             原始数据集文件路径 (磁盘上, BIGANN 格式)；不再
+ *                               整份读进内存，按 batch 顺序读取需要的连续区间
  * @param N                      数据点总数
  * @param D                      向量维度
  * @param n_centroids            centroid 数量
  * @param centroid_global_indices 每个 centroid 在原始数据中的全局索引
+ * @param bucket_vecs            每个点分配结果一确定，就把它的原始向量顺手写
+ *                               进对应 bucket 的磁盘文件 (供 Step 6 顺序读取)
  * @param d_centroids            centroid 数据 (n_centroids * D, CentroidT, 已在 GPU)
  * @param centroid_gpu_bytes     centroid 数据在 GPU 上占用的字节数
  * @param d_graph                centroid KNN 图 (n_centroids * K, uint32, 已在 GPU)
@@ -762,11 +765,12 @@ __global__ void greedy_graph_search_topK_kernel(
  */
 template <typename T, typename CentroidT>
 std::vector<int64_t> batch_assign_with_cagra_anns(
-    const T* X_full,
+    const std::string& input_path,
     int64_t N,
     int64_t D,
     int64_t n_centroids,
     const std::vector<int64_t>& centroid_global_indices,
+    BucketVectorAccumulator<T>& bucket_vecs,
     CentroidT* d_centroids,
     size_t centroid_gpu_bytes,
     uint32_t* d_graph,
@@ -792,6 +796,20 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         }
     }
     int64_t N_nc = static_cast<int64_t>(non_centroid_indices.size());
+
+    // centroid 自己的点不走下面的 batch 循环 (提前分配给自身)，这里单独把它们
+    // 的原始向量补写进各自的 bucket 文件。n_centroids 条，一次性小读，不是要
+    // 避免的那种"整份数据集常驻"。
+    {
+        std::vector<T> centroid_vecs_raw;
+        int32_t N_tmp, D_tmp;
+        load::read_bigann_raw_sampled<T>(input_path, centroid_global_indices,
+                                          centroid_vecs_raw, N_tmp, D_tmp);
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            bucket_vecs.add(c, centroid_global_indices[c],
+                            centroid_vecs_raw.data() + static_cast<size_t>(c) * D);
+        }
+    }
 
     std::cout << "[BatchAssign] N=" << N
               << ", centroids=" << n_centroids
@@ -880,15 +898,28 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         int64_t batch_end = std::min(batch_start + Nv, N_nc);
         int64_t batch_size = batch_end - batch_start;
 
-        // ---- 4a: 读取 batch 数据，转换为 CentroidT，上传到 GPU ----
+        // ---- 4a: 读取 batch 数据 (一次连续区间读)，转换为 CentroidT，上传到 GPU ----
+        // non_centroid_indices 在这个 batch 内基本连续 (只跳过零星的 centroid
+        // id)，所以整段 [lo, hi] 一次顺序读比逐点 seek 快得多；读出来多覆盖的
+        // 那几个 centroid 行的数据直接不用，忽略即可。
+        int64_t batch_lo = non_centroid_indices[batch_start];
+        int64_t batch_hi = non_centroid_indices[batch_end - 1];
+        std::vector<T> raw_batch;
+        {
+            int32_t N_tmp, D_tmp;
+            load::read_bigann_raw_range<T>(input_path, batch_lo, batch_hi - batch_lo + 1,
+                                            raw_batch, N_tmp, D_tmp);
+        }
+
         if constexpr (is_pq) {
             // PQ 模式：读取原始 T 数据 -> 转为 float32 -> encode uint8 -> 上传
             std::vector<float> batch_f32(batch_size * D);
             #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < batch_size; ++i) {
                 int64_t gi = non_centroid_indices[batch_start + i];
+                int64_t local = gi - batch_lo;
                 for (int64_t d = 0; d < D; ++d) {
-                    batch_f32[i * D + d] = static_cast<float>(X_full[gi * D + d]);
+                    batch_f32[i * D + d] = static_cast<float>(raw_batch[local * D + d]);
                 }
             }
 
@@ -903,8 +934,9 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < batch_size; ++i) {
                 int64_t gi = non_centroid_indices[batch_start + i];
+                int64_t local = gi - batch_lo;
                 for (int64_t d = 0; d < D; ++d) {
-                    batch_data[i * D + d] = static_cast<CentroidT>(X_full[gi * D + d]);
+                    batch_data[i * D + d] = static_cast<CentroidT>(raw_batch[local * D + d]);
                 }
             }
 
@@ -954,6 +986,17 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             int64_t gi = non_centroid_indices[batch_start + i];
             assignments[gi] = chosen;
             cluster_sizes[chosen].fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // ---- 4e: 串行把这批点的原始向量写进各自 bucket 的文件 ----
+        // 分配结果已经在上面那个并行循环里拍板定案、不会再改；raw_batch 这批
+        // 原始向量本来就在内存里 (刚从磁盘顺序读出来的)，直接顺手写掉，不需要
+        // 再读一遍磁盘。串行是因为多个点可能落到同一个 bucket，避免并发写同一
+        // 个 BucketBuf 的数据竞争；这一步只是内存 memcpy + 偶尔 flush，很快。
+        for (int64_t i = 0; i < batch_size; ++i) {
+            int64_t gi = non_centroid_indices[batch_start + i];
+            int64_t local = gi - batch_lo;
+            bucket_vecs.add(assignments[gi], gi, raw_batch.data() + local * D);
         }
 
         if ((batch_start / Nv) % 10 == 0 || batch_end == N_nc) {
@@ -2518,6 +2561,173 @@ struct ChunkedKnnAccumulator {
     }
 };
 
+// ============== Per-bucket disk-backed original-vector cache ==============
+//
+// 目的: Step 4 算完每个点的 bucket 分配后，把它的原始向量 (D 个 DataT 分量)
+// 连同 gid 一起顺序追加写进"这个 bucket 专属"的文件里——数据只经过一次磁盘
+// 读 (batch 读入原始数据) + 一次磁盘写 (追加进 bucket 文件)，不会被重复读。
+// Step 6 需要某个 bucket (或它的邻居 bucket) 的原始向量时，直接顺序整块读这
+// 一个文件即可，不用碰原始输入文件、不用等 GPU 从整份常驻显存里 gather。
+//
+// 每条记录格式: int64_t gid + D 个 DataT 分量。记录自带 gid，Step 6/7 读回
+// 来的时候不需要依赖"文件第 i 行对应某个外部列表第 i 个 id"这种隐式顺序假设。
+//
+// 写缓冲区大小: 不能像 ChunkedKnnAccumulator 那样每个 key 固定分配一块 (那是
+// 因为 num_chunks 量级是几十；这里 n_centroids 可能是几千上万)，而是先定一个
+// 总缓冲区内存预算，再除以 n_centroids 分给每个 bucket，这样总内存不会随桶数
+// 线性暴涨。
+template <typename DataT>
+struct BucketVectorAccumulator {
+    std::string dir;
+    int64_t n_centroids = 0;
+    int64_t D = 0;
+
+    struct BucketBuf {
+        std::vector<char> data;
+        size_t capacity_records = 0;
+        size_t count = 0;         // 当前缓冲区里还没 flush 的记录数
+        int64_t total_count = 0;  // 这个 bucket 本轮总共写了多少条 (跨 flush 累计)
+        std::ofstream file;
+    };
+    std::vector<BucketBuf> bufs;
+
+    static constexpr size_t record_bytes(int64_t D) {
+        return sizeof(int64_t) + static_cast<size_t>(D) * sizeof(DataT);
+    }
+
+    static std::string bucket_path(const std::string& dir, int64_t c) {
+        return dir + "/bucket_vec_" + std::to_string(c) + ".bin";
+    }
+
+    // total_buffer_budget_bytes: 所有 bucket 的写缓冲区加起来的总内存预算
+    // (不是每个 bucket 各自这么多)。
+    static BucketVectorAccumulator create(const std::string& dir, int64_t n_centroids,
+                                           int64_t D, size_t total_buffer_budget_bytes) {
+        BucketVectorAccumulator acc;
+        acc.dir = dir;
+        acc.n_centroids = n_centroids;
+        acc.D = D;
+
+        constexpr size_t kMinBufferBytesPerBucket = 4096;  // ~1 个文件系统块，下限
+        size_t rec_bytes = record_bytes(D);
+        size_t nb = std::max<int64_t>(1, n_centroids);
+        size_t buf_bytes_per_bucket = std::max<size_t>(
+            kMinBufferBytesPerBucket, total_buffer_budget_bytes / nb);
+        size_t cap_records = std::max<size_t>(1, buf_bytes_per_bucket / rec_bytes);
+
+        acc.bufs.resize(static_cast<size_t>(n_centroids));
+        for (auto& b : acc.bufs) {
+            b.capacity_records = cap_records;
+            b.data.resize(cap_records * rec_bytes);
+        }
+
+        std::cout << "[BucketVecCache] n_centroids=" << n_centroids << " D=" << D
+                  << " write_buffer=" << (cap_records * rec_bytes) / 1024
+                  << "KB/bucket (" << (cap_records * rec_bytes * nb) / 1e6 << "MB total)\n";
+        return acc;
+    }
+
+    void start_iteration() {
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            auto& b = bufs[static_cast<size_t>(c)];
+            b.count = 0;
+            b.total_count = 0;
+            b.file.open(bucket_path(dir, c), std::ios::binary | std::ios::out | std::ios::trunc);
+            if (!b.file.is_open())
+                throw std::runtime_error("BucketVectorAccumulator: cannot open " + bucket_path(dir, c));
+        }
+    }
+
+    void flush_bucket(int64_t c) {
+        auto& b = bufs[static_cast<size_t>(c)];
+        if (b.count == 0) return;
+        size_t rec_bytes = record_bytes(D);
+        b.file.write(b.data.data(), static_cast<std::streamsize>(b.count * rec_bytes));
+        if (!b.file.good())
+            throw std::runtime_error("BucketVectorAccumulator: flush failed for bucket " + std::to_string(c));
+        b.count = 0;
+    }
+
+    // vec 必须指向恰好 D 个 DataT 分量。
+    void add(int64_t bucket_id, int64_t gid, const DataT* vec) {
+        auto& b = bufs[static_cast<size_t>(bucket_id)];
+        size_t rec_bytes = record_bytes(D);
+        size_t off = b.count * rec_bytes;
+        std::memcpy(b.data.data() + off, &gid, sizeof(int64_t));
+        std::memcpy(b.data.data() + off + sizeof(int64_t), vec, static_cast<size_t>(D) * sizeof(DataT));
+        ++b.count;
+        ++b.total_count;
+        if (b.count == b.capacity_records) flush_bucket(bucket_id);
+    }
+
+    void finish_iteration() {
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            flush_bucket(c);
+            bufs[static_cast<size_t>(c)].file.close();
+        }
+    }
+
+    int64_t count(int64_t c) const { return bufs[static_cast<size_t>(c)].total_count; }
+
+    // 顺序整块读出 bucket c 的全部 (gid, vector) 记录。
+    void read_bucket(int64_t c, std::vector<int64_t>& ids_out, std::vector<DataT>& vecs_out) const {
+        int64_t cnt = count(c);
+        ids_out.resize(static_cast<size_t>(cnt));
+        vecs_out.resize(static_cast<size_t>(cnt) * static_cast<size_t>(D));
+        if (cnt == 0) return;
+
+        std::string path = bucket_path(dir, c);
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open())
+            throw std::runtime_error("BucketVectorAccumulator: cannot open " + path + " for read");
+
+        size_t rec_bytes = record_bytes(D);
+        std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
+        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+        if (!in.good())
+            throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
+
+        for (int64_t i = 0; i < cnt; ++i) {
+            const char* p = raw.data() + static_cast<size_t>(i) * rec_bytes;
+            std::memcpy(&ids_out[static_cast<size_t>(i)], p, sizeof(int64_t));
+            std::memcpy(vecs_out.data() + static_cast<size_t>(i) * static_cast<size_t>(D),
+                        p + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
+        }
+    }
+
+    // 跟 read_bucket 一样，但直接写进调用方提供的缓冲区 (ids_out_ptr 至少
+    // count(c) 个 int64_t，vecs_out_ptr 至少 count(c)*D 个 DataT)，省掉每次
+    // 调用都新分配 vector 的开销——热循环 (Step 6 逐 bucket) 里用这个。
+    void read_bucket_into(int64_t c, int64_t* ids_out_ptr, DataT* vecs_out_ptr) const {
+        int64_t cnt = count(c);
+        if (cnt == 0) return;
+
+        std::string path = bucket_path(dir, c);
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open())
+            throw std::runtime_error("BucketVectorAccumulator: cannot open " + path + " for read");
+
+        size_t rec_bytes = record_bytes(D);
+        std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
+        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+        if (!in.good())
+            throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
+
+        for (int64_t i = 0; i < cnt; ++i) {
+            const char* p = raw.data() + static_cast<size_t>(i) * rec_bytes;
+            std::memcpy(ids_out_ptr + i, p, sizeof(int64_t));
+            std::memcpy(vecs_out_ptr + static_cast<size_t>(i) * static_cast<size_t>(D),
+                        p + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
+        }
+    }
+
+    void remove_all_files() {
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            std::filesystem::remove(bucket_path(dir, c));
+        }
+    }
+};
+
 constexpr size_t knn_file_header_bytes() { return sizeof(int64_t) + sizeof(int32_t); }
 
 // 把 vector_knn.bin (RunningKnnFile 的 int64 N + int32 M header, flat int32
@@ -2564,10 +2774,11 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
  *   4) CUDA kernel: 从 dots 矩阵中为 bucket 内每个点提取 top-M 最近邻
  *   5) 下载结果
  *
- * @param X_full              完整数据集 (CPU, float32, N*D)
  * @param N                   数据点总数
  * @param D                   向量维度
- * @param assignments         (N,) 每个点的 bucket (local centroid index)
+ * @param bucket_vecs         每个 bucket 的 (gid, 原始向量) 磁盘缓存 (Step 4 写好的，
+ *                            见文件顶部 BucketVectorAccumulator 的说明)；bucket/pool
+ *                            的原始向量直接从这里顺序读，不需要整份数据集常驻内存
  * @param centroid_knn_graph  (n_centroids, K) centroid KNN 图 (CPU, uint32)
  * @param n_centroids         centroid / bucket 数量
  * @param K                   centroid KNN 图度数
@@ -2584,11 +2795,9 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
  */
 template <typename DataT>
 void build_vector_knn_with_tensorcore(
-    const DataT* X_full,
     int64_t N,
     int64_t D,
-    const std::vector<int64_t>& assignments,
-    const std::vector<int64_t>& centroid_global_indices,
+    BucketVectorAccumulator<DataT>& bucket_vecs,
     const uint32_t* centroid_knn_graph,  // (n_centroids, K) row-major
     int64_t n_centroids,
     uint32_t K,
@@ -2618,28 +2827,13 @@ void build_vector_knn_with_tensorcore(
     }
 
     // ================================================================
-    // Step 0: Build in-memory bucket lists & ensure centroid is in its bucket
+    // Step 0: bucket 大小表 (点的原始向量已经在 Step 4 里按 bucket 顺序落盘了，
+    // 这里只需要知道每个 bucket 有多少点，不用再重建/常驻整份 id 列表)。
+    // centroid 必在自己 bucket 里 (Step 4 已经保证)，不需要再检查/补写。
     // ================================================================
-    std::vector<std::vector<int32_t>> buckets(n_centroids);
-    for (int64_t i = 0; i < N; ++i) {
-        int64_t c = assignments[i];
-        if (c >= 0 && c < n_centroids) {
-            buckets[c].push_back(static_cast<int32_t>(i));
-        }
-    }
-
-    // 确认每个 centroid 在自己的 bucket 中
+    std::vector<int64_t> bucket_count(n_centroids);
     for (int64_t c = 0; c < n_centroids; ++c) {
-        int32_t centroid_gid = static_cast<int32_t>(centroid_global_indices[c]);
-        bool found = false;
-        for (int32_t pid : buckets[c]) {
-            if (pid == centroid_gid) { found = true; break; }
-        }
-        if (!found) {
-            std::cout << "  [WARN] Centroid " << c << " (global=" << centroid_gid
-                      << ") not in its bucket, inserting.\n";
-            buckets[c].push_back(centroid_gid);
-        }
+        bucket_count[c] = bucket_vecs.count(c);
     }
 
     // ================================================================
@@ -2667,35 +2861,21 @@ void build_vector_knn_with_tensorcore(
     // ================================================================
     // 关键优化:
     //   1) 取消每 bucket cudaMalloc/cudaFree (原本每 bucket 7 次同步分配)
-    //   2) X_full 整体常驻 GPU，A/B 改为 GPU gather (省去 CPU memcpy + 大块 H2D)
-    //   3) ‖x‖² 全局只算一次
+    //   2) bucket/pool 的原始向量从磁盘上"按 bucket 分组"的文件顺序整块读取
+    //      (Step 4 写的，见 BucketVectorAccumulator)，不需要整份数据集常驻
+    //      CPU/GPU，也不需要 GPU kernel 按 id gather——数据已经是需要的行。
+    //   3) ‖x‖² 按 bucket 现算 (从刚读进来的 pool 数据算，不再有全局常驻表)
     //   4) Double-buffer + 双 stream: bucket c 的 GEMM/topM/D2H 与 bucket c+1 的
-    //      CPU prep + H2D + gather 并行；CPU 的 sort/unique 与 GPU 工作完全重叠。
-    //
-    // 关于 (2) 的一个已知权衡（暂不改，先记录）：
-    // 之所以要求 X_full/d_X_full 整份常驻 CPU+GPU，是因为 gather A/B 这一步是
-    // GPU kernel 直接按 id 去 d_X_full 里抠数据（gather_rows_int32/gather_rows_
-    // raw），CUDA kernel 只能解引用显存指针，没法在 kernel 内部临时去读磁盘或
-    // CPU 内存，而任意一个 bucket 的近邻桶都可能覆盖数据集里的任意点，没法只常
-    // 驻一部分。理论上可以换成 bucket_build.cu 那种做法：需要哪个 bucket 就现读
-    // 磁盘、CPU 端拼好向量再整块 H2D，完全不需要 d_X_full 常驻——但一个 bucket
-    // 里的点在原文件里是随机散布的（分桶本身就打乱了顺序），这样读会退化成"每个
-    // 点一次 seek"，而不是几次大块顺序读；把这种随机 I/O 插进现在这条为吞吐量
-    // 设计的热循环（tensor core + 多 slot 流水线），可能会让 I/O 耗时超过 GPU
-    // 计算耗时，反而拖慢整体。要让它划算，需要先把数据集按桶重排到磁盘上一份
-    // （assign 阶段顺便生成，或者复用现成的 reorder 逻辑），这样每个 bucket 和它
-    // 的近邻桶就变成几段连续区间，读起来才是大块顺序读而不是随机 seek。这块目前
-    // 没有实现，先维持 d_X_full 整份常驻的现状，把这个方案记在这里，之后要做的
-    // 话再单独展开。
+    //      CPU prep + H2D 并行；CPU 端的磁盘读取与 GPU 工作完全重叠。
     size_t max_bucket_size = 0;
     size_t max_pool_size_ub = 0;  // 上界(未去重)
     for (int64_t c = 0; c < n_centroids; ++c) {
-        max_bucket_size = std::max(max_bucket_size, buckets[c].size());
-        size_t ps = buckets[c].size();
+        max_bucket_size = std::max<size_t>(max_bucket_size, static_cast<size_t>(bucket_count[c]));
+        size_t ps = static_cast<size_t>(bucket_count[c]);
         for (uint32_t k = 0; k < K; ++k) {
             uint32_t nb_c = centroid_knn_graph[c * K + k];
             if (nb_c < static_cast<uint32_t>(n_centroids)) {
-                ps += buckets[nb_c].size();
+                ps += static_cast<size_t>(bucket_count[nb_c]);
             }
         }
         max_pool_size_ub = std::max(max_pool_size_ub, ps);
@@ -2711,10 +2891,11 @@ void build_vector_knn_with_tensorcore(
         return;
     }
 
-    // ---- 显存预算分两块: 全局常驻 + per-slot ----
-    // d_X_full 以 DataT 存（uint8/int8 时省 4×）；per-bucket A/B 用 GemmInT (int8 时也省 4×)
-    size_t bytes_X            = static_cast<size_t>(N) * D * sizeof(DataT);
-    size_t bytes_norms_full   = static_cast<size_t>(N) * sizeof(float);
+    // ---- 显存预算: 不再有整份数据集常驻的全局 buffer，只有 per-slot ----
+    // d_A_raw/d_B_raw 存原始 DataT (从磁盘读来的 bucket/pool 数据, 未转型)；
+    // d_A/d_B 是转型/位移之后喂给 cuBLAS 的 GemmInT 视图。
+    size_t bytes_A_raw        = max_bucket_size * D * sizeof(DataT);
+    size_t bytes_B_raw        = max_pool_size_ub * D * sizeof(DataT);
     size_t bytes_A            = max_bucket_size * D * sizeof(GemmInT);
     size_t bytes_B            = max_pool_size_ub * D * sizeof(GemmInT);
     size_t bytes_dots         = max_bucket_size * max_pool_size_ub * sizeof(GemmOutT);
@@ -2725,8 +2906,11 @@ void build_vector_knn_with_tensorcore(
     // 距离输出 buffer 仅在 want_distances 时分配 (multi-iteration merge 需要)
     size_t bytes_out_dists    = want_distances ? max_bucket_size * static_cast<size_t>(M) * sizeof(float) : 0;
 
-    size_t bytes_global   = bytes_X + bytes_norms_full;
-    size_t bytes_per_slot = bytes_A + bytes_B + bytes_dots + bytes_norms_pool
+    // identity index (0,1,2,...) 全局共用一份，只跟 max_pool_size_ub 相关
+    size_t bytes_identity_idx = max_pool_size_ub * sizeof(int32_t);
+
+    size_t bytes_global   = bytes_identity_idx;
+    size_t bytes_per_slot = bytes_A_raw + bytes_B_raw + bytes_A + bytes_B + bytes_dots + bytes_norms_pool
                           + bytes_ids_bucket + bytes_ids_pool + bytes_out + bytes_out_dists;
 
     // ---- 动态 num_slots ----
@@ -2769,8 +2953,7 @@ void build_vector_knn_with_tensorcore(
             + " GB usable. Increase n_centroids (smaller buckets) or lower K.");
     }
 
-    std::cout << "  [VectorKNN] buffer plan: X_full=" << bytes_X/1e9
-              << "GB, dots(max)=" << bytes_dots/1e9 << "GB, "
+    std::cout << "  [VectorKNN] buffer plan: dots(max)=" << bytes_dots/1e9 << "GB, "
               << "per-slot=" << bytes_per_slot/1e9 << "GB × " << num_slots
               << " + global=" << bytes_global/1e9 << "GB / usable="
               << usable_bytes/1e9 << "GB"
@@ -2780,15 +2963,26 @@ void build_vector_knn_with_tensorcore(
               << ", est_blocks/kernel=" << est_blocks_per_kernel
               << ", target_streams(pre-mem)=" << target_streams << "]\n";
 
-    // ---- 全局常驻 GPU buffer ----
-    DataT* d_X_full     = nullptr;          // 数据集本体保留原始 element type
-    float* d_norms_full = nullptr;          // 范数始终 fp32
-    CUDA_CHECK(cudaMalloc(&d_X_full,     bytes_X));
-    CUDA_CHECK(cudaMalloc(&d_norms_full, bytes_norms_full));
+    // ---- 全局常驻 GPU buffer: 只有 identity index (0,1,2,...)，跟数据集大小
+    // 无关，只跟 max_pool_size_ub 有关——用来把"刚从磁盘读上来、已经是需要的
+    // 那些行、且已经按 bucket+pool 顺序紧密排列"的原始数据，直接喂给原有的
+    // gather_rows_raw/gather_rows_int32 kernel 做类型转换 (identity 索引 =
+    // 不做任何重排，只做逐元素转型/位移)，复用现成 kernel，不用另写转型 kernel。
+    // ----
+    int32_t* d_identity_idx = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_identity_idx, bytes_identity_idx));
+    {
+        std::vector<int32_t> h_identity(max_pool_size_ub);
+        std::iota(h_identity.begin(), h_identity.end(), 0);
+        CUDA_CHECK(cudaMemcpy(d_identity_idx, h_identity.data(), bytes_identity_idx,
+                              cudaMemcpyHostToDevice));
+    }
 
     // ---- per-slot 持久化 buffer (最多 8 slot 轮转, 实际用 num_slots 个) ----
     // d_A/d_B/d_dots 类型由 GemmInT/GemmOutT 决定（INT8 路径 / FP32 路径不同）
     // C++ partial init: {nullptr, nullptr} 后面的 slot 会被零初始化为 nullptr
+    DataT*       d_A_raw[MAX_SLOTS]         = {nullptr};  // 磁盘读来的原始数据 (未转型)
+    DataT*       d_B_raw[MAX_SLOTS]         = {nullptr};
     GemmInT*     d_A[MAX_SLOTS]             = {nullptr};
     GemmInT*     d_B[MAX_SLOTS]             = {nullptr};
     GemmOutT*    d_dots[MAX_SLOTS]          = {nullptr};
@@ -2801,6 +2995,10 @@ void build_vector_knn_with_tensorcore(
     float*       d_select_dist[MAX_SLOTS]   = {nullptr};  // RAFT dist 输出 scratch
     int32_t*     h_ids_bucket[MAX_SLOTS]    = {nullptr};
     int32_t*     h_ids_pool[MAX_SLOTS]      = {nullptr};
+    DataT*       h_A_raw[MAX_SLOTS]         = {nullptr};  // 从 bucket_vecs 读出来的原始数据
+    DataT*       h_B_raw[MAX_SLOTS]         = {nullptr};
+    int64_t*     h_ids_bucket64[MAX_SLOTS]  = {nullptr};  // bucket_vecs 读出来的 gid (int64)
+    int64_t*     h_ids_pool64[MAX_SLOTS]    = {nullptr};
     int32_t*     h_out[MAX_SLOTS]           = {nullptr};
     float*       h_out_dists[MAX_SLOTS]     = {nullptr};  // 仅 want_distances 时使用
     cudaStream_t streams[MAX_SLOTS]         = {nullptr};
@@ -2810,6 +3008,8 @@ void build_vector_knn_with_tensorcore(
     size_t bytes_select_dist = max_bucket_size * static_cast<size_t>(M) * sizeof(float);
 
     for (int s = 0; s < num_slots; ++s) {
+        CUDA_CHECK(cudaMalloc(&d_A_raw[s],         bytes_A_raw));
+        CUDA_CHECK(cudaMalloc(&d_B_raw[s],         bytes_B_raw));
         CUDA_CHECK(cudaMalloc(&d_A[s],             bytes_A));
         CUDA_CHECK(cudaMalloc(&d_B[s],             bytes_B));
         CUDA_CHECK(cudaMalloc(&d_dots[s],          bytes_dots));
@@ -2821,45 +3021,16 @@ void build_vector_knn_with_tensorcore(
         CUDA_CHECK(cudaMalloc(&d_select_dist[s],   bytes_select_dist));
         CUDA_CHECK(cudaMallocHost(&h_ids_bucket[s], bytes_ids_bucket));
         CUDA_CHECK(cudaMallocHost(&h_ids_pool[s],   bytes_ids_pool));
+        CUDA_CHECK(cudaMallocHost(&h_A_raw[s],      bytes_A_raw));
+        CUDA_CHECK(cudaMallocHost(&h_B_raw[s],      bytes_B_raw));
+        h_ids_bucket64[s] = new int64_t[max_bucket_size];
+        h_ids_pool64[s]   = new int64_t[max_pool_size_ub];
         CUDA_CHECK(cudaMallocHost(&h_out[s],        bytes_out));
         if (want_distances) {
             CUDA_CHECK(cudaMalloc(&d_out_dists[s],  bytes_out_dists));
             CUDA_CHECK(cudaMallocHost(&h_out_dists[s], bytes_out_dists));
         }
         CUDA_CHECK(cudaStreamCreate(&streams[s]));
-    }
-
-    // ---- 一次性上传 X_full + (uint8 时) shift → int8 + 计算所有点的 ‖x‖² (用 stream 0) ----
-    // norms 必须从 GEMM 实际看到的数据视图算出来（uint8 路径下要在 shift 之后用 int8 视图算）。
-    {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        CUDA_CHECK(cudaMemcpyAsync(d_X_full, X_full, bytes_X,
-                                   cudaMemcpyHostToDevice, streams[0]));
-        int threads = 256;
-
-        // uint8 → int8 in-place 平移 (仅 uint8 路径)
-        if constexpr (std::is_same<DataT, uint8_t>::value) {
-            int64_t total = static_cast<int64_t>(N) * D;
-            int64_t shift_blocks = (total + threads - 1) / threads;
-            shift_uint8_to_int8_inplace<<<shift_blocks, threads, 0, streams[0]>>>(
-                reinterpret_cast<uint8_t*>(d_X_full), total);
-            CUDA_CHECK(cudaGetLastError());
-        }
-
-        int64_t blocks = (N + threads - 1) / threads;
-        if constexpr (kIsInt8Path) {
-            // 用 int8 视图算 norms（uint8 已 shift；int8 直接）
-            compute_row_norms_kernel<int8_t><<<blocks, threads, 0, streams[0]>>>(
-                reinterpret_cast<const int8_t*>(d_X_full), d_norms_full, N, D);
-        } else {
-            compute_row_norms_kernel<DataT><<<blocks, threads, 0, streams[0]>>>(
-                d_X_full, d_norms_full, N, D);
-        }
-        CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaStreamSynchronize(streams[0]));
-        auto t1 = std::chrono::high_resolution_clock::now();
-        double upload_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::cout << "  [VectorKNN] X_full upload + norms: " << upload_ms << " ms\n";
     }
 
     // ================================================================
@@ -2901,13 +3072,14 @@ void build_vector_knn_with_tensorcore(
 
     auto scatter_pending = [&](int slot) {
         if (pending[slot].c < 0) return;
-        const auto& bk_prev = buckets[pending[slot].c];
+        // h_ids_bucket[slot] 这时候还是"上一次派到这个 slot 的那个 bucket"的
+        // gid 数组 (本次循环要到下面 3b 才会覆写它)，直接用，不用额外记录。
         int bs = pending[slot].bucket_size;
         int aM = pending[slot].actual_M;
         const int32_t* hp = h_out[slot];
         const float*   hd = h_out_dists[slot];  // 始终已分配 (want_distances 内部恒为 true)
         for (int i = 0; i < bs; ++i) {
-            int32_t gid = bk_prev[i];
+            int32_t gid = h_ids_bucket[slot][i];
             std::fill(scatter_new_n.begin(), scatter_new_n.end(), -1);
             std::fill(scatter_new_d.begin(), scatter_new_d.end(),
                      std::numeric_limits<float>::infinity());
@@ -2935,7 +3107,7 @@ void build_vector_knn_with_tensorcore(
     double t_sync = 0, t_scatter = 0, t_poolbuild = 0, t_submit = 0;
 
     for (int64_t c = 0; c < n_centroids; ++c) {
-        if (buckets[c].empty()) continue;
+        if (bucket_count[c] == 0) continue;
 
         int slot = static_cast<int>(c % num_slots);
 
@@ -2949,44 +3121,58 @@ void build_vector_knn_with_tensorcore(
         auto dt2 = diag_now();
         t_scatter += diag_secs(dt1, dt2);
 
-        // ---- 3b: CPU 端拼 pool_ids ----
-        // BatchAssign 里 line 791 强制 assignments[centroid_global_indices[c]] = c,
-        // 加上每个非 centroid 点只在 assignments[] 里有一个值 → buckets 互不相交,
-        // 拼出来的 pool 不会重复，无需 sort+unique。
-        const auto& bk = buckets[c];
-        size_t ofs = 0;
-        std::memcpy(h_ids_pool[slot] + ofs, bk.data(), bk.size() * sizeof(int32_t));
-        ofs += bk.size();
+        // ---- 3b: 从磁盘按 bucket 顺序读 pool 的 (gid, 原始向量) ----
+        // Step 4 已经保证每个非 centroid 点只属于一个 bucket、centroid 必在
+        // 自己 bucket 里 → 各 bucket 互不相交，拼出来的 pool 不会重复。
+        int64_t* ids_pool64 = h_ids_pool64[slot];
+        DataT*   vecs_pool   = h_B_raw[slot];
+        size_t ofs = 0;  // 以"点数"计，不是字节
+        bucket_vecs.read_bucket_into(c, ids_pool64 + ofs, vecs_pool + ofs * D);
+        ofs += static_cast<size_t>(bucket_count[c]);
         for (uint32_t k = 0; k < K; ++k) {
             uint32_t nb_c = centroid_knn_graph[c * K + k];
-            if (nb_c < static_cast<uint32_t>(n_centroids) && !buckets[nb_c].empty()) {
-                std::memcpy(h_ids_pool[slot] + ofs, buckets[nb_c].data(),
-                            buckets[nb_c].size() * sizeof(int32_t));
-                ofs += buckets[nb_c].size();
+            if (nb_c < static_cast<uint32_t>(n_centroids) && bucket_count[nb_c] > 0) {
+                bucket_vecs.read_bucket_into(nb_c, ids_pool64 + ofs, vecs_pool + ofs * D);
+                ofs += static_cast<size_t>(bucket_count[nb_c]);
             }
         }
         int pool_size   = static_cast<int>(ofs);
-        int bucket_size = static_cast<int>(bk.size());
+        int bucket_size = static_cast<int>(bucket_count[c]);
         int actual_M    = std::min(M, pool_size - 1);
         if (actual_M <= 0) {
             t_poolbuild += diag_secs(dt2, diag_now());
             continue;
         }
 
-        std::memcpy(h_ids_bucket[slot], bk.data(), bk.size() * sizeof(int32_t));
+        // bucket 自己的这部分 (pool 最前面 bucket_size 条) 就是 A；顺手把 gid
+        // 从 int64 truncate 成 int32 (id 数组沿用项目里 N<2^31 的既有假设)。
+        for (int i = 0; i < bucket_size; ++i) {
+            h_ids_bucket[slot][i] = static_cast<int32_t>(ids_pool64[i]);
+        }
+        for (int i = 0; i < pool_size; ++i) {
+            h_ids_pool[slot][i] = static_cast<int32_t>(ids_pool64[i]);
+        }
+        std::memcpy(h_A_raw[slot], vecs_pool, static_cast<size_t>(bucket_size) * D * sizeof(DataT));
         auto dt3 = diag_now();
         t_poolbuild += diag_secs(dt2, dt3);
 
-        // ---- 3c: 上传 id 列表 (async on slot stream) ----
+        // ---- 3c: 上传 id 列表 + 原始向量 (async on slot stream) ----
         CUDA_CHECK(cudaMemcpyAsync(d_ids_bucket[slot], h_ids_bucket[slot],
                                    bucket_size * sizeof(int32_t),
                                    cudaMemcpyHostToDevice, streams[slot]));
         CUDA_CHECK(cudaMemcpyAsync(d_ids_pool[slot], h_ids_pool[slot],
                                    pool_size * sizeof(int32_t),
                                    cudaMemcpyHostToDevice, streams[slot]));
+        CUDA_CHECK(cudaMemcpyAsync(d_A_raw[slot], h_A_raw[slot],
+                                   static_cast<size_t>(bucket_size) * D * sizeof(DataT),
+                                   cudaMemcpyHostToDevice, streams[slot]));
+        CUDA_CHECK(cudaMemcpyAsync(d_B_raw[slot], h_B_raw[slot],
+                                   static_cast<size_t>(pool_size) * D * sizeof(DataT),
+                                   cudaMemcpyHostToDevice, streams[slot]));
 
-        // ---- 3d: GPU gather A / B / norms_pool ----
-        // INT8 路径: gather_rows_raw 不转换 type；FP32 路径: gather_rows_int32 cast 到 fp32
+        // ---- 3d: 转型/位移 A、B (identity 索引，不做重排只做逐元素转型) + 现算 norms_pool ----
+        // 数据已经是磁盘按 bucket 顺序读出来的、恰好需要的那些行，不需要再按 id
+        // gather 一遍——复用原有 kernel，只是把"按 gid 查表"换成"identity 索引"。
         {
             int threads = 256;
             int64_t total_A  = static_cast<int64_t>(bucket_size) * D;
@@ -2995,26 +3181,34 @@ void build_vector_knn_with_tensorcore(
             int64_t blocks_B = (total_B + threads - 1) / threads;
 
             if constexpr (kIsInt8Path) {
-                // d_X_full 已含 int8 byte pattern (uint8 path 已在 shift 阶段就位)
-                auto d_X_int8 = reinterpret_cast<const int8_t*>(d_X_full);
-                gather_rows_raw<int8_t><<<blocks_A, threads, 0, streams[slot]>>>(
-                    d_X_int8, d_ids_bucket[slot],
-                    reinterpret_cast<int8_t*>(d_A[slot]), bucket_size, D);
-                gather_rows_raw<int8_t><<<blocks_B, threads, 0, streams[slot]>>>(
-                    d_X_int8, d_ids_pool[slot],
-                    reinterpret_cast<int8_t*>(d_B[slot]), pool_size, D);
+                gather_rows_raw<DataT><<<blocks_A, threads, 0, streams[slot]>>>(
+                    d_A_raw[slot], d_identity_idx,
+                    reinterpret_cast<DataT*>(d_A[slot]), bucket_size, D);
+                gather_rows_raw<DataT><<<blocks_B, threads, 0, streams[slot]>>>(
+                    d_B_raw[slot], d_identity_idx,
+                    reinterpret_cast<DataT*>(d_B[slot]), pool_size, D);
+                // uint8 → int8 in-place 平移 (仅 uint8 路径；int8 数据本来就对)
+                if constexpr (std::is_same<DataT, uint8_t>::value) {
+                    shift_uint8_to_int8_inplace<<<blocks_A, threads, 0, streams[slot]>>>(
+                        reinterpret_cast<uint8_t*>(d_A[slot]), total_A);
+                    shift_uint8_to_int8_inplace<<<blocks_B, threads, 0, streams[slot]>>>(
+                        reinterpret_cast<uint8_t*>(d_B[slot]), total_B);
+                }
             } else {
                 gather_rows_int32<DataT><<<blocks_A, threads, 0, streams[slot]>>>(
-                    d_X_full, d_ids_bucket[slot],
+                    d_A_raw[slot], d_identity_idx,
                     reinterpret_cast<float*>(d_A[slot]), bucket_size, D);
                 gather_rows_int32<DataT><<<blocks_B, threads, 0, streams[slot]>>>(
-                    d_X_full, d_ids_pool[slot],
+                    d_B_raw[slot], d_identity_idx,
                     reinterpret_cast<float*>(d_B[slot]), pool_size, D);
             }
+            CUDA_CHECK(cudaGetLastError());
 
+            // norms 必须从 GEMM 实际看到的 (转型/位移之后的) 数据视图算，直接
+            // 对刚转好的 d_B[slot] 现算，不再有全局常驻的 norms 表可查。
             int64_t blocks_n = (pool_size + threads - 1) / threads;
-            gather_floats_int32<<<blocks_n, threads, 0, streams[slot]>>>(
-                d_norms_full, d_ids_pool[slot], d_norms_pool[slot], pool_size);
+            compute_row_norms_kernel<GemmInT><<<blocks_n, threads, 0, streams[slot]>>>(
+                d_B[slot], d_norms_pool[slot], pool_size, D);
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -3139,9 +3333,10 @@ void build_vector_knn_with_tensorcore(
     }
 
     // ---- 释放 ----
-    cudaFree(d_X_full);
-    cudaFree(d_norms_full);
+    cudaFree(d_identity_idx);
     for (int s = 0; s < num_slots; ++s) {
+        cudaFree(d_A_raw[s]);
+        cudaFree(d_B_raw[s]);
         cudaFree(d_A[s]);
         cudaFree(d_B[s]);
         cudaFree(d_dots[s]);
@@ -3154,6 +3349,10 @@ void build_vector_knn_with_tensorcore(
         if (d_out_dists[s])  cudaFree(d_out_dists[s]);
         cudaFreeHost(h_ids_bucket[s]);
         cudaFreeHost(h_ids_pool[s]);
+        cudaFreeHost(h_A_raw[s]);
+        cudaFreeHost(h_B_raw[s]);
+        delete[] h_ids_bucket64[s];
+        delete[] h_ids_pool64[s];
         cudaFreeHost(h_out[s]);
         if (h_out_dists[s])  cudaFreeHost(h_out_dists[s]);
         cudaStreamDestroy(streams[s]);
@@ -3346,20 +3545,22 @@ static ReorderInfo compute_bucket_reorder(
  *   bucket_offsets.bin           bucket 边界 (新 ID 空间)
  *   perm.bin / inverse_perm.bin  ID 翻译表 (uint32[N])
  *
- * X_full 现在是 DataT，原本格式直写一遍 row 重排即可（无类型转换）。
+ * data_reordered 现在从 bucket_vecs (最后一轮 Step 4 写的按 bucket 分组的
+ * (gid, 原始向量) 磁盘缓存) 读，而不是整份常驻的 X_full；每条记录自带 gid，
+ * 用 r.perm[gid] 直接算出这一行该落在新 ID 空间的哪个位置，不依赖桶内顺序。
  */
 template <typename DataT>
 static void write_reordered_outputs(
     const std::string& output_dir,
     const std::string& input_ext,
-    const std::vector<DataT>& X_full, int64_t /*N*/, int D,
+    BucketVectorAccumulator<DataT>& bucket_vecs, int64_t N, int D,
     const std::vector<int32_t>& vector_knn, int M_neighbors,
     const ReorderInfo& r, int64_t n_buckets)
 {
-    const int64_t N = static_cast<int64_t>(X_full.size() / D);
     const int64_t total = r.total_in_buckets;
 
-    // 1) data_reordered.<ext>：直接 row-level memcpy，element type = DataT
+    // 1) data_reordered.<ext>：从按 bucket 分组的磁盘缓存里顺序读，
+    //    按每条记录自带的 gid 算出新 id，散写进 reord。
     {
         std::string path = output_dir + "/data_reordered" + input_ext;
         std::ofstream out(path, std::ios::binary);
@@ -3368,13 +3569,23 @@ static void write_reordered_outputs(
         out.write(reinterpret_cast<const char*>(&Dh), sizeof(int32_t));
 
         std::vector<DataT> reord(static_cast<size_t>(total) * D);
-        const size_t row_bytes = static_cast<size_t>(D) * sizeof(DataT);
-        #pragma omp parallel for schedule(static)
-        for (int64_t new_id = 0; new_id < total; ++new_id) {
-            uint32_t old_id = r.inverse_perm[new_id];
-            std::memcpy(reord.data() + static_cast<size_t>(new_id) * D,
-                        X_full.data() + static_cast<size_t>(old_id) * D,
-                        row_bytes);
+        std::vector<int64_t> bucket_ids;
+        std::vector<DataT>   bucket_data;
+        for (int64_t c = 0; c < n_buckets; ++c) {
+            int64_t cnt = bucket_vecs.count(c);
+            if (cnt == 0) continue;
+            bucket_ids.resize(static_cast<size_t>(cnt));
+            bucket_data.resize(static_cast<size_t>(cnt) * D);
+            bucket_vecs.read_bucket_into(c, bucket_ids.data(), bucket_data.data());
+            #pragma omp parallel for schedule(static)
+            for (int64_t i = 0; i < cnt; ++i) {
+                int64_t gid = bucket_ids[static_cast<size_t>(i)];
+                uint32_t new_id = r.perm[gid];
+                if (new_id == 0xFFFFFFFFu) continue;  // 未分配的点 (理论上不该出现)
+                std::memcpy(reord.data() + static_cast<size_t>(new_id) * D,
+                            bucket_data.data() + static_cast<size_t>(i) * D,
+                            static_cast<size_t>(D) * sizeof(DataT));
+            }
         }
         out.write(reinterpret_cast<const char*>(reord.data()),
                   static_cast<std::streamsize>(reord.size() * sizeof(DataT)));
@@ -3604,10 +3815,14 @@ int run_pipeline_impl(
         std::vector<uint32_t> centroid_knn_graph_host;  // (n_centroids, K), row-major
         uint32_t             K = config.knn_k;
 
-        // X_full 在 Step 3.5 加载, 跨 iteration 复用 (大数据)
-        // 在第一次 iteration 的 Step 4 之前加载
-        std::vector<DataT> X_full;
-        bool X_full_loaded = false;
+        // 每个 bucket 的 (gid, 原始向量) 磁盘缓存：Step 4 算完一个点的分配就
+        // 顺手把它的原始向量写进这里 (见文件顶部 BucketVectorAccumulator 的
+        // 说明)；Step 6 直接从这里按 bucket 顺序整块读，不需要整份数据集常驻
+        // 内存/显存。n_centroids 每轮 Step 2 选完才知道 (不同轮的 KMeans||
+        // 采样可能选出稍微不同的数量)，所以在循环内、Step 2 之后才 create()。
+        std::string bucket_vec_dir = output_dir + "/bucket_vecs_tmp";
+        std::filesystem::create_directories(bucket_vec_dir);
+        std::unique_ptr<BucketVectorAccumulator<DataT>> bucket_vecs_ptr;
 
         for (int iter = 0; iter < iterations; ++iter) {
             // 每次 iteration 用不同 seed (centroid 选取多样化)
@@ -3640,6 +3855,15 @@ int run_pipeline_impl(
         }
 
         n_centroids = static_cast<int64_t>(centroid_global_indices.size());
+
+        // bucket 磁盘缓存跟着这一轮的 n_centroids 重新建 (bufs 大小依赖它)；
+        // 磁盘上的文件名固定是 bucket_vec_<c>.bin，start_iteration() 会把本轮
+        // 用到的都 truncate 掉，不用手动清上一轮的。
+        bucket_vecs_ptr = std::make_unique<BucketVectorAccumulator<DataT>>(
+            BucketVectorAccumulator<DataT>::create(
+                bucket_vec_dir, n_centroids, D, config.cpu_limit_bytes / 8));
+        bucket_vecs_ptr->start_iteration();
+
         cudaDeviceSynchronize();
         double iter_step2 = std::chrono::duration<double>(Clock::now() - t2).count();
         elapsed_step2 += iter_step2;
@@ -3663,39 +3887,15 @@ int run_pipeline_impl(
         elapsed_step3 += iter_step3;
         std::cout << "  Step 3 done [" << std::fixed << std::setprecision(3) << iter_step3 << "s]\n";
 
-        // ================================================================
-        // Step 3.5: Lazy-load full dataset if not already loaded
-        //           (采样模式下 X_sampled 只有子集，assignment/KNN 需要全量数据)
-        // ================================================================
-        // X_full 以 DataT 存（保留原始 element type，省 host RAM/PCIe，u8 时 4×）
-        // 多 iteration 时只在第一次 iteration 加载, 后续复用
-        if (!X_full_loaded) {
-            auto t_load = Clock::now();
-            if (!mem_est.fits_in_gpu) {
-                std::cout << "=== Step 3.5: Loading full dataset for assignment ===\n";
-                // 不做类型转换，直接以 DataT 读 BIGANN payload
-                int32_t fullN = 0, fullD = 0;
-                load::read_bigann_raw<DataT>(input_path, X_full, fullN, fullD);
-                if (fullN != N || fullD != D)
-                    throw std::runtime_error("Full-load header mismatches sampled header");
-                std::cout << "  Full data loaded: " << X_full.size() * sizeof(DataT) / 1e9 << " GB"
-                          << " [" << std::chrono::duration<double>(Clock::now() - t_load).count() << "s]\n";
-            } else {
-                // fits_in_gpu: X_sampled (fp32) 是全量；转成 DataT 给 Step 4/6 用
-                X_full.resize(X_sampled.size());
-                #pragma omp parallel for schedule(static)
-                for (size_t i = 0; i < X_sampled.size(); ++i)
-                    X_full[i] = static_cast<DataT>(X_sampled[i]);
-            }
-            // 多 iteration: X_sampled 不再需要 (centroid 选取从 iter 1 起会重复用 X_sampled,
-            // 但我们改为始终用 X_full → 跨 iteration 复用)。
-            // 不过 select_centroids_on_gpu_kmeans_parallel 需要 fp32 X_sampled,
-            // 多 iter 时需要保留 X_sampled. 单 iter 时可以 drop.
-            if (iterations <= 1) {
-                auto _drop = std::move(X_sampled);
-            }
-            X_full_loaded = true;
-            elapsed_step3p5 = std::chrono::duration<double>(Clock::now() - t_load).count();
+        // Step 3.5 (原来的"整份加载数据集"步骤) 已经不需要了——Step 4/6 都改成
+        // 按需从磁盘读了，不再要求整份数据集常驻内存。elapsed_step3p5 保留在
+        // Timing Summary 里，恒为 0。
+        //
+        // select_centroids_on_gpu_kmeans_parallel 需要 fp32 X_sampled，多轮时
+        // 每轮 Step 2 都要用，只有 iterations<=1 (只有这一轮、以后不会再用)
+        // 时才能提前释放。
+        if (iter == 0 && iterations <= 1) {
+            auto _drop = std::move(X_sampled);
         }
 
         // ================================================================
@@ -3741,8 +3941,8 @@ int run_pipeline_impl(
             d_centroids_f32 = nullptr;
 
             assignments = batch_assign_with_cagra_anns<DataT, uint8_t>(
-                X_full.data(), N, D, n_centroids,
-                centroid_global_indices,
+                input_path, N, D, n_centroids,
+                centroid_global_indices, *bucket_vecs_ptr,
                 d_centroids_u8, u8_bytes,
                 d_graph, graph_bytes,
                 K, quantizer, Mbatch_bytes, search_max_iters);
@@ -3751,8 +3951,8 @@ int run_pipeline_impl(
         } else {
             // Non-PQ mode: use float32 centroids directly
             assignments = batch_assign_with_cagra_anns<DataT, float>(
-                X_full.data(), N, D, n_centroids,
-                centroid_global_indices,
+                input_path, N, D, n_centroids,
+                centroid_global_indices, *bucket_vecs_ptr,
                 d_centroids_f32, centroid_gpu_bytes,
                 d_graph, graph_bytes,
                 K, quantizer, Mbatch_bytes, search_max_iters);
@@ -3771,6 +3971,10 @@ int run_pipeline_impl(
         // Free KNN graph from GPU
         CUDA_CHECK(cudaFree(d_graph));
         cudaDeviceSynchronize();
+
+        // flush 掉这一轮所有 bucket 的写缓冲区，Step 6 才能安全地整块读它们。
+        bucket_vecs_ptr->finish_iteration();
+
         double iter_step4 = std::chrono::duration<double>(Clock::now() - t4).count();
         elapsed_step4 += iter_step4;
         std::cout << "  Step 4 done [" << std::fixed << std::setprecision(3) << iter_step4 << "s]\n";
@@ -3838,9 +4042,8 @@ int run_pipeline_impl(
             knn_acc->start_iteration(iter);
 
             build_vector_knn_with_tensorcore(
-                X_full.data(), N, D,
-                assignments,
-                centroid_global_indices,
+                N, D,
+                *bucket_vecs_ptr,
                 graph_ptr,
                 n_centroids, graph_K, neighbors_m,
                 *knn_acc);
@@ -3955,7 +4158,7 @@ int run_pipeline_impl(
                     throw std::runtime_error("Failed reading vector_knn.bin for reorder");
             }
 
-            write_reordered_outputs(output_dir, ext, X_full, N, D,
+            write_reordered_outputs(output_dir, ext, *bucket_vecs_ptr, N, D,
                                     vector_knn, neighbors_m,
                                     reorder_info, n_centroids);
 
@@ -3964,8 +4167,12 @@ int run_pipeline_impl(
                       << elapsed_step7 << "s]\n";
         }
 
-        // X_full no longer needed
-        { auto _drop = std::move(X_full); }
+        // 最后一轮的 bucket 分组磁盘缓存 (Step 7 如果跑了，刚刚还在用) 到这里
+        // 可以清掉了。用 remove_all 而不是 bucket_vecs_ptr->remove_all_files()，
+        // 因为不同轮 n_centroids 可能不完全一样，remove_all_files() 只按最后
+        // 一轮的 n_centroids 删，可能漏掉更早某轮 (n_centroids 更大时) 留下的
+        // 文件；直接删整个临时目录更彻底。
+        std::filesystem::remove_all(bucket_vec_dir);
 
         double elapsed_total = std::chrono::duration<double>(Clock::now() - t_total_start).count();
 
