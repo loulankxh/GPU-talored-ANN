@@ -741,6 +741,173 @@ __global__ void greedy_graph_search_topK_kernel(
     }
 }
 
+// ============== Per-bucket disk-backed original-vector cache ==============
+//
+// 目的: Step 4 算完每个点的 bucket 分配后，把它的原始向量 (D 个 DataT 分量)
+// 连同 gid 一起顺序追加写进"这个 bucket 专属"的文件里——数据只经过一次磁盘
+// 读 (batch 读入原始数据) + 一次磁盘写 (追加进 bucket 文件)，不会被重复读。
+// Step 6 需要某个 bucket (或它的邻居 bucket) 的原始向量时，直接顺序整块读这
+// 一个文件即可，不用碰原始输入文件、不用等 GPU 从整份常驻显存里 gather。
+//
+// 每条记录格式: int64_t gid + D 个 DataT 分量。记录自带 gid，Step 6/7 读回
+// 来的时候不需要依赖"文件第 i 行对应某个外部列表第 i 个 id"这种隐式顺序假设。
+//
+// 写缓冲区大小: 不能像 ChunkedKnnAccumulator 那样每个 key 固定分配一块 (那是
+// 因为 num_chunks 量级是几十；这里 n_centroids 可能是几千上万)，而是先定一个
+// 总缓冲区内存预算，再除以 n_centroids 分给每个 bucket，这样总内存不会随桶数
+// 线性暴涨。
+template <typename DataT>
+struct BucketVectorAccumulator {
+    std::string dir;
+    int64_t n_centroids = 0;
+    int64_t D = 0;
+
+    struct BucketBuf {
+        std::vector<char> data;
+        size_t capacity_records = 0;
+        size_t count = 0;         // 当前缓冲区里还没 flush 的记录数
+        int64_t total_count = 0;  // 这个 bucket 本轮总共写了多少条 (跨 flush 累计)
+        std::ofstream file;
+    };
+    std::vector<BucketBuf> bufs;
+
+    static constexpr size_t record_bytes(int64_t D) {
+        return sizeof(int64_t) + static_cast<size_t>(D) * sizeof(DataT);
+    }
+
+    static std::string bucket_path(const std::string& dir, int64_t c) {
+        return dir + "/bucket_vec_" + std::to_string(c) + ".bin";
+    }
+
+    // total_buffer_budget_bytes: 所有 bucket 的写缓冲区加起来的总内存预算
+    // (不是每个 bucket 各自这么多)。
+    static BucketVectorAccumulator create(const std::string& dir, int64_t n_centroids,
+                                           int64_t D, size_t total_buffer_budget_bytes) {
+        BucketVectorAccumulator acc;
+        acc.dir = dir;
+        acc.n_centroids = n_centroids;
+        acc.D = D;
+
+        constexpr size_t kMinBufferBytesPerBucket = 4096;  // ~1 个文件系统块，下限
+        size_t rec_bytes = record_bytes(D);
+        size_t nb = std::max<int64_t>(1, n_centroids);
+        size_t buf_bytes_per_bucket = std::max<size_t>(
+            kMinBufferBytesPerBucket, total_buffer_budget_bytes / nb);
+        size_t cap_records = std::max<size_t>(1, buf_bytes_per_bucket / rec_bytes);
+
+        acc.bufs.resize(static_cast<size_t>(n_centroids));
+        for (auto& b : acc.bufs) {
+            b.capacity_records = cap_records;
+            b.data.resize(cap_records * rec_bytes);
+        }
+
+        std::cout << "[BucketVecCache] n_centroids=" << n_centroids << " D=" << D
+                  << " write_buffer=" << (cap_records * rec_bytes) / 1024
+                  << "KB/bucket (" << (cap_records * rec_bytes * nb) / 1e6 << "MB total)\n";
+        return acc;
+    }
+
+    void start_iteration() {
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            auto& b = bufs[static_cast<size_t>(c)];
+            b.count = 0;
+            b.total_count = 0;
+            b.file.open(bucket_path(dir, c), std::ios::binary | std::ios::out | std::ios::trunc);
+            if (!b.file.is_open())
+                throw std::runtime_error("BucketVectorAccumulator: cannot open " + bucket_path(dir, c));
+        }
+    }
+
+    void flush_bucket(int64_t c) {
+        auto& b = bufs[static_cast<size_t>(c)];
+        if (b.count == 0) return;
+        size_t rec_bytes = record_bytes(D);
+        b.file.write(b.data.data(), static_cast<std::streamsize>(b.count * rec_bytes));
+        if (!b.file.good())
+            throw std::runtime_error("BucketVectorAccumulator: flush failed for bucket " + std::to_string(c));
+        b.count = 0;
+    }
+
+    // vec 必须指向恰好 D 个 DataT 分量。
+    void add(int64_t bucket_id, int64_t gid, const DataT* vec) {
+        auto& b = bufs[static_cast<size_t>(bucket_id)];
+        size_t rec_bytes = record_bytes(D);
+        size_t off = b.count * rec_bytes;
+        std::memcpy(b.data.data() + off, &gid, sizeof(int64_t));
+        std::memcpy(b.data.data() + off + sizeof(int64_t), vec, static_cast<size_t>(D) * sizeof(DataT));
+        ++b.count;
+        ++b.total_count;
+        if (b.count == b.capacity_records) flush_bucket(bucket_id);
+    }
+
+    void finish_iteration() {
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            flush_bucket(c);
+            bufs[static_cast<size_t>(c)].file.close();
+        }
+    }
+
+    int64_t count(int64_t c) const { return bufs[static_cast<size_t>(c)].total_count; }
+
+    // 顺序整块读出 bucket c 的全部 (gid, vector) 记录。
+    void read_bucket(int64_t c, std::vector<int64_t>& ids_out, std::vector<DataT>& vecs_out) const {
+        int64_t cnt = count(c);
+        ids_out.resize(static_cast<size_t>(cnt));
+        vecs_out.resize(static_cast<size_t>(cnt) * static_cast<size_t>(D));
+        if (cnt == 0) return;
+
+        std::string path = bucket_path(dir, c);
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open())
+            throw std::runtime_error("BucketVectorAccumulator: cannot open " + path + " for read");
+
+        size_t rec_bytes = record_bytes(D);
+        std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
+        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+        if (!in.good())
+            throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
+
+        for (int64_t i = 0; i < cnt; ++i) {
+            const char* p = raw.data() + static_cast<size_t>(i) * rec_bytes;
+            std::memcpy(&ids_out[static_cast<size_t>(i)], p, sizeof(int64_t));
+            std::memcpy(vecs_out.data() + static_cast<size_t>(i) * static_cast<size_t>(D),
+                        p + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
+        }
+    }
+
+    // 跟 read_bucket 一样，但直接写进调用方提供的缓冲区 (ids_out_ptr 至少
+    // count(c) 个 int64_t，vecs_out_ptr 至少 count(c)*D 个 DataT)，省掉每次
+    // 调用都新分配 vector 的开销——热循环 (Step 6 逐 bucket) 里用这个。
+    void read_bucket_into(int64_t c, int64_t* ids_out_ptr, DataT* vecs_out_ptr) const {
+        int64_t cnt = count(c);
+        if (cnt == 0) return;
+
+        std::string path = bucket_path(dir, c);
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open())
+            throw std::runtime_error("BucketVectorAccumulator: cannot open " + path + " for read");
+
+        size_t rec_bytes = record_bytes(D);
+        std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
+        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+        if (!in.good())
+            throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
+
+        for (int64_t i = 0; i < cnt; ++i) {
+            const char* p = raw.data() + static_cast<size_t>(i) * rec_bytes;
+            std::memcpy(ids_out_ptr + i, p, sizeof(int64_t));
+            std::memcpy(vecs_out_ptr + static_cast<size_t>(i) * static_cast<size_t>(D),
+                        p + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
+        }
+    }
+
+    void remove_all_files() {
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            std::filesystem::remove(bucket_path(dir, c));
+        }
+    }
+};
+
 // ============== Phase 8: Batch Assignment via Graph ANNS ==============
 
 /**
@@ -2565,173 +2732,6 @@ struct ChunkedKnnAccumulator {
         }
         if (!kout.good() || !dout.good())
             throw std::runtime_error("ChunkedKnnAccumulator: finalize write failed");
-    }
-};
-
-// ============== Per-bucket disk-backed original-vector cache ==============
-//
-// 目的: Step 4 算完每个点的 bucket 分配后，把它的原始向量 (D 个 DataT 分量)
-// 连同 gid 一起顺序追加写进"这个 bucket 专属"的文件里——数据只经过一次磁盘
-// 读 (batch 读入原始数据) + 一次磁盘写 (追加进 bucket 文件)，不会被重复读。
-// Step 6 需要某个 bucket (或它的邻居 bucket) 的原始向量时，直接顺序整块读这
-// 一个文件即可，不用碰原始输入文件、不用等 GPU 从整份常驻显存里 gather。
-//
-// 每条记录格式: int64_t gid + D 个 DataT 分量。记录自带 gid，Step 6/7 读回
-// 来的时候不需要依赖"文件第 i 行对应某个外部列表第 i 个 id"这种隐式顺序假设。
-//
-// 写缓冲区大小: 不能像 ChunkedKnnAccumulator 那样每个 key 固定分配一块 (那是
-// 因为 num_chunks 量级是几十；这里 n_centroids 可能是几千上万)，而是先定一个
-// 总缓冲区内存预算，再除以 n_centroids 分给每个 bucket，这样总内存不会随桶数
-// 线性暴涨。
-template <typename DataT>
-struct BucketVectorAccumulator {
-    std::string dir;
-    int64_t n_centroids = 0;
-    int64_t D = 0;
-
-    struct BucketBuf {
-        std::vector<char> data;
-        size_t capacity_records = 0;
-        size_t count = 0;         // 当前缓冲区里还没 flush 的记录数
-        int64_t total_count = 0;  // 这个 bucket 本轮总共写了多少条 (跨 flush 累计)
-        std::ofstream file;
-    };
-    std::vector<BucketBuf> bufs;
-
-    static constexpr size_t record_bytes(int64_t D) {
-        return sizeof(int64_t) + static_cast<size_t>(D) * sizeof(DataT);
-    }
-
-    static std::string bucket_path(const std::string& dir, int64_t c) {
-        return dir + "/bucket_vec_" + std::to_string(c) + ".bin";
-    }
-
-    // total_buffer_budget_bytes: 所有 bucket 的写缓冲区加起来的总内存预算
-    // (不是每个 bucket 各自这么多)。
-    static BucketVectorAccumulator create(const std::string& dir, int64_t n_centroids,
-                                           int64_t D, size_t total_buffer_budget_bytes) {
-        BucketVectorAccumulator acc;
-        acc.dir = dir;
-        acc.n_centroids = n_centroids;
-        acc.D = D;
-
-        constexpr size_t kMinBufferBytesPerBucket = 4096;  // ~1 个文件系统块，下限
-        size_t rec_bytes = record_bytes(D);
-        size_t nb = std::max<int64_t>(1, n_centroids);
-        size_t buf_bytes_per_bucket = std::max<size_t>(
-            kMinBufferBytesPerBucket, total_buffer_budget_bytes / nb);
-        size_t cap_records = std::max<size_t>(1, buf_bytes_per_bucket / rec_bytes);
-
-        acc.bufs.resize(static_cast<size_t>(n_centroids));
-        for (auto& b : acc.bufs) {
-            b.capacity_records = cap_records;
-            b.data.resize(cap_records * rec_bytes);
-        }
-
-        std::cout << "[BucketVecCache] n_centroids=" << n_centroids << " D=" << D
-                  << " write_buffer=" << (cap_records * rec_bytes) / 1024
-                  << "KB/bucket (" << (cap_records * rec_bytes * nb) / 1e6 << "MB total)\n";
-        return acc;
-    }
-
-    void start_iteration() {
-        for (int64_t c = 0; c < n_centroids; ++c) {
-            auto& b = bufs[static_cast<size_t>(c)];
-            b.count = 0;
-            b.total_count = 0;
-            b.file.open(bucket_path(dir, c), std::ios::binary | std::ios::out | std::ios::trunc);
-            if (!b.file.is_open())
-                throw std::runtime_error("BucketVectorAccumulator: cannot open " + bucket_path(dir, c));
-        }
-    }
-
-    void flush_bucket(int64_t c) {
-        auto& b = bufs[static_cast<size_t>(c)];
-        if (b.count == 0) return;
-        size_t rec_bytes = record_bytes(D);
-        b.file.write(b.data.data(), static_cast<std::streamsize>(b.count * rec_bytes));
-        if (!b.file.good())
-            throw std::runtime_error("BucketVectorAccumulator: flush failed for bucket " + std::to_string(c));
-        b.count = 0;
-    }
-
-    // vec 必须指向恰好 D 个 DataT 分量。
-    void add(int64_t bucket_id, int64_t gid, const DataT* vec) {
-        auto& b = bufs[static_cast<size_t>(bucket_id)];
-        size_t rec_bytes = record_bytes(D);
-        size_t off = b.count * rec_bytes;
-        std::memcpy(b.data.data() + off, &gid, sizeof(int64_t));
-        std::memcpy(b.data.data() + off + sizeof(int64_t), vec, static_cast<size_t>(D) * sizeof(DataT));
-        ++b.count;
-        ++b.total_count;
-        if (b.count == b.capacity_records) flush_bucket(bucket_id);
-    }
-
-    void finish_iteration() {
-        for (int64_t c = 0; c < n_centroids; ++c) {
-            flush_bucket(c);
-            bufs[static_cast<size_t>(c)].file.close();
-        }
-    }
-
-    int64_t count(int64_t c) const { return bufs[static_cast<size_t>(c)].total_count; }
-
-    // 顺序整块读出 bucket c 的全部 (gid, vector) 记录。
-    void read_bucket(int64_t c, std::vector<int64_t>& ids_out, std::vector<DataT>& vecs_out) const {
-        int64_t cnt = count(c);
-        ids_out.resize(static_cast<size_t>(cnt));
-        vecs_out.resize(static_cast<size_t>(cnt) * static_cast<size_t>(D));
-        if (cnt == 0) return;
-
-        std::string path = bucket_path(dir, c);
-        std::ifstream in(path, std::ios::binary);
-        if (!in.is_open())
-            throw std::runtime_error("BucketVectorAccumulator: cannot open " + path + " for read");
-
-        size_t rec_bytes = record_bytes(D);
-        std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
-        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
-        if (!in.good())
-            throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
-
-        for (int64_t i = 0; i < cnt; ++i) {
-            const char* p = raw.data() + static_cast<size_t>(i) * rec_bytes;
-            std::memcpy(&ids_out[static_cast<size_t>(i)], p, sizeof(int64_t));
-            std::memcpy(vecs_out.data() + static_cast<size_t>(i) * static_cast<size_t>(D),
-                        p + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
-        }
-    }
-
-    // 跟 read_bucket 一样，但直接写进调用方提供的缓冲区 (ids_out_ptr 至少
-    // count(c) 个 int64_t，vecs_out_ptr 至少 count(c)*D 个 DataT)，省掉每次
-    // 调用都新分配 vector 的开销——热循环 (Step 6 逐 bucket) 里用这个。
-    void read_bucket_into(int64_t c, int64_t* ids_out_ptr, DataT* vecs_out_ptr) const {
-        int64_t cnt = count(c);
-        if (cnt == 0) return;
-
-        std::string path = bucket_path(dir, c);
-        std::ifstream in(path, std::ios::binary);
-        if (!in.is_open())
-            throw std::runtime_error("BucketVectorAccumulator: cannot open " + path + " for read");
-
-        size_t rec_bytes = record_bytes(D);
-        std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
-        in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
-        if (!in.good())
-            throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
-
-        for (int64_t i = 0; i < cnt; ++i) {
-            const char* p = raw.data() + static_cast<size_t>(i) * rec_bytes;
-            std::memcpy(ids_out_ptr + i, p, sizeof(int64_t));
-            std::memcpy(vecs_out_ptr + static_cast<size_t>(i) * static_cast<size_t>(D),
-                        p + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
-        }
-    }
-
-    void remove_all_files() {
-        for (int64_t c = 0; c < n_centroids; ++c) {
-            std::filesystem::remove(bucket_path(dir, c));
-        }
     }
 };
 
