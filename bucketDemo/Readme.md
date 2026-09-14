@@ -127,7 +127,8 @@ python3 generate_test_data.py
 | `--neighbors-m` | 可选（0=跳过 Step6） | 每个点的 per-vector KNN 近邻数 M |
 | `--t, --iterations` | 可选（1） | Step2-6 重复轮数（每轮不同 seed），按 per-vector KNN 去重合并；桶文件（Step5）只反映最后一轮 |
 | `--reorder` | 可选（false） | 额外输出按桶重排的文件（`data_reordered.*`、`vector_knn_reordered.bin`、`bucket_offsets.bin`、`perm.bin`、`inverse_perm.bin`），供 `optimize_chunked --method C/D` 使用（开关，无值） |
-| `--order-window` | 可选（0=自动，4*knn-k） | `--reorder` 用的桶处理顺序滑动窗口大小 |
+| `--order-window` | 可选（0=自动，4*knn-k） | `--reorder` 用的桶处理顺序滑动窗口大小；Step6 内部也会用同一个值（0 时按 Step3 原始 CAGRA 图度数算 4*knn-k），驱动下面 `--cache-mb` 的 Belady 缓存排序 |
+| `--cache-mb` | 可选（0=自动，cpu-limit/2） | Step6 的 Belady 桶向量读缓存预算（MB）。原理见 `bucket_order.hpp`（DiskJoin 风格任务排序 + 最优离线缓存）：按处理顺序把"桶自己 + 近邻桶"的原始向量缓存住，命中就不用再碰磁盘；跟 `bucket_build.cu` 的 `--cache-mb` 是同一套机制 |
 
 ### optimize（CAGRA 图剪枝，吃 bucket2 产出的 `vector_knn.bin`）
 
@@ -198,7 +199,7 @@ python3 generate_test_data.py
 
 ```bash
 # search 子命令：算召回率
-./build search \
+./build/search search \
     --base test_data/vectors_100k_128d.fbin \
     --query <query_file> \
     --index output/bucket2_test/k32p32m32t1/neighbors.npy \
@@ -206,7 +207,7 @@ python3 generate_test_data.py
     --topk 10 --ef 200 --num-entry 4
 
 # compare 子命令：对比两份索引结果的重合度
-../search compare \
+./build/search compare \
     --index1 <a.npy> --index2 <b.npy> \
     --k-cmp 10 --save-csv diff.csv
 ```

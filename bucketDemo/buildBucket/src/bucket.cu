@@ -952,6 +952,15 @@ struct BucketVectorAccumulator {
     }
 };
 
+// 配合 BucketVectorAccumulator，作为 bucket_order::BeladyBucketCache<T> 的缓存值
+// 类型：一份已经从磁盘读出来、常驻内存的 (gid, 向量) 副本 (对应 bucket_build.cu
+// 里的 Bucket，只是 vecs 是模板化的 DataT 而不是固定 float)。
+template <typename DataT>
+struct VecBucket {
+    std::vector<int64_t> ids;
+    std::vector<DataT> vecs;
+};
+
 // ============== Phase 8: Batch Assignment via Graph ANNS ==============
 
 /**
@@ -2830,9 +2839,13 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
  * @param bucket_vecs         每个 bucket 的 (gid, 原始向量) 磁盘缓存 (Step 4 写好的，
  *                            见文件顶部 BucketVectorAccumulator 的说明)；bucket/pool
  *                            的原始向量直接从这里顺序读，不需要整份数据集常驻内存
- * @param centroid_knn_graph  (n_centroids, K) centroid KNN 图 (CPU, uint32)
+ * @param centroid_knn_graph  (n_centroids, K) centroid KNN 图，nprobe 展开后的、Step 6
+ *                            实际搜索用的近邻集合 (CPU, uint32)——决定每个 bucket 真正
+ *                            会读哪些近邻 bucket，也是 Belady 缓存 future-access 预测
+ *                            必须严格对应的那个访问模式
  * @param n_centroids         centroid / bucket 数量
- * @param K                   centroid KNN 图度数
+ * @param K                   centroid_knn_graph 的度数 (= nprobe 展开后的近邻数，可能
+ *                            远大于 Step 3 原始 CAGRA 图度数)
  * @param M                   每个向量要找的邻居数
  *
  * @param acc                 分块的 disk-backed 累积器 (见文件顶部 ChunkedKnnAccumulator
@@ -2840,6 +2853,18 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
  *                            的 M 个候选，按 gid 路由进对应 chunk 的内存 write buffer
  *                            (纯追加，不读旧值)；真正的跨 iteration 合并延后到调用方
  *                            在每轮结束后调 acc.merge_iteration() 时才做。
+ * @param order_graph         Step 3 原始 (未 nprobe 展开的) centroid KNN 图，只用来算
+ *                            桶处理顺序——compute_bucket_processing_order 是 O(B*K'^2)
+ *                            的，K' 用 nprobe 展开后的度数 (可能到 250+) 会直接爆炸，
+ *                            用原始、小得多的图度数 (order_graph_K) 求序足够了：顺序只
+ *                            要能让"近邻集合重叠多的桶排在一起"这个大方向对，不需要
+ *                            跟真实访问的近邻集合完全一致 (那是 future_access 的职责，
+ *                            用的是上面 centroid_knn_graph/K 那个真实展开后的图)
+ * @param order_graph_K       order_graph 的度数 (= Step 3 的 knn-k)
+ * @param order_window_arg    DiskJoin 风格桶处理顺序的滑动窗口大小 (见 bucket_order.hpp)，
+ *                            0 = 自动 (4*order_graph_K)；跟 --reorder 用的是同一个 CLI 参数
+ * @param cache_bytes         Belady 桶缓存的字节预算——按处理顺序把"桶自己 + K 个
+ *                            近邻桶"的原始向量缓存住，命中就不用再碰磁盘
  *
  * 距离对合并是必需的 (要按距离排序去重)，所以内部始终按 want_distances=true
  * 的路径跑；不再对外暴露"不算距离"这个选项。
@@ -2849,11 +2874,15 @@ void build_vector_knn_with_tensorcore(
     int64_t N,
     int64_t D,
     BucketVectorAccumulator<DataT>& bucket_vecs,
-    const uint32_t* centroid_knn_graph,  // (n_centroids, K) row-major
+    const uint32_t* centroid_knn_graph,  // (n_centroids, K) row-major, nprobe 展开后
     int64_t n_centroids,
     uint32_t K,
     int M,
-    ChunkedKnnAccumulator& acc)
+    ChunkedKnnAccumulator& acc,
+    const uint32_t* order_graph,   // (n_centroids, order_graph_K) row-major, 原始 CAGRA 图
+    uint32_t order_graph_K,
+    int32_t order_window_arg,
+    size_t cache_bytes)
 {
     constexpr bool want_distances = true;  // 合并去重总是需要距离
     // ============= Stage 2 路径选择（INT8 IMMA / fp32 fallback）=============
@@ -2886,6 +2915,52 @@ void build_vector_knn_with_tensorcore(
     for (int64_t c = 0; c < n_centroids; ++c) {
         bucket_count[c] = bucket_vecs.count(c);
     }
+
+    // ================================================================
+    // Step 0.5: DiskJoin 风格的桶处理顺序 + Belady 最优离线缓存 (见
+    // bucket_order.hpp，跟 bucket_build.cu Step 4 用的是同一套机制)。
+    //
+    // 主循环按 c 的自然顺序遍历时，同一个桶平均会被 ~K 个不同的查询桶当作
+    // "近邻"重复读——处理顺序如果是随便的 0,1,2,...，相邻处理的桶之间的
+    // 近邻集合基本不重叠，没法靠缓存复用。compute_bucket_processing_order
+    // 贪心地把"近邻集合重叠多"的桶排在一起处理，配合下面按这个顺序算出的
+    // "每个桶未来会在哪些位置被用到"，BeladyBucketCache 就能做到（给定这个
+    // 顺序时）理论最优的缓存命中率——大部分近邻桶的读会直接命中缓存，不用
+    // 再碰磁盘 (哪怕现在磁盘读本身已经很便宜，见 BucketVectorAccumulator 的
+    // 单文件+持久句柄设计，命中缓存还是比 seekg+read 更快，且完全不占用
+    // 磁盘带宽)。
+    //
+    // 算 order 用的是原始 (未 nprobe 展开) 的小度数图 order_graph/order_graph_K，
+    // 不是 centroid_knn_graph/K 那个真实展开后的大度数图——
+    // compute_bucket_processing_order 是 O(B*度数^2) 的，nprobe 展开后度数可能
+    // 到 250+，代进去会直接算不动；用原始度数 (通常 32 量级) 求出的顺序，"近邻
+    // 集合重叠多的桶排一起"这个大方向依然成立，足够给缓存用。
+    // future_access 则必须用 centroid_knn_graph/K (真实展开后的图)，因为它要
+    // 精确预测"每个桶未来会在哪些位置被访问"，跟主循环里 append_bucket 实际
+    // 读取的近邻集合必须一致，否则 Belady 缓存的淘汰决策会跟真实访问模式脱节。
+    auto order_adj = bucket_order::adjacency_from_flat_graph(
+        order_graph, n_centroids, static_cast<int32_t>(order_graph_K));
+    int32_t order_window = (order_window_arg > 0)
+        ? order_window_arg
+        : std::max<int32_t>(4 * static_cast<int32_t>(order_graph_K), 16);
+    auto bucket_order_seq = bucket_order::compute_bucket_processing_order(order_adj, order_window);
+
+    auto access_adj = bucket_order::adjacency_from_flat_graph(
+        centroid_knn_graph, n_centroids, static_cast<int32_t>(K));
+    auto future_access = bucket_order::compute_future_access_lists(bucket_order_seq, access_adj);
+
+    auto vec_bucket_bytes = [](const VecBucket<DataT>& b) {
+        return b.ids.size() * sizeof(int64_t) + b.vecs.size() * sizeof(DataT);
+    };
+    bucket_order::BeladyBucketCache<VecBucket<DataT>> bucket_cache(
+        std::move(future_access), cache_bytes, vec_bucket_bytes);
+    auto bucket_loader = [&](int32_t bid) {
+        VecBucket<DataT> vb;
+        bucket_vecs.read_bucket(bid, vb.ids, vb.vecs);
+        return vb;
+    };
+    std::cout << "  [VectorKNN] bucket order_window=" << order_window
+              << ", cache_budget=" << (cache_bytes / 1e6) << " MB\n";
 
     // ================================================================
     // Step 1: cuBLAS handle 初始化
@@ -3157,10 +3232,15 @@ void build_vector_knn_with_tensorcore(
     auto diag_secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
     double t_sync = 0, t_scatter = 0, t_poolbuild = 0, t_submit = 0;
 
-    for (int64_t c = 0; c < n_centroids; ++c) {
+    for (int32_t pos = 0; pos < static_cast<int32_t>(n_centroids); ++pos) {
+        int64_t c = bucket_order_seq[pos];
         if (bucket_count[c] == 0) continue;
 
-        int slot = static_cast<int>(c % num_slots);
+        // slot 必须按遍历位置 pos 轮转 (不是按桶 id c)——c 现在是按 DiskJoin
+        // 顺序跳着走的，只有 pos 才是真正连续递增的循环步数，slot 轮转要靠它
+        // 才能维持"这一 slot 的上一次提交已经隔了 num_slots 步"这个 double-
+        // buffer 假设。
+        int slot = static_cast<int>(pos % num_slots);
 
         // ---- 3a: 等本 slot 上一轮 D2H 落地，scatter 老结果，腾出 buffer ----
         auto dt0 = diag_now();
@@ -3172,19 +3252,29 @@ void build_vector_knn_with_tensorcore(
         auto dt2 = diag_now();
         t_scatter += diag_secs(dt1, dt2);
 
-        // ---- 3b: 从磁盘按 bucket 顺序读 pool 的 (gid, 原始向量) ----
+        // ---- 3b: 按 bucket 顺序取 pool 的 (gid, 原始向量)，经过 Belady 缓存 ----
         // Step 4 已经保证每个非 centroid 点只属于一个 bucket、centroid 必在
         // 自己 bucket 里 → 各 bucket 互不相交，拼出来的 pool 不会重复。
+        // cache.get() 命中就是纯内存 memcpy，不命中才真的从 bucket_vecs 读盘；
+        // 因为 bucket_order_seq 让相邻处理的桶尽量共享近邻集合，大部分近邻桶
+        // 应该都能命中。每次 get() 后立刻 memcpy 出来，不跨下一次 get() 调用
+        // 持有引用 (BeladyBucketCache 的使用约定，见 bucket_order.hpp)。
         int64_t* ids_pool64 = h_ids_pool64[slot];
         DataT*   vecs_pool   = h_B_raw[slot];
         size_t ofs = 0;  // 以"点数"计，不是字节
-        bucket_vecs.read_bucket_into(c, ids_pool64 + ofs, vecs_pool + ofs * D);
-        ofs += static_cast<size_t>(bucket_count[c]);
+        auto append_bucket = [&](int64_t bid) {
+            if (bucket_count[bid] == 0) return;
+            const VecBucket<DataT>& vb = bucket_cache.get(pos, static_cast<int32_t>(bid), bucket_loader);
+            size_t cnt = vb.ids.size();
+            std::memcpy(ids_pool64 + ofs, vb.ids.data(), cnt * sizeof(int64_t));
+            std::memcpy(vecs_pool + ofs * D, vb.vecs.data(), cnt * static_cast<size_t>(D) * sizeof(DataT));
+            ofs += cnt;
+        };
+        append_bucket(c);
         for (uint32_t k = 0; k < K; ++k) {
             uint32_t nb_c = centroid_knn_graph[c * K + k];
-            if (nb_c < static_cast<uint32_t>(n_centroids) && bucket_count[nb_c] > 0) {
-                bucket_vecs.read_bucket_into(nb_c, ids_pool64 + ofs, vecs_pool + ofs * D);
-                ofs += static_cast<size_t>(bucket_count[nb_c]);
+            if (nb_c < static_cast<uint32_t>(n_centroids)) {
+                append_bucket(static_cast<int64_t>(nb_c));
             }
         }
         int pool_size   = static_cast<int>(ofs);
@@ -3714,10 +3804,17 @@ int run_pipeline_impl(
     int iterations,
     LoadConfig config,
     const std::string& ext,
-    int32_t order_window_arg)
+    int32_t order_window_arg,
+    size_t cache_mb_arg)
 {
     try {
         init_gpu_limit_if_needed(config);
+
+        // Step 6 的 Belady 桶缓存预算：0 = 自动，退化成 cpu-limit 的一半
+        // (跟 bucket_build.cu 的 --cache-mb 是同一个约定)。
+        size_t step6_cache_bytes = (cache_mb_arg > 0)
+            ? cache_mb_arg * 1024ULL * 1024ULL
+            : config.cpu_limit_bytes / 2;
 
         // 在 output_root 下建子目录: k<knn_k>p<nprobe>m<neighbors_m>t<iterations>
         // knn_k = 图度数 K; nprobe = Step 6 邻居扩展数 (0 时回退到 knn_k);
@@ -4101,7 +4198,9 @@ int run_pipeline_impl(
                 *bucket_vecs_ptr,
                 graph_ptr,
                 n_centroids, graph_K, neighbors_m,
-                *knn_acc);
+                *knn_acc,
+                centroid_knn_graph_host.data(), K,
+                order_window_arg, step6_cache_bytes);
 
             // flush 掉这一轮剩余的 write buffer；merge_iteration 本身扔到
             // 后台线程做，让下一轮的 Step 2~6 立刻开始跑，不用等 merge 跑完
@@ -4366,7 +4465,10 @@ int main(int argc, char** argv) {
                 "for optimize_chunked --method C/D")
             ("order-window",  po::value<int32_t>()->default_value(0),
                 "Sliding-window size for the bucket processing order used by --reorder "
-                "(DiskJoin-style task ordering over the centroid KNN graph; 0 = auto: 4*knn-k)");
+                "(DiskJoin-style task ordering over the centroid KNN graph; 0 = auto: 4*knn-k)")
+            ("cache-mb",      po::value<size_t>()->default_value(0),
+                "Step6 Belady bucket-vector read cache budget in MB, keyed on the same "
+                "DiskJoin-style processing order as --order-window (0 = auto: cpu-limit/2)");
 
         po::variables_map vm;
         po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -4385,6 +4487,7 @@ int main(int argc, char** argv) {
         bool do_reorder         = vm["reorder"].as<bool>();
         int iterations          = vm["iterations"].as<int>();
         int32_t order_window_arg = vm["order-window"].as<int32_t>();
+        size_t cache_mb_arg      = vm["cache-mb"].as<size_t>();
 
         constexpr uint32_t MAX_NPROBE = 256;
         if (nprobe > MAX_NPROBE) {
@@ -4414,23 +4517,23 @@ int main(int argc, char** argv) {
         if (ext == ".fbin" || ext == ".bin") {
             return run_pipeline_impl<float>(input_path, output_root, search_max_iters,
                                             neighbors_m, nprobe, do_reorder, iterations,
-                                            config, ext, order_window_arg);
+                                            config, ext, order_window_arg, cache_mb_arg);
         } else if (ext == ".u8bin") {
             return run_pipeline_impl<uint8_t>(input_path, output_root, search_max_iters,
                                               neighbors_m, nprobe, do_reorder, iterations,
-                                              config, ext, order_window_arg);
+                                              config, ext, order_window_arg, cache_mb_arg);
         } else if (ext == ".i8bin") {
             return run_pipeline_impl<int8_t>(input_path, output_root, search_max_iters,
                                              neighbors_m, nprobe, do_reorder, iterations,
-                                             config, ext, order_window_arg);
+                                             config, ext, order_window_arg, cache_mb_arg);
         } else if (ext == ".ibin") {
             return run_pipeline_impl<int32_t>(input_path, output_root, search_max_iters,
                                               neighbors_m, nprobe, do_reorder, iterations,
-                                              config, ext, order_window_arg);
+                                              config, ext, order_window_arg, cache_mb_arg);
         } else if (ext == ".ubin") {
             return run_pipeline_impl<uint32_t>(input_path, output_root, search_max_iters,
                                                neighbors_m, nprobe, do_reorder, iterations,
-                                               config, ext, order_window_arg);
+                                               config, ext, order_window_arg, cache_mb_arg);
         } else {
             throw std::runtime_error("Unsupported file extension: " + ext +
                 ". Supported: .fbin/.bin (float), .u8bin (uint8), .i8bin (int8), "
