@@ -27,7 +27,6 @@
 #include <limits>
 #include <map>
 #include <queue>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -209,6 +208,22 @@ inline std::vector<std::vector<int32_t>> compute_future_access_lists(
 // a *different* bucket id at that same position - the reference is only
 // guaranteed valid until the next get() call, since a later miss can evict
 // it once its next use has been consumed.
+//
+// Storage is indexed directly by bucket_id (0..B-1, B = future_access.size()),
+// not hashed: bucket ids here are always a dense small-integer range, so a
+// flat array lookup replaces what used to be several std::unordered_map
+// accesses per get() call (on *every* call, hit or miss - book-keeping for
+// the eviction-order tracking, not just the cache lookup itself). At small
+// scale, where the whole working set fits under capacity_bytes_ and nothing
+// ever gets evicted, that per-call hashing was pure overhead; at the actual
+// target scale, where eviction is genuinely happening, the flat arrays are
+// still strictly cheaper than hashing for the same book-keeping - this
+// isn't a fast path that only helps the easy case, it helps both. The one
+// piece that's still a tree (by_next_use_, a multimap ordered by next-use
+// position) is inherent to the algorithm: picking "the resident bucket
+// needed farthest in the future" needs an ordered structure, and swapping
+// that out isn't the part that shows up as pure per-call constant-factor
+// waste in the profiling.
 template <typename BucketT>
 class BeladyBucketCache {
 public:
@@ -218,29 +233,37 @@ public:
                        size_t capacity_bytes, SizeFn size_fn)
         : future_access_(std::move(future_access)),
           capacity_bytes_(capacity_bytes),
-          size_fn_(std::move(size_fn)) {}
+          size_fn_(std::move(size_fn)),
+          B_(static_cast<int32_t>(future_access_.size())),
+          next_ptr_(static_cast<size_t>(B_), 0),
+          resident_(static_cast<size_t>(B_), 0),
+          slot_(static_cast<size_t>(B_)),
+          byte_size_(static_cast<size_t>(B_), 0),
+          has_order_iter_(static_cast<size_t>(B_), 0),
+          order_iter_(static_cast<size_t>(B_)) {}
 
     template <typename Loader>
     const BucketT& get(int32_t position, int32_t bucket_id, Loader&& loader) {
-        auto it = cache_.find(bucket_id);
-        if (it != cache_.end()) {
+        if (resident_[bucket_id]) {
             advance_pointer(bucket_id, position);
-            return it->second;
+            return slot_[bucket_id];
         }
 
         BucketT loaded = loader(bucket_id);
         size_t bytes = size_fn_(loaded);
         make_room(bytes);
 
-        auto ins = cache_.emplace(bucket_id, std::move(loaded)).first;
+        slot_[bucket_id] = std::move(loaded);
+        resident_[bucket_id] = 1;
+        ++resident_count_;
         used_bytes_ += bytes;
         byte_size_[bucket_id] = bytes;
         advance_pointer(bucket_id, position);
-        return ins->second;
+        return slot_[bucket_id];
     }
 
     size_t used_bytes() const { return used_bytes_; }
-    size_t resident_count() const { return cache_.size(); }
+    size_t resident_count() const { return resident_count_; }
 
 private:
     void advance_pointer(int32_t bucket_id, int32_t position) {
@@ -251,25 +274,25 @@ private:
             ? fa[ptr]
             : std::numeric_limits<int32_t>::max();
 
-        auto idx_it = order_index_.find(bucket_id);
-        if (idx_it != order_index_.end()) by_next_use_.erase(idx_it->second);
-        auto mit = by_next_use_.emplace(next_use, bucket_id);
-        order_index_[bucket_id] = mit;
+        if (has_order_iter_[bucket_id]) by_next_use_.erase(order_iter_[bucket_id]);
+        order_iter_[bucket_id] = by_next_use_.emplace(next_use, bucket_id);
+        has_order_iter_[bucket_id] = 1;
     }
 
     void make_room(size_t incoming_bytes) {
-        while (!cache_.empty() && used_bytes_ + incoming_bytes > capacity_bytes_) {
+        while (resident_count_ > 0 && used_bytes_ + incoming_bytes > capacity_bytes_) {
             // by_next_use_ is sorted ascending by next-use position, so the
             // last entry is whichever resident bucket is needed farthest in
             // the future (or never again, sentinel = INT32_MAX).
             auto victim_it = std::prev(by_next_use_.end());
             int32_t victim = victim_it->second;
             by_next_use_.erase(victim_it);
-            order_index_.erase(victim);
+            has_order_iter_[victim] = 0;
             used_bytes_ -= byte_size_[victim];
-            byte_size_.erase(victim);
-            next_ptr_.erase(victim);
-            cache_.erase(victim);
+            byte_size_[victim] = 0;
+            slot_[victim] = BucketT();  // release its heap memory, not just the accounting
+            resident_[victim] = 0;
+            --resident_count_;
         }
         // If a single bucket's bytes alone exceed capacity_bytes_, the loop
         // above empties the cache and still can't make room - we insert it
@@ -282,11 +305,15 @@ private:
     size_t used_bytes_ = 0;
     SizeFn size_fn_;
 
-    std::unordered_map<int32_t, BucketT> cache_;
-    std::unordered_map<int32_t, size_t> byte_size_;
-    std::unordered_map<int32_t, size_t> next_ptr_;
+    int32_t B_;
+    std::vector<size_t> next_ptr_;
+    std::vector<char> resident_;
+    std::vector<BucketT> slot_;
+    std::vector<size_t> byte_size_;
     std::multimap<int32_t, int32_t> by_next_use_;  // next_use_pos -> bucket_id
-    std::unordered_map<int32_t, std::multimap<int32_t, int32_t>::iterator> order_index_;
+    std::vector<char> has_order_iter_;
+    std::vector<std::multimap<int32_t, int32_t>::iterator> order_iter_;
+    size_t resident_count_ = 0;
 };
 
 }  // namespace bucket_order
