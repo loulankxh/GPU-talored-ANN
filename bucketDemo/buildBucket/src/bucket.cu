@@ -3018,11 +3018,12 @@ void build_vector_knn_with_tensorcore(
     }
 
     // ---- 显存预算: 不再有整份数据集常驻的全局 buffer，只有 per-slot ----
-    // d_A_raw/d_B_raw 存原始 DataT (从磁盘读来的 bucket/pool 数据, 未转型)；
-    // d_A/d_B 是转型/位移之后喂给 cuBLAS 的 GemmInT 视图。
-    size_t bytes_A_raw        = max_bucket_size * D * sizeof(DataT);
+    // d_B_raw 存原始 DataT (从磁盘/缓存读来的 pool 数据, 未转型)；d_B 是转型/
+    // 位移之后喂给 cuBLAS 的 GemmInT 视图。A (bucket 自己) 不再单独占一份
+    // buffer——pool 的前 bucket_size 行本来就是 A 的数据 (append_bucket 总是
+    // 先 append 自己)，GEMM 直接拿 d_B 的前缀当 A 操作数即可，省掉一份重复的
+    // CPU memcpy + H2D 传输 + gather/shift kernel。
     size_t bytes_B_raw        = max_pool_size_ub * D * sizeof(DataT);
-    size_t bytes_A            = max_bucket_size * D * sizeof(GemmInT);
     size_t bytes_B            = max_pool_size_ub * D * sizeof(GemmInT);
     size_t bytes_dots         = max_bucket_size * max_pool_size_ub * sizeof(GemmOutT);
     size_t bytes_norms_pool   = max_pool_size_ub * sizeof(float);
@@ -3036,7 +3037,7 @@ void build_vector_knn_with_tensorcore(
     size_t bytes_identity_idx = max_pool_size_ub * sizeof(int32_t);
 
     size_t bytes_global   = bytes_identity_idx;
-    size_t bytes_per_slot = bytes_A_raw + bytes_B_raw + bytes_A + bytes_B + bytes_dots + bytes_norms_pool
+    size_t bytes_per_slot = bytes_B_raw + bytes_B + bytes_dots + bytes_norms_pool
                           + bytes_ids_bucket + bytes_ids_pool + bytes_out + bytes_out_dists;
 
     // ---- 动态 num_slots ----
@@ -3105,11 +3106,11 @@ void build_vector_knn_with_tensorcore(
     }
 
     // ---- per-slot 持久化 buffer (最多 8 slot 轮转, 实际用 num_slots 个) ----
-    // d_A/d_B/d_dots 类型由 GemmInT/GemmOutT 决定（INT8 路径 / FP32 路径不同）
+    // d_B/d_dots 类型由 GemmInT/GemmOutT 决定（INT8 路径 / FP32 路径不同）
     // C++ partial init: {nullptr, nullptr} 后面的 slot 会被零初始化为 nullptr
-    DataT*       d_A_raw[MAX_SLOTS]         = {nullptr};  // 磁盘读来的原始数据 (未转型)
+    // A (bucket 自己) 没有独立 buffer：GEMM 直接用 d_B 的前 bucket_size 行当
+    // A 操作数 (append_bucket 总是先 append 自己，pool 前缀天然就是 A 的数据)。
     DataT*       d_B_raw[MAX_SLOTS]         = {nullptr};
-    GemmInT*     d_A[MAX_SLOTS]             = {nullptr};
     GemmInT*     d_B[MAX_SLOTS]             = {nullptr};
     GemmOutT*    d_dots[MAX_SLOTS]          = {nullptr};
     float*       d_norms_pool[MAX_SLOTS]    = {nullptr};
@@ -3121,7 +3122,6 @@ void build_vector_knn_with_tensorcore(
     float*       d_select_dist[MAX_SLOTS]   = {nullptr};  // RAFT dist 输出 scratch
     int32_t*     h_ids_bucket[MAX_SLOTS]    = {nullptr};
     int32_t*     h_ids_pool[MAX_SLOTS]      = {nullptr};
-    DataT*       h_A_raw[MAX_SLOTS]         = {nullptr};  // 从 bucket_vecs 读出来的原始数据
     DataT*       h_B_raw[MAX_SLOTS]         = {nullptr};
     int64_t*     h_ids_bucket64[MAX_SLOTS]  = {nullptr};  // bucket_vecs 读出来的 gid (int64)
     int64_t*     h_ids_pool64[MAX_SLOTS]    = {nullptr};
@@ -3134,9 +3134,7 @@ void build_vector_knn_with_tensorcore(
     size_t bytes_select_dist = max_bucket_size * static_cast<size_t>(M) * sizeof(float);
 
     for (int s = 0; s < num_slots; ++s) {
-        CUDA_CHECK(cudaMalloc(&d_A_raw[s],         bytes_A_raw));
         CUDA_CHECK(cudaMalloc(&d_B_raw[s],         bytes_B_raw));
-        CUDA_CHECK(cudaMalloc(&d_A[s],             bytes_A));
         CUDA_CHECK(cudaMalloc(&d_B[s],             bytes_B));
         CUDA_CHECK(cudaMalloc(&d_dots[s],          bytes_dots));
         CUDA_CHECK(cudaMalloc(&d_norms_pool[s],    bytes_norms_pool));
@@ -3147,7 +3145,6 @@ void build_vector_knn_with_tensorcore(
         CUDA_CHECK(cudaMalloc(&d_select_dist[s],   bytes_select_dist));
         CUDA_CHECK(cudaMallocHost(&h_ids_bucket[s], bytes_ids_bucket));
         CUDA_CHECK(cudaMallocHost(&h_ids_pool[s],   bytes_ids_pool));
-        CUDA_CHECK(cudaMallocHost(&h_A_raw[s],      bytes_A_raw));
         CUDA_CHECK(cudaMallocHost(&h_B_raw[s],      bytes_B_raw));
         h_ids_bucket64[s] = new int64_t[max_bucket_size];
         h_ids_pool64[s]   = new int64_t[max_pool_size_ub];
@@ -3231,6 +3228,11 @@ void build_vector_knn_with_tensorcore(
     auto diag_now = [] { return std::chrono::high_resolution_clock::now(); };
     auto diag_secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
     double t_sync = 0, t_scatter = 0, t_poolbuild = 0, t_submit = 0;
+    // pool_build 内部再拆一层: cache.get() (命中时的记账 + 没命中时真正调
+    // loader 读盘) vs. 从 cache 命中的数据往 pool buffer 里 memcpy 的时间。
+    // 想确认这两版优化之后剩下的 pool_build 时间到底是"访问 cache 本身"还是
+    // "纯数据搬运量大"——先测出来，不再靠估算。跑完可以再删。
+    double t_cache_get = 0, t_pool_memcpy = 0;
 
     for (int32_t pos = 0; pos < static_cast<int32_t>(n_centroids); ++pos) {
         int64_t c = bucket_order_seq[pos];
@@ -3264,11 +3266,15 @@ void build_vector_knn_with_tensorcore(
         size_t ofs = 0;  // 以"点数"计，不是字节
         auto append_bucket = [&](int64_t bid) {
             if (bucket_count[bid] == 0) return;
+            auto ga0 = diag_now();
             const VecBucket<DataT>& vb = bucket_cache.get(pos, static_cast<int32_t>(bid), bucket_loader);
+            auto ga1 = diag_now();
+            t_cache_get += diag_secs(ga0, ga1);
             size_t cnt = vb.ids.size();
             std::memcpy(ids_pool64 + ofs, vb.ids.data(), cnt * sizeof(int64_t));
             std::memcpy(vecs_pool + ofs * D, vb.vecs.data(), cnt * static_cast<size_t>(D) * sizeof(DataT));
             ofs += cnt;
+            t_pool_memcpy += diag_secs(ga1, diag_now());
         };
         append_bucket(c);
         for (uint32_t k = 0; k < K; ++k) {
@@ -3285,15 +3291,16 @@ void build_vector_knn_with_tensorcore(
             continue;
         }
 
-        // bucket 自己的这部分 (pool 最前面 bucket_size 条) 就是 A；顺手把 gid
-        // 从 int64 truncate 成 int32 (id 数组沿用项目里 N<2^31 的既有假设)。
+        // bucket 自己的这部分 (pool 最前面 bucket_size 条) 就是 A，不用再单独
+        // 拷一份——GEMM 直接拿 d_B 的前 bucket_size 行当 A 操作数 (下面 3e)。
+        // 顺手把 gid 从 int64 truncate 成 int32 (id 数组沿用项目里 N<2^31 的
+        // 既有假设)。
         for (int i = 0; i < bucket_size; ++i) {
             h_ids_bucket[slot][i] = static_cast<int32_t>(ids_pool64[i]);
         }
         for (int i = 0; i < pool_size; ++i) {
             h_ids_pool[slot][i] = static_cast<int32_t>(ids_pool64[i]);
         }
-        std::memcpy(h_A_raw[slot], vecs_pool, static_cast<size_t>(bucket_size) * D * sizeof(DataT));
         auto dt3 = diag_now();
         t_poolbuild += diag_secs(dt2, dt3);
 
@@ -3304,41 +3311,30 @@ void build_vector_knn_with_tensorcore(
         CUDA_CHECK(cudaMemcpyAsync(d_ids_pool[slot], h_ids_pool[slot],
                                    pool_size * sizeof(int32_t),
                                    cudaMemcpyHostToDevice, streams[slot]));
-        CUDA_CHECK(cudaMemcpyAsync(d_A_raw[slot], h_A_raw[slot],
-                                   static_cast<size_t>(bucket_size) * D * sizeof(DataT),
-                                   cudaMemcpyHostToDevice, streams[slot]));
         CUDA_CHECK(cudaMemcpyAsync(d_B_raw[slot], h_B_raw[slot],
                                    static_cast<size_t>(pool_size) * D * sizeof(DataT),
                                    cudaMemcpyHostToDevice, streams[slot]));
 
-        // ---- 3d: 转型/位移 A、B (identity 索引，不做重排只做逐元素转型) + 现算 norms_pool ----
-        // 数据已经是磁盘按 bucket 顺序读出来的、恰好需要的那些行，不需要再按 id
-        // gather 一遍——复用原有 kernel，只是把"按 gid 查表"换成"identity 索引"。
+        // ---- 3d: 转型/位移 B (identity 索引，不做重排只做逐元素转型) + 现算 norms_pool ----
+        // 数据已经是磁盘/缓存按 bucket 顺序读出来的、恰好需要的那些行，不需要
+        // 再按 id gather 一遍——复用原有 kernel，只是把"按 gid 查表"换成
+        // "identity 索引"。A 不再单独转型：d_B 转好之后，它的前 bucket_size
+        // 行本来就是转型/位移后的 A。
         {
             int threads = 256;
-            int64_t total_A  = static_cast<int64_t>(bucket_size) * D;
-            int64_t blocks_A = (total_A + threads - 1) / threads;
             int64_t total_B  = static_cast<int64_t>(pool_size) * D;
             int64_t blocks_B = (total_B + threads - 1) / threads;
 
             if constexpr (kIsInt8Path) {
-                gather_rows_raw<DataT><<<blocks_A, threads, 0, streams[slot]>>>(
-                    d_A_raw[slot], d_identity_idx,
-                    reinterpret_cast<DataT*>(d_A[slot]), bucket_size, D);
                 gather_rows_raw<DataT><<<blocks_B, threads, 0, streams[slot]>>>(
                     d_B_raw[slot], d_identity_idx,
                     reinterpret_cast<DataT*>(d_B[slot]), pool_size, D);
                 // uint8 → int8 in-place 平移 (仅 uint8 路径；int8 数据本来就对)
                 if constexpr (std::is_same<DataT, uint8_t>::value) {
-                    shift_uint8_to_int8_inplace<<<blocks_A, threads, 0, streams[slot]>>>(
-                        reinterpret_cast<uint8_t*>(d_A[slot]), total_A);
                     shift_uint8_to_int8_inplace<<<blocks_B, threads, 0, streams[slot]>>>(
                         reinterpret_cast<uint8_t*>(d_B[slot]), total_B);
                 }
             } else {
-                gather_rows_int32<DataT><<<blocks_A, threads, 0, streams[slot]>>>(
-                    d_A_raw[slot], d_identity_idx,
-                    reinterpret_cast<float*>(d_A[slot]), bucket_size, D);
                 gather_rows_int32<DataT><<<blocks_B, threads, 0, streams[slot]>>>(
                     d_B_raw[slot], d_identity_idx,
                     reinterpret_cast<float*>(d_B[slot]), pool_size, D);
@@ -3361,13 +3357,16 @@ void build_vector_knn_with_tensorcore(
             if constexpr (kIsInt8Path) {
                 // INT8 IMMA: int8 in × int8 in → int32 out, Tensor Core
                 int alpha_i = 1, beta_i = 0;
+                // A 操作数直接传 d_B[slot] 本身: A 是 pool 的前 bucket_size
+                // 行，跟 B 是同一份已转型数据，lda=D 不变，cuBLAS 只读前
+                // bucket_size 行，不需要一份独立的 A buffer。
                 stat = cublasGemmEx(
                     cublas_handle,
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     pool_size, bucket_size, D,
                     &alpha_i,
                     d_B[slot], CUDA_R_8I, D,
-                    d_A[slot], CUDA_R_8I, D,
+                    d_B[slot], CUDA_R_8I, D,
                     &beta_i,
                     d_dots[slot], CUDA_R_32I, pool_size,
                     CUBLAS_COMPUTE_32I,
@@ -3383,7 +3382,7 @@ void build_vector_knn_with_tensorcore(
                     pool_size, bucket_size, D,
                     &alpha,
                     reinterpret_cast<const float*>(d_B[slot]), D,
-                    reinterpret_cast<const float*>(d_A[slot]), D,
+                    reinterpret_cast<const float*>(d_B[slot]), D,
                     &beta,
                     reinterpret_cast<float*>(d_dots[slot]), pool_size);
                 if (stat != CUBLAS_STATUS_SUCCESS)
@@ -3471,14 +3470,16 @@ void build_vector_knn_with_tensorcore(
                   << "s pool_build=" << t_poolbuild
                   << "s gpu_submit=" << t_submit
                   << "s (sum=" << sum_s << "s, loop_wall=" << loop_s << "s)\n";
+        std::cout << "  [VectorKNN] pool_build breakdown: cache_get="
+                  << t_cache_get << "s pool_memcpy=" << t_pool_memcpy
+                  << "s (sum=" << (t_cache_get + t_pool_memcpy)
+                  << "s vs pool_build=" << t_poolbuild << "s)\n";
     }
 
     // ---- 释放 ----
     cudaFree(d_identity_idx);
     for (int s = 0; s < num_slots; ++s) {
-        cudaFree(d_A_raw[s]);
         cudaFree(d_B_raw[s]);
-        cudaFree(d_A[s]);
         cudaFree(d_B[s]);
         cudaFree(d_dots[s]);
         cudaFree(d_norms_pool[s]);
@@ -3490,7 +3491,6 @@ void build_vector_knn_with_tensorcore(
         if (d_out_dists[s])  cudaFree(d_out_dists[s]);
         cudaFreeHost(h_ids_bucket[s]);
         cudaFreeHost(h_ids_pool[s]);
-        cudaFreeHost(h_A_raw[s]);
         cudaFreeHost(h_B_raw[s]);
         delete[] h_ids_bucket64[s];
         delete[] h_ids_pool64[s];
