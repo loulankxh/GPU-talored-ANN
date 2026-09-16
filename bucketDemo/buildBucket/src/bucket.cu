@@ -57,6 +57,7 @@
 #include "load.hpp"
 #include "bucket_build.cuh"
 #include "bucket_order.hpp"
+#include "graph_io.hpp"
 
 namespace po = boost::program_options;
 using namespace bucket;
@@ -4296,6 +4297,15 @@ int run_pipeline_impl(
                       << " total_in_buckets=" << reorder_info.total_in_buckets
                       << " (unassigned=" << (N - reorder_info.total_in_buckets) << ")\n";
 
+            // order[pos] = raw bucket id at position pos -- written so
+            // prune_windowed can recover "which raw bucket owns new-id range
+            // [offsets[pos],offsets[pos+1])" exactly, without recomputing
+            // compute_bucket_processing_order a second time (which would
+            // silently drift if --order-window doesn't match). Same file,
+            // same format as reorder.cpp's standalone path writes.
+            graph_io::write_bucket_process_order(
+                output_dir + "/bucket_process_order.bin", bucket_process_order);
+
             // write_reordered_outputs 需要整份 vector_knn 在内存里做按 id 重排；
             // 现在它活在磁盘上，这里读回来（顺序读，一次性，只有 --reorder 时
             // 才会触发）。
@@ -4367,6 +4377,7 @@ int run_pipeline_impl(
             if (neighbors_m > 0)
                 std::cout << "    vector_knn_reordered.bin  — KNN graph in new ID space\n";
             std::cout << "    bucket_offsets.bin        — bucket boundaries (new ID space)\n";
+            std::cout << "    bucket_process_order.bin  — for prune_windowed (bucket id at each position)\n";
             std::cout << "    perm.bin / inverse_perm.bin — ID translation tables\n";
         }
 
@@ -4461,8 +4472,8 @@ int main(int argc, char** argv) {
                 "Bucket files (Step 5) reflect the last iteration only. Default 1.")
             ("reorder",       po::bool_switch()->default_value(false),
                 "Also output bucket-aligned reordered files (data_reordered.<ext>, "
-                "vector_knn_reordered.bin, bucket_offsets.bin, perm.bin, inverse_perm.bin) "
-                "for optimize_chunked --method C/D")
+                "vector_knn_reordered.bin, bucket_offsets.bin, bucket_process_order.bin, "
+                "perm.bin, inverse_perm.bin) for optimize_chunked --method C/D/E and prune_windowed")
             ("order-window",  po::value<int32_t>()->default_value(0),
                 "Sliding-window size for the bucket processing order used by --reorder "
                 "(DiskJoin-style task ordering over the centroid KNN graph; 0 = auto: 4*knn-k)")
