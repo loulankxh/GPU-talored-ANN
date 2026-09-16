@@ -119,8 +119,10 @@ set_target_properties(optimize PROPERTIES
 )
 
 # optimize_chunked: chunked reverse-graph + merge for huge graphs that don't
-# fit on a single GPU. Implements 3 methods (A: kernel-filter, B: pre-shuffle,
-# C: bucket-aligned A) selectable via --method.
+# fit on a single GPU. Implements 5 methods (A: kernel-filter, B: pre-shuffle,
+# C: bucket-aligned + overflow, D: 3-slot sliding window, E: per-chunk disk-
+# backed scatter buffer, rank-priority preserving, streams fwd/output graph
+# from/to disk instead of requiring them host-resident) selectable via --method.
 add_executable(optimize_chunked ${BUILD_SRC_PATH}/optimize_chunked.cu)
 
 target_link_libraries(optimize_chunked
@@ -146,5 +148,25 @@ target_link_libraries(reorder
 )
 
 set_target_properties(reorder PROPERTIES
+    BUILD_RPATH ${CONDA_LIB}
+)
+
+# prune_windowed: CPU-only (OpenMP) approximate CAGRA prune for graphs too
+# large for raft's own sort_knn_graph+optimize() to hold resident. Windows
+# the "does my neighbor's neighbor connect back to me" lookup through
+# bucket_order.hpp's Belady bucket cache instead of requiring the whole
+# candidate graph resident -- see prune_windowed.cpp's header comment for
+# why this is CPU-only rather than a CUDA kernel. Feeds optimize_chunked's
+# forward-graph input (any method, but paired with --method E and the same
+# --bucket-offsets is the intended large-scale path).
+add_executable(prune_windowed ${BUILD_SRC_PATH}/prune_windowed.cpp)
+
+target_link_libraries(prune_windowed
+    PRIVATE
+    OpenMP::OpenMP_CXX
+    boost_program_options
+)
+
+set_target_properties(prune_windowed PROPERTIES
     BUILD_RPATH ${CONDA_LIB}
 )

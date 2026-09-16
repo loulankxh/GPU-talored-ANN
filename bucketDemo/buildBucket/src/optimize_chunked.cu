@@ -47,6 +47,8 @@
 #include <cuda_runtime.h>
 
 #include "load.hpp"
+#include "graph_io.hpp"
+#include "edge_chunk_accumulator.hpp"
 
 namespace po = boost::program_options;
 
@@ -61,56 +63,27 @@ namespace po = boost::program_options;
     } while (0)
 
 // =====================================================================
-// I/O
+// I/O -- shared readers/writers now live in graph_io.hpp (used by
+// reorder.cpp and prune_windowed.cu too); these are thin aliases so the
+// rest of this file doesn't need to change call sites.
 // =====================================================================
 static void read_forward_graph(const std::string& path,
                                std::vector<uint32_t>& graph,
                                int64_t& N, int32_t& K_out)
 {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open())
-        throw std::runtime_error("Cannot open: " + path);
-    in.read(reinterpret_cast<char*>(&N), sizeof(int64_t));
-    in.read(reinterpret_cast<char*>(&K_out), sizeof(int32_t));
-    if (!in.good() || N <= 0 || K_out <= 0)
-        throw std::runtime_error("Invalid forward graph header");
-
-    const size_t cnt = static_cast<size_t>(N) * static_cast<size_t>(K_out);
-    graph.resize(cnt);
-    in.read(reinterpret_cast<char*>(graph.data()),
-            static_cast<std::streamsize>(cnt * sizeof(uint32_t)));
-    if (!in.good())
-        throw std::runtime_error("Failed to read forward graph payload");
+    graph_io::read_forward_graph(path, graph, N, K_out);
 }
 
 static void write_graph(const std::string& path,
                         const uint32_t* graph,
                         int64_t N, int32_t K_out)
 {
-    std::ofstream out(path, std::ios::binary);
-    if (!out.is_open())
-        throw std::runtime_error("Cannot open: " + path);
-    out.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
-    out.write(reinterpret_cast<const char*>(&K_out), sizeof(int32_t));
-    out.write(reinterpret_cast<const char*>(graph),
-              static_cast<size_t>(N) * K_out * sizeof(uint32_t));
+    graph_io::write_graph(path, graph, N, K_out);
 }
 
 static std::vector<uint32_t> read_bucket_offsets(const std::string& path)
 {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open())
-        throw std::runtime_error("Cannot open bucket-offsets: " + path);
-    int32_t n_buckets = 0;
-    in.read(reinterpret_cast<char*>(&n_buckets), sizeof(int32_t));
-    if (!in.good() || n_buckets <= 0)
-        throw std::runtime_error("Invalid bucket-offsets header");
-    std::vector<uint32_t> offsets(n_buckets + 1);
-    in.read(reinterpret_cast<char*>(offsets.data()),
-            static_cast<std::streamsize>((n_buckets + 1) * sizeof(uint32_t)));
-    if (!in.good())
-        throw std::runtime_error("Failed to read bucket-offsets payload");
-    return offsets;
+    return graph_io::read_bucket_offsets(path);
 }
 
 // =====================================================================
@@ -269,6 +242,54 @@ __global__ void kern_rev_scatter_pairs(
     uint32_t pos = atomicAdd(&rev_count_chunk[local_j], 1u);
     if (pos < K_rev_cap)
         rev_graph_chunk[(uint64_t)local_j * K_rev_cap + pos] = i;
+}
+
+// 方案 E 用：单遍扫描，每条边按 chunk_of(dst) 直接散射进该 chunk 自己的 GPU
+// scatter buffer（容量固定，跨多个 batch 持续累积，由 host 侧按批读回计数，
+// 写满了才 drain 到磁盘并清零——不是每批都 flush）。本批次恰好把某个 chunk
+// 缓冲区写满、多出来的少量边落进一个共享 overflow 缓冲区（大小按
+// batch_rows*K_out 最坏情况算，一批边全部挤爆同一个 chunk 也能兜住），host
+// 侧每批都会把 overflow drain 出来按 chunk_of 分发进正确的磁盘文件——保证
+// 不丢边，同时不需要为了防溢出把每个 chunk 的主 buffer 按最坏情况分配。
+//
+// rank = col：这条边是 src 这一行的第几个（第几近）邻居，写进
+// edge_chunk::EdgeRecord 里带走，Phase 2 按 rank 排序后重建优先级（见
+// edge_chunk_accumulator.hpp 顶部注释）。
+__global__ void kern_scatter_rank(
+    const uint32_t* __restrict__ fwd_batch,   // [batch_rows, K_out]
+    uint64_t batch_row_offset,
+    uint32_t batch_rows,
+    uint32_t K_out,
+    const uint32_t* __restrict__ chunk_starts,  // [num_chunks+1]
+    uint32_t num_chunks,
+    edge_chunk::EdgeRecord* __restrict__ chunk_buf,  // [num_chunks * capacity_per_chunk]
+    uint32_t capacity_per_chunk,
+    uint32_t* __restrict__ chunk_count,         // [num_chunks], 跨 batch 持续累积
+    edge_chunk::EdgeRecord* __restrict__ overflow_buf,  // [overflow_cap]
+    uint32_t* __restrict__ overflow_count,      // singleton，每 batch 由 host 清零
+    uint32_t overflow_cap)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t total = (uint64_t)batch_rows * K_out;
+    if (tid >= total) return;
+
+    uint32_t row = tid / K_out;
+    uint32_t col = tid - row * K_out;
+    uint32_t j = fwd_batch[(uint64_t)row * K_out + col];
+    uint32_t i = static_cast<uint32_t>(batch_row_offset + row);
+
+    uint32_t c = edge_chunk::chunk_of(chunk_starts, num_chunks, j);
+    uint32_t pos = atomicAdd(&chunk_count[c], 1u);
+    edge_chunk::EdgeRecord rec{j, i, static_cast<uint16_t>(col)};
+    if (pos < capacity_per_chunk) {
+        chunk_buf[(uint64_t)c * capacity_per_chunk + pos] = rec;
+    } else {
+        uint32_t opos = atomicAdd(overflow_count, 1u);
+        if (opos < overflow_cap) overflow_buf[opos] = rec;
+        // opos >= overflow_cap: host 检测 *overflow_count > overflow_cap 时报错
+        // (见 run_method_E) -- 意味着 --gpu-budget-mb/--edge-buffer-mb 对当前
+        // batch_rows 来说太小，不会静默丢边。
+    }
 }
 
 // =====================================================================
@@ -1284,12 +1305,250 @@ static void run_method_B(
 }
 
 // =====================================================================
+// Method E: 单遍扫描 + per-chunk 磁盘 flush 的 scatter buffer（见
+// kern_scatter_rank 和 edge_chunk_accumulator.hpp），rank 保序，不要求
+// forward/output 整图常驻 host。
+//
+// 跟 A/B/C/D 不同：这里不吃预先读好的 host 数组，自己流式读
+// forward_graph.bin，也流式写 output —— 是这四个方法之外唯一一个不要求
+// N*K_out*4B 常驻 host 两份（fwd + output）的路径。main() 对 method "E"
+// 单独分支，跳过现有的整图 read_forward_graph/output_graph 拷贝。
+//
+// Phase 1 在这份文件里都保持单 stream、同步的写法（每个 batch: 读盘 → H2D
+// → kernel → 同步 → D2H 计数 → 按需 drain），没有像 A/C/D 那样做双缓冲/
+// 多 stream 重叠——本机没有 GPU 没法在这上面调优，先保证正确、简单，异步
+// 重叠留作后续在真实硬件上验证过一遍之后再加。
+// =====================================================================
+static void run_method_E(
+    const std::string& fwd_path,
+    const std::string& out_path,
+    int64_t N, int32_t K_out,
+    const ChunkPlan& plan,
+    size_t gpu_budget_bytes,
+    size_t edge_buffer_bytes,
+    const std::string& tmp_dir)
+{
+    using Clock = std::chrono::steady_clock;
+    const int32_t num_chunks = static_cast<int32_t>(plan.starts.size()) - 1;
+
+    std::filesystem::create_directories(tmp_dir);
+
+    // -------- Phase 1 GPU 预算切分 --------
+    // 50% 给 chunk scatter buffer（跨 batch 持续累积），剩下的给双缓冲级别
+    // 简化后的单份 fwd_batch staging + worst-case overflow buffer。
+    size_t chunk_buf_budget = static_cast<size_t>(gpu_budget_bytes * 0.5);
+    size_t capacity_per_chunk = std::max<size_t>(
+        16, chunk_buf_budget / static_cast<size_t>(num_chunks) / sizeof(edge_chunk::EdgeRecord));
+    size_t chunk_buf_bytes = static_cast<size_t>(num_chunks) * capacity_per_chunk * sizeof(edge_chunk::EdgeRecord);
+
+    size_t remaining = (gpu_budget_bytes > chunk_buf_bytes)
+        ? (gpu_budget_bytes - chunk_buf_bytes) : (256ULL << 20);
+    // 每行成本：fwd_batch (K_out*4) + overflow worst-case (K_out * sizeof(EdgeRecord))
+    size_t per_row_bytes = K_out * sizeof(uint32_t) + static_cast<size_t>(K_out) * sizeof(edge_chunk::EdgeRecord);
+    uint32_t batch_rows = static_cast<uint32_t>(std::max<size_t>(4096, remaining / per_row_bytes));
+    batch_rows = static_cast<uint32_t>(std::min<int64_t>(batch_rows, N));
+    uint32_t overflow_cap = batch_rows * static_cast<uint32_t>(K_out);  // 一整批全挤爆同一个 chunk 也能兜住
+
+    std::cout << "  [Method E] " << plan.label
+              << ", num_chunks=" << num_chunks
+              << ", capacity_per_chunk=" << capacity_per_chunk << " records"
+              << " (" << capacity_per_chunk * sizeof(edge_chunk::EdgeRecord) / 1e6 << " MB/chunk)"
+              << ", batch_rows=" << batch_rows
+              << ", overflow_cap=" << overflow_cap << "\n";
+
+    // -------- GPU 侧分配 --------
+    std::vector<uint32_t> starts_u32(plan.starts.begin(), plan.starts.end());
+    uint32_t* d_chunk_starts = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_chunk_starts, starts_u32.size() * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_chunk_starts, starts_u32.data(),
+        starts_u32.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+    edge_chunk::EdgeRecord* d_chunk_buf = nullptr;
+    uint32_t* d_chunk_count = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_chunk_buf,
+        static_cast<size_t>(num_chunks) * capacity_per_chunk * sizeof(edge_chunk::EdgeRecord)));
+    CUDA_CHECK(cudaMalloc(&d_chunk_count, static_cast<size_t>(num_chunks) * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_chunk_count, 0, static_cast<size_t>(num_chunks) * sizeof(uint32_t)));
+
+    edge_chunk::EdgeRecord* d_overflow_buf = nullptr;
+    uint32_t* d_overflow_count = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_overflow_buf, static_cast<size_t>(overflow_cap) * sizeof(edge_chunk::EdgeRecord)));
+    CUDA_CHECK(cudaMalloc(&d_overflow_count, sizeof(uint32_t)));
+
+    uint32_t* d_fwd_batch = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t)));
+
+    uint32_t* h_fwd_batch = nullptr;
+    CUDA_CHECK(cudaMallocHost(&h_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t)));
+    std::vector<uint32_t> h_chunk_count(static_cast<size_t>(num_chunks));
+    edge_chunk::EdgeRecord* h_overflow_buf = nullptr;
+    CUDA_CHECK(cudaMallocHost(&h_overflow_buf, static_cast<size_t>(overflow_cap) * sizeof(edge_chunk::EdgeRecord)));
+    edge_chunk::EdgeRecord* h_drain_buf = nullptr;
+    CUDA_CHECK(cudaMallocHost(&h_drain_buf, capacity_per_chunk * sizeof(edge_chunk::EdgeRecord)));
+
+    auto acc = edge_chunk::EdgeChunkAccumulator::create(tmp_dir, num_chunks, edge_buffer_bytes);
+    acc.start();
+
+    // -------- Phase 1: 单遍扫描 forward_graph.bin，散射进 per-chunk buffer --------
+    auto tA = Clock::now();
+    {
+        std::ifstream fwd_in(fwd_path, std::ios::binary);
+        if (!fwd_in.is_open())
+            throw std::runtime_error("Method E: cannot open " + fwd_path);
+        fwd_in.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);  // 跳过 N/K_out header
+
+        uint64_t total_in_chunk = 0, total_overflow = 0;
+
+        for (int64_t bs = 0; bs < N; bs += batch_rows) {
+            uint32_t cur_rows = static_cast<uint32_t>(std::min<int64_t>(batch_rows, N - bs));
+            size_t n_elems = static_cast<size_t>(cur_rows) * K_out;
+
+            fwd_in.read(reinterpret_cast<char*>(h_fwd_batch),
+                        static_cast<std::streamsize>(n_elems * sizeof(uint32_t)));
+            if (!fwd_in.good())
+                throw std::runtime_error("Method E: failed to read forward graph batch at row " + std::to_string(bs));
+
+            CUDA_CHECK(cudaMemcpy(d_fwd_batch, h_fwd_batch,
+                n_elems * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemset(d_overflow_count, 0, sizeof(uint32_t)));
+
+            uint64_t total_edges = static_cast<uint64_t>(cur_rows) * K_out;
+            int threads = 256;
+            int blocks = static_cast<int>((total_edges + threads - 1) / threads);
+            kern_scatter_rank<<<blocks, threads>>>(
+                d_fwd_batch, static_cast<uint64_t>(bs), cur_rows, static_cast<uint32_t>(K_out),
+                d_chunk_starts, static_cast<uint32_t>(num_chunks),
+                d_chunk_buf, static_cast<uint32_t>(capacity_per_chunk), d_chunk_count,
+                d_overflow_buf, d_overflow_count, overflow_cap);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            CUDA_CHECK(cudaMemcpy(h_chunk_count.data(), d_chunk_count,
+                static_cast<size_t>(num_chunks) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            uint32_t ofc = 0;
+            CUDA_CHECK(cudaMemcpy(&ofc, d_overflow_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            if (ofc > overflow_cap)
+                throw std::runtime_error(
+                    "Method E: overflow buffer exceeded capacity (" + std::to_string(ofc) +
+                    " > " + std::to_string(overflow_cap) +
+                    "). Increase --gpu-budget-mb or --edge-buffer-mb.");
+            if (ofc > 0) {
+                CUDA_CHECK(cudaMemcpy(h_overflow_buf, d_overflow_buf,
+                    static_cast<size_t>(ofc) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+                for (uint32_t e = 0; e < ofc; ++e) {
+                    uint32_t c = edge_chunk::chunk_of(plan.starts.data(),
+                        static_cast<uint32_t>(num_chunks), h_overflow_buf[e].dst);
+                    acc.add_records(static_cast<int32_t>(c), &h_overflow_buf[e], 1);
+                }
+                total_overflow += ofc;
+            }
+
+            for (int32_t c = 0; c < num_chunks; ++c) {
+                if (h_chunk_count[static_cast<size_t>(c)] >= capacity_per_chunk) {
+                    uint32_t take = static_cast<uint32_t>(capacity_per_chunk);
+                    CUDA_CHECK(cudaMemcpy(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
+                        static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+                    acc.add_records(c, h_drain_buf, take);
+                    CUDA_CHECK(cudaMemset(d_chunk_count + c, 0, sizeof(uint32_t)));
+                    total_in_chunk += take;
+                }
+            }
+        }
+
+        // 收尾：drain 每个 chunk 剩下没写满的部分
+        CUDA_CHECK(cudaMemcpy(h_chunk_count.data(), d_chunk_count,
+            static_cast<size_t>(num_chunks) * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        for (int32_t c = 0; c < num_chunks; ++c) {
+            uint32_t cnt = h_chunk_count[static_cast<size_t>(c)];
+            if (cnt == 0) continue;
+            uint32_t take = std::min(cnt, static_cast<uint32_t>(capacity_per_chunk));
+            CUDA_CHECK(cudaMemcpy(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
+                static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+            acc.add_records(c, h_drain_buf, take);
+            total_in_chunk += take;
+        }
+
+        double t_phase1 = std::chrono::duration<double>(Clock::now() - tA).count();
+        uint64_t total_edges_all = total_in_chunk + total_overflow;
+        double pct_over = total_edges_all ? 100.0 * total_overflow / total_edges_all : 0.0;
+        std::cout << "  [Stats] scattered edges: " << total_edges_all
+                  << " (overflow path: " << total_overflow << ", " << std::fixed
+                  << std::setprecision(2) << pct_over << "%)\n";
+        std::cout << "  [Timing] Phase 1 (scatter) = " << t_phase1 << "s\n";
+    }
+
+    acc.finish();
+
+    // -------- 清理 Phase 1 的 GPU/host 分配 --------
+    cudaFree(d_chunk_starts);
+    cudaFree(d_chunk_buf);
+    cudaFree(d_chunk_count);
+    cudaFree(d_overflow_buf);
+    cudaFree(d_overflow_count);
+    cudaFree(d_fwd_batch);
+    cudaFreeHost(h_fwd_batch);
+    cudaFreeHost(h_overflow_buf);
+    cudaFreeHost(h_drain_buf);
+
+    // -------- Phase 2: 按 chunk 顺序重新顺序读一遍 forward_graph.bin（这次
+    // 是当"底稿"用，不是当边的源表用——两次顺序读，用途不同，参见此前的
+    // 讨论：Phase 1 读整张图当 source table，Phase 2 每个 chunk 只读自己
+    // 那一段当 output 的初始值），rank 排序合并，直接流式写出。--------
+    auto tB = Clock::now();
+    {
+        std::ifstream fwd_in2(fwd_path, std::ios::binary);
+        if (!fwd_in2.is_open())
+            throw std::runtime_error("Method E: cannot reopen " + fwd_path);
+        fwd_in2.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);
+
+        graph_io::StreamingGraphWriter writer(out_path, N, K_out);
+
+        std::vector<uint32_t> row_block;
+        std::vector<edge_chunk::EdgeRecord> chunk_edges;
+
+        for (int32_t c = 0; c < num_chunks; ++c) {
+            uint32_t j_lo = plan.starts[static_cast<size_t>(c)];
+            uint32_t j_hi = plan.starts[static_cast<size_t>(c) + 1];
+            uint32_t chunk_sz = j_hi - j_lo;
+
+            row_block.resize(static_cast<size_t>(chunk_sz) * K_out);
+            fwd_in2.read(reinterpret_cast<char*>(row_block.data()),
+                        static_cast<std::streamsize>(row_block.size() * sizeof(uint32_t)));
+            if (!fwd_in2.good())
+                throw std::runtime_error("Method E Phase 2: failed to read forward rows for chunk " + std::to_string(c));
+
+            acc.read_chunk(c, chunk_edges);
+            auto csr = edge_chunk::build_rank_ordered_csr(chunk_edges, j_lo, chunk_sz);
+
+            #pragma omp parallel for schedule(dynamic, 1024)
+            for (int64_t lj = 0; lj < static_cast<int64_t>(chunk_sz); ++lj) {
+                uint32_t lo = csr.row_offsets[static_cast<size_t>(lj)];
+                uint32_t hi = csr.row_offsets[static_cast<size_t>(lj) + 1];
+                edge_chunk::merge_rank_ordered_into_row(
+                    row_block.data() + static_cast<size_t>(lj) * K_out,
+                    csr.src.data() + lo, hi - lo, static_cast<uint32_t>(K_out));
+            }
+
+            writer.write_rows(row_block.data(), j_lo, chunk_sz);
+        }
+
+        if (writer.rows_written() != N)
+            throw std::runtime_error("Method E: wrote " + std::to_string(writer.rows_written()) +
+                                     " rows, expected " + std::to_string(N));
+    }
+    double t_phase2 = std::chrono::duration<double>(Clock::now() - tB).count();
+    std::cout << "  [Timing] Phase 2 (merge + stream write) = " << t_phase2 << "s\n";
+
+    std::filesystem::remove_all(tmp_dir);
+}
+
+// =====================================================================
 // main
 // =====================================================================
 int main(int argc, char** argv)
 {
     try {
-        po::options_description desc("CAGRA chunked reverse-graph + merge (4 methods)");
+        po::options_description desc("CAGRA chunked reverse-graph + merge (5 methods)");
         desc.add_options()
             ("help,h", "Show help")
             ("forward-graph,g", po::value<std::string>()->required(),
@@ -1301,13 +1560,25 @@ int main(int argc, char** argv)
                 "B (pre-shuffle pairs), "
                 "C (bucket-aligned single-pass + overflow capture, lossless), "
                 "D (3-slot sliding window over bucket-aligned chunks, "
-                "captures ±1 cross-chunk edges directly, lossless)")
+                "captures ±1 cross-chunk edges directly, lossless), "
+                "E (per-chunk disk-backed scatter buffer, rank-priority preserving, "
+                "single pass, streams fwd graph + output from/to disk -- doesn't "
+                "require the full graph resident in host memory like A/B/C/D do)")
             ("gpu-budget-mb", po::value<size_t>()->default_value(8000),
                 "GPU memory budget for chunk buffers (MB)")
+            ("edge-buffer-mb", po::value<size_t>()->default_value(1024),
+                "Method E only: total host-side staging budget (MB), shared across all "
+                "chunks' disk-flush buffers -- same semantics as bucket2's --bucket-vec-buffer")
+            ("tmp-dir", po::value<std::string>()->default_value(""),
+                "Method E only: scratch directory for per-chunk edge files "
+                "(default: <output dir>/.optimize_chunked_e_tmp, removed on success)")
             ("bucket-offsets", po::value<std::string>()->default_value(""),
-                "Bucket boundaries file (required for methods C and D)")
+                "Bucket boundaries file (required for methods C and D; optional for E -- "
+                "if given, chunks align to buckets, otherwise E falls back to uniform "
+                "GPU-budget-sized chunks since it doesn't need bucket locality for correctness)")
             ("rev-degree-cap", po::value<int32_t>()->default_value(0),
-                "Cap on reverse edges per node (0 = K_out, the default)")
+                "Cap on reverse edges per node (0 = K_out, the default). Unused by method E, "
+                "which keeps variable-length per-node candidate lists instead of a fixed cap.")
             ("save-npy", po::bool_switch()->default_value(false),
                 "Also write a .npy alongside the .bin");
 
@@ -1321,17 +1592,83 @@ int main(int argc, char** argv)
         const std::string method    = vm["method"].as<std::string>();
         const size_t gpu_budget_mb  = vm["gpu-budget-mb"].as<size_t>();
         const size_t gpu_budget_b   = gpu_budget_mb << 20;
+        const size_t edge_buffer_mb = vm["edge-buffer-mb"].as<size_t>();
+        const size_t edge_buffer_b  = edge_buffer_mb << 20;
+        std::string tmp_dir_arg     = vm["tmp-dir"].as<std::string>();
         const std::string bo_path   = vm["bucket-offsets"].as<std::string>();
         int32_t rev_cap_arg         = vm["rev-degree-cap"].as<int32_t>();
         const bool save_npy         = vm["save-npy"].as<bool>();
 
-        if (method != "A" && method != "B" && method != "C" && method != "D")
-            throw std::runtime_error("--method must be A, B, C, or D");
+        if (method != "A" && method != "B" && method != "C" && method != "D" && method != "E")
+            throw std::runtime_error("--method must be A, B, C, D, or E");
         if ((method == "C" || method == "D") && bo_path.empty())
             throw std::runtime_error("Method " + method + " requires --bucket-offsets");
 
         using Clock = std::chrono::steady_clock;
         auto t_start = Clock::now();
+
+        // ====================================================================
+        // Method E takes a completely different path: it never loads the full
+        // forward/output graph into host memory (that's the whole point), so
+        // it can't share the "read_forward_graph -> array -> write_graph" flow
+        // the other four methods use below. Handle it here and return early.
+        // ====================================================================
+        if (method == "E") {
+            std::cout << "=== Step 1: Reading forward graph header ===\n";
+            int64_t N = 0; int32_t K_out = 0;
+            graph_io::read_forward_graph_header(fwd_path, N, K_out);
+            std::cout << "  N=" << N << " K_out=" << K_out << "\n";
+
+            std::string tmp_dir = tmp_dir_arg.empty()
+                ? std::filesystem::path(out_path).parent_path().string() + "/.optimize_chunked_e_tmp"
+                : tmp_dir_arg;
+
+            std::cout << "=== Step 2: Planning chunks ===\n";
+            ChunkPlan plan;
+            if (!bo_path.empty()) {
+                auto offsets = read_bucket_offsets(bo_path);
+                if (offsets.back() != static_cast<uint32_t>(N))
+                    throw std::runtime_error(
+                        "bucket_offsets.back() (" + std::to_string(offsets.back()) +
+                        ") != N (" + std::to_string(N) + ")");
+                // K_out 当"每个节点期望反向边数"的启发式估计，用来复用现有的
+                // bucket-aligned 分块公式 -- 分块大小只影响性能（buffer 摊得
+                // 多细），不影响正确性（EdgeChunkAccumulator 写满就 flush，
+                // 加上共享 overflow buffer 兜底，任意 chunk 数都是对的）。
+                plan = plan_bucket_aligned_chunks(offsets, K_out, gpu_budget_b);
+            } else {
+                plan = plan_uniform_chunks(N, K_out, gpu_budget_b);
+            }
+            std::cout << "  " << plan.label << ", num_chunks=" << plan.starts.size() - 1 << "\n";
+
+            std::cout << "=== Step 3: Reverse graph + merge (method E) ===\n";
+            auto t2 = Clock::now();
+            run_method_E(fwd_path, out_path, N, K_out, plan, gpu_budget_b, edge_buffer_b, tmp_dir);
+            std::cout << "  Done [" << std::chrono::duration<double>(Clock::now() - t2).count()
+                      << "s]\n";
+
+            if (save_npy) {
+                // Optional diagnostic/interop output only -- reloads the just-written
+                // file whole, unlike the streaming core path above.
+                std::vector<uint32_t> out_graph;
+                int64_t N2 = 0; int32_t K2 = 0;
+                graph_io::read_forward_graph(out_path, out_graph, N2, K2);
+                std::vector<int64_t> g64(out_graph.size());
+                #pragma omp parallel for schedule(static)
+                for (size_t i = 0; i < out_graph.size(); ++i)
+                    g64[i] = static_cast<int64_t>(out_graph[i]);
+                auto p = std::filesystem::path(out_path);
+                p.replace_extension(".npy");
+                load::write_npy_int64_2d(p.string(), g64.data(), N2, K2);
+                std::cout << "  Wrote " << p.string() << " (npy)\n";
+            }
+
+            double total = std::chrono::duration<double>(Clock::now() - t_start).count();
+            std::cout << "\n=== Done ===\n";
+            std::cout << "Method: E\n";
+            std::cout << "Total: " << std::fixed << std::setprecision(3) << total << "s\n";
+            return 0;
+        }
 
         // ---- Load forward graph ----
         std::cout << "=== Step 1: Loading forward graph ===\n";

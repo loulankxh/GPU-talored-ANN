@@ -15,11 +15,15 @@
 //                              图，用于推导有空间局部性的 bucket 处理顺序
 //
 // 输出（写入指定输出目录）：
-//   data_reordered.<ext>       重排后的数据集（保留原始格式 / 元素类型）
-//   bucket_offsets.bin         method C 用的 bucket 边界（新 ID 空间）
-//   perm.bin                   uint32[N]，perm[old_id] = new_id
-//   inverse_perm.bin           uint32[N]，inverse_perm[new_id] = old_id
-//   [vector_knn_reordered.bin] 可选，重排 + 邻居 ID 重映射后的 KNN 图
+//   data_reordered.<ext>        重排后的数据集（保留原始格式 / 元素类型）
+//   bucket_offsets.bin          method C/D/E 和 prune_windowed 用的 bucket 边界（新 ID 空间）
+//   bucket_process_order.bin    order[pos] = 原始 bucket id，给 prune_windowed 用来精确复原
+//                                "新 ID 区间 [offsets[pos],offsets[pos+1]) 属于哪个原始 bucket"，
+//                                不用重新跑一遍 compute_bucket_processing_order（避免 --order-window
+//                                两边对不上导致行映射悄悄错位）
+//   perm.bin                    uint32[N]，perm[old_id] = new_id
+//   inverse_perm.bin            uint32[N]，inverse_perm[new_id] = old_id
+//   [vector_knn_reordered.bin]  可选，重排 + 邻居 ID 重映射后的 KNN 图
 //
 // bucket_offsets.bin 格式（与 optimize_chunked 对应）:
 //   int32_t  n_buckets
@@ -44,6 +48,7 @@
 
 #include "load.hpp"
 #include "bucket_order.hpp"
+#include "graph_io.hpp"
 
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
@@ -101,81 +106,11 @@ static std::vector<int32_t> read_bucket_data(const std::string& path, int64_t to
     return ids;
 }
 
-// centroid_knn.bin (written by bucket.cu when --reorder is set):
-//   int64_t  n_centroids
-//   int32_t  K
-//   uint32_t graph[n_centroids * K]   // row-major, bucket -> its K nearest buckets
-struct CentroidKnn {
-    int64_t n_centroids;
-    int32_t K;
-    std::vector<uint32_t> graph;
-};
-
-static CentroidKnn read_centroid_knn(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open())
-        throw std::runtime_error("Cannot open centroid_knn: " + path);
-
-    CentroidKnn ck;
-    in.read(reinterpret_cast<char*>(&ck.n_centroids), sizeof(int64_t));
-    in.read(reinterpret_cast<char*>(&ck.K), sizeof(int32_t));
-    if (!in.good() || ck.n_centroids <= 0 || ck.K <= 0)
-        throw std::runtime_error("Invalid centroid_knn header");
-    ck.graph.resize(static_cast<size_t>(ck.n_centroids) * ck.K);
-    in.read(reinterpret_cast<char*>(ck.graph.data()),
-            static_cast<std::streamsize>(ck.graph.size() * sizeof(uint32_t)));
-    if (!in.good())
-        throw std::runtime_error("Failed to read centroid_knn payload");
-    return ck;
-}
-
-// vector_knn.bin: int64 N, int32 M, int32 graph[N*M]
-struct VectorKnn {
-    int64_t N;
-    int32_t M;
-    std::vector<int32_t> graph;
-};
-
-static VectorKnn read_vector_knn(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in.is_open())
-        throw std::runtime_error("Cannot open vector_knn: " + path);
-
-    VectorKnn vk;
-    in.read(reinterpret_cast<char*>(&vk.N), sizeof(int64_t));
-    in.read(reinterpret_cast<char*>(&vk.M), sizeof(int32_t));
-    if (!in.good() || vk.N <= 0 || vk.M <= 0)
-        throw std::runtime_error("Invalid vector_knn header");
-    vk.graph.resize(static_cast<size_t>(vk.N) * vk.M);
-    in.read(reinterpret_cast<char*>(vk.graph.data()),
-            static_cast<std::streamsize>(vk.graph.size() * sizeof(int32_t)));
-    if (!in.good())
-        throw std::runtime_error("Failed to read vector_knn payload");
-    return vk;
-}
-
-static void write_vector_knn(const std::string& path,
-                             const std::vector<int32_t>& graph,
-                             int64_t N, int32_t M)
-{
-    std::ofstream out(path, std::ios::binary);
-    if (!out.is_open())
-        throw std::runtime_error("Cannot open: " + path);
-    out.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
-    out.write(reinterpret_cast<const char*>(&M), sizeof(int32_t));
-    out.write(reinterpret_cast<const char*>(graph.data()),
-              static_cast<std::streamsize>(graph.size() * sizeof(int32_t)));
-}
-
-// 通用二进制写
-template <typename T>
-static void write_vector_bin(const std::string& path, const std::vector<T>& v) {
-    std::ofstream out(path, std::ios::binary);
-    if (!out.is_open())
-        throw std::runtime_error("Cannot open: " + path);
-    out.write(reinterpret_cast<const char*>(v.data()),
-              static_cast<std::streamsize>(v.size() * sizeof(T)));
-}
+// centroid_knn.bin / vector_knn.bin readers + writer and the generic
+// write_vector_bin now live in graph_io.hpp (shared with optimize_chunked.cu
+// and prune_windowed.cpp) as graph_io::CentroidKnn/read_centroid_knn,
+// graph_io::VectorKnn/read_vector_knn/write_vector_knn, and
+// graph_io::write_vector_bin.
 
 // ---------- Main ----------
 
@@ -244,7 +179,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> bucket_process_order(n_buckets);
         if (!cknn_path.empty()) {
             std::cout << "  Loading centroid_knn from " << cknn_path << " ...\n";
-            auto ck = read_centroid_knn(cknn_path);
+            auto ck = graph_io::read_centroid_knn(cknn_path);
             if (ck.n_centroids != n_buckets)
                 throw std::runtime_error("centroid_knn n_centroids (" +
                     std::to_string(ck.n_centroids) + ") != bucket-index n_buckets (" +
@@ -365,7 +300,7 @@ int main(int argc, char** argv) {
         if (!vknn_path.empty()) {
             std::cout << "=== Step 3: Reordering vector_knn.bin ===\n";
             auto t3 = Clock::now();
-            auto vk = read_vector_knn(vknn_path);
+            auto vk = graph_io::read_vector_knn(vknn_path);
             if (vk.N != N)
                 throw std::runtime_error("vector_knn N != dataset N");
 
@@ -396,7 +331,7 @@ int main(int argc, char** argv) {
             }
 
             std::string out_knn_path = out_dir + "/vector_knn_reordered.bin";
-            write_vector_knn(out_knn_path, new_graph,
+            graph_io::write_vector_knn(out_knn_path, new_graph,
                              static_cast<int64_t>(total_rows), vk.M);
             std::cout << "  Wrote " << out_knn_path
                       << " (" << new_graph.size() * sizeof(int32_t) / 1e6 << " MB) ["
@@ -414,17 +349,28 @@ int main(int argc, char** argv) {
         // bucket_offsets.bin
         {
             std::string p = out_dir + "/bucket_offsets.bin";
-            std::ofstream out(p, std::ios::binary);
-            int32_t nb32 = static_cast<int32_t>(n_buckets);
-            out.write(reinterpret_cast<const char*>(&nb32), sizeof(int32_t));
-            out.write(reinterpret_cast<const char*>(offsets_new.data()),
-                      static_cast<std::streamsize>(offsets_new.size() * sizeof(uint32_t)));
+            graph_io::write_bucket_offsets(p, offsets_new);
             std::cout << "  Wrote " << p << " (n_buckets=" << n_buckets << ")\n";
         }
 
+        // bucket_process_order.bin: order[pos] = original bucket id at
+        // position pos. Written unconditionally (even the --centroid-knn-less
+        // identity-order fallback) so downstream tools (prune_windowed) can
+        // always recover "which original bucket owns new-id range
+        // [offsets[pos], offsets[pos+1])" by reading this file instead of
+        // recomputing compute_bucket_processing_order a second time -- that
+        // recomputation would silently produce a different order (and thus
+        // corrupt every row mapping) if its --order-window doesn't exactly
+        // match what was used here.
+        {
+            std::string p = out_dir + "/bucket_process_order.bin";
+            graph_io::write_bucket_process_order(p, bucket_process_order);
+            std::cout << "  Wrote " << p << "\n";
+        }
+
         // perm.bin / inverse_perm.bin
-        write_vector_bin(out_dir + "/perm.bin", perm);
-        write_vector_bin(out_dir + "/inverse_perm.bin", inverse_perm);
+        graph_io::write_vector_bin(out_dir + "/perm.bin", perm);
+        graph_io::write_vector_bin(out_dir + "/inverse_perm.bin", inverse_perm);
         std::cout << "  Wrote perm.bin (" << perm.size() * 4 / 1e6 << " MB), "
                   << "inverse_perm.bin (" << inverse_perm.size() * 4 / 1e6 << " MB)\n";
 
@@ -438,7 +384,8 @@ int main(int argc, char** argv) {
         std::cout << "  data_reordered" << ext << "        — reordered dataset\n";
         if (!vknn_path.empty())
             std::cout << "  vector_knn_reordered.bin    — remapped KNN graph\n";
-        std::cout << "  bucket_offsets.bin          — for optimize_chunked --method C\n";
+        std::cout << "  bucket_offsets.bin          — for optimize_chunked --method C/D/E, prune_windowed\n";
+        std::cout << "  bucket_process_order.bin    — for prune_windowed (bucket id at each position)\n";
         std::cout << "  perm.bin / inverse_perm.bin — id translation tables\n";
         return 0;
 
