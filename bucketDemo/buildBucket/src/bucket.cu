@@ -4315,14 +4315,14 @@ int run_pipeline_impl(
             if (iter == 0) {
                 reordered_io::ReorderedDatasetBucketReader<DataT> reader(
                     working_input_path, D, reorder_offsets_new, reorder_pos_of);
-                build_vector_knn_with_tensorcore(
+                build_vector_knn_with_tensorcore<DataT>(
                     N, D, reader, graph_ptr,
                     n_centroids, graph_K, neighbors_m,
                     *knn_acc,
                     centroid_knn_graph_host.data(), K,
                     order_window_arg, step6_cache_bytes);
             } else {
-                build_vector_knn_with_tensorcore(
+                build_vector_knn_with_tensorcore<DataT>(
                     N, D, *bucket_vecs_ptr, graph_ptr,
                     n_centroids, graph_K, neighbors_m,
                     *knn_acc,
