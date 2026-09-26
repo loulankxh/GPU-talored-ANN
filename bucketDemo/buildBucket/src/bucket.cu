@@ -3806,6 +3806,7 @@ int run_pipeline_impl(
         // 采样索引: sampled_indices[sample_idx] = raw_idx
         std::vector<int64_t> sampled_indices;
         std::vector<float> X_sampled;
+        int64_t working_N = 0;  // X_sampled 的行数；Step 2 等 lambda 外的代码要用
 
         // 采样逻辑抽成 lambda：round 1 重排完之后，如果 iterations > 1，要对着
         // 新坐标系的 data_reordered.<ext> 重新采一遍（否则第 2..t 轮选出来的
@@ -3815,7 +3816,7 @@ int run_pipeline_impl(
         auto sample_from = [&](const std::string& path) {
             if (!mem_est.fits_in_gpu) {
                 // 只从 disk 读取采样行，不加载完整数据集
-                int64_t working_N = mem_est.sampled_data_rows;
+                working_N = mem_est.sampled_data_rows;
                 sampled_indices = sample_without_replacement(N, working_N, config.seed);
                 // 排序以实现顺序磁盘读取 (SSD/NVMe 友好)
                 auto sorted_order = sampled_indices;
@@ -3853,6 +3854,7 @@ int run_pipeline_impl(
                           << X_sampled.size() * sizeof(float) / 1e9 << " GB)\n";
             } else {
                 // 全量数据可放入 GPU — 此处仍需全量读取 (后续 step 也需要)
+                working_N = N;
                 sampled_indices.resize(N);
                 std::iota(sampled_indices.begin(), sampled_indices.end(), 0LL);
 
