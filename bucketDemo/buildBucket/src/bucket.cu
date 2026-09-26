@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <atomic>
 #include <unordered_set>
+#include <unordered_map>
 #include <cstring>
 #include <type_traits>
 #include <omp.h>
@@ -58,6 +59,7 @@
 #include "bucket_build.cuh"
 #include "bucket_order.hpp"
 #include "graph_io.hpp"
+#include "reordered_dataset_io.hpp"
 
 namespace po = boost::program_options;
 using namespace bucket;
@@ -988,6 +990,11 @@ struct VecBucket {
  * @param quantizer              量化器（仅 CentroidT=uint8_t 时使用）
  * @param Mbatch_bytes           GPU 剩余可用空间 (bytes), 默认 10GB
  * @param search_max_iters       图搜索最大迭代次数, 默认 64
+ * @param bucket_vecs            按桶散写原始向量的累加器；传 nullptr 跳过这次散写
+ *                               （round 1 的 Step4 用——round 1 分配完之后马上会做
+ *                               一次性重排直接写 data_reordered.<ext>，这份按桶散
+ *                               写的临时文件对 round 1 来说本来就是白写，见
+ *                               bucket.cu 主循环里 round 1 分支的注释）
  *
  * @return  (N,) 每个点分配到的 local centroid index [0, n_centroids)
  */
@@ -998,7 +1005,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     int64_t D,
     int64_t n_centroids,
     const std::vector<int64_t>& centroid_global_indices,
-    BucketVectorAccumulator<T>& bucket_vecs,
+    BucketVectorAccumulator<T>* bucket_vecs,
     CentroidT* d_centroids,
     size_t centroid_gpu_bytes,
     uint32_t* d_graph,
@@ -1029,13 +1036,15 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     // 的原始向量补写进各自的 bucket 文件。n_centroids 条，一次性小读，不是要
     // 避免的那种"整份数据集常驻"。
     {
-        std::vector<T> centroid_vecs_raw;
-        int32_t N_tmp, D_tmp;
-        load::read_bigann_raw_sampled<T>(input_path, centroid_global_indices,
-                                          centroid_vecs_raw, N_tmp, D_tmp);
-        for (int64_t c = 0; c < n_centroids; ++c) {
-            bucket_vecs.add(c, centroid_global_indices[c],
-                            centroid_vecs_raw.data() + static_cast<size_t>(c) * D);
+        if (bucket_vecs) {
+            std::vector<T> centroid_vecs_raw;
+            int32_t N_tmp, D_tmp;
+            load::read_bigann_raw_sampled<T>(input_path, centroid_global_indices,
+                                              centroid_vecs_raw, N_tmp, D_tmp);
+            for (int64_t c = 0; c < n_centroids; ++c) {
+                bucket_vecs->add(c, centroid_global_indices[c],
+                                centroid_vecs_raw.data() + static_cast<size_t>(c) * D);
+            }
         }
     }
 
@@ -1221,10 +1230,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         // 原始向量本来就在内存里 (刚从磁盘顺序读出来的)，直接顺手写掉，不需要
         // 再读一遍磁盘。串行是因为多个点可能落到同一个 bucket，避免并发写同一
         // 个 BucketBuf 的数据竞争；这一步只是内存 memcpy + 偶尔 flush，很快。
-        for (int64_t i = 0; i < batch_size; ++i) {
-            int64_t gi = non_centroid_indices[batch_start + i];
-            int64_t local = gi - batch_lo;
-            bucket_vecs.add(assignments[gi], gi, raw_batch.data() + local * D);
+        if (bucket_vecs) {
+            for (int64_t i = 0; i < batch_size; ++i) {
+                int64_t gi = non_centroid_indices[batch_start + i];
+                int64_t local = gi - batch_lo;
+                bucket_vecs->add(assignments[gi], gi, raw_batch.data() + local * D);
+            }
         }
 
         if ((batch_start / Nv) % 10 == 0 || batch_end == N_nc) {
@@ -2863,18 +2874,25 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
  *                            用的是上面 centroid_knn_graph/K 那个真实展开后的图)
  * @param order_graph_K       order_graph 的度数 (= Step 3 的 knn-k)
  * @param order_window_arg    DiskJoin 风格桶处理顺序的滑动窗口大小 (见 bucket_order.hpp)，
- *                            0 = 自动 (4*order_graph_K)；跟 --reorder 用的是同一个 CLI 参数
+ *                            0 = 自动 (4*order_graph_K)
  * @param cache_bytes         Belady 桶缓存的字节预算——按处理顺序把"桶自己 + K 个
  *                            近邻桶"的原始向量缓存住，命中就不用再碰磁盘
  *
  * 距离对合并是必需的 (要按距离排序去重)，所以内部始终按 want_distances=true
  * 的路径跑；不再对外暴露"不算距离"这个选项。
+ *
+ * bucket_vecs 的类型是模板参数 BucketReaderT 而不是写死 BucketVectorAccumulator<DataT>——
+ * 函数体只通过 count(bid) / read_bucket(bid, ids_out, vecs_out) 这两个方法访问它
+ * (见下面 bucket_loader)，round 2..t 传 BucketVectorAccumulator<DataT>&（跟以前一样），
+ * round 1 传 ReorderedDatasetBucketReader<DataT>&（见 reordered_dataset_io.hpp）——
+ * round 1 分配完就已经把数据集重排写进 data_reordered.<ext> 了，直接按 offset 读，
+ * 不需要 BucketVectorAccumulator 那份按桶散写的临时文件。
  */
-template <typename DataT>
+template <typename DataT, typename BucketReaderT>
 void build_vector_knn_with_tensorcore(
     int64_t N,
     int64_t D,
-    BucketVectorAccumulator<DataT>& bucket_vecs,
+    BucketReaderT& bucket_vecs,
     const uint32_t* centroid_knn_graph,  // (n_centroids, K) row-major, nprobe 展开后
     int64_t n_centroids,
     uint32_t K,
@@ -3628,20 +3646,29 @@ void write_vector_knn_to_disk(
  * 的假设才成立。
  *
  * 输入 assignments (老 ID 空间)，输出:
- *   perm[old_id]         = new_id    (未分配的点为 0xFFFFFFFFu)
  *   inverse_perm[new_id] = old_id
  *   bucket_offsets       = bucket 边界（新 ID 空间，按 bucket_order 排列），长度 n_buckets+1
+ *   centroid_new_ids[k]  = centroid_global_indices[k] 的新 ID
+ *
+ * 没有 perm[old_id]=new_id 这张全量表——它从来没被任何下游读过（inverse_perm
+ * 才是 search 阶段真正需要的方向：新 ID 翻回旧 ID），而且信息上是 inverse_perm
+ * 的完全冗余（谁真需要 old->new，反着扫一遍 inverse_perm 就有），没必要为了一
+ * 个从没用过的方向多背 N 个 uint32。调用方唯一需要的 old->new 查询只有
+ * centroid_global_indices 那几个具体的点（n_centroids 个，远小于 N），所以在
+ * 下面这个本来就要跑一遍的 O(N) 循环里，顺手用一个只有 n_centroids 个条目的
+ * hash map 把它们摘出来，不必再为全量 old->new 分配一个 O(N) 数组。
  */
 struct ReorderInfo {
-    std::vector<uint32_t> perm;
     std::vector<uint32_t> inverse_perm;
     std::vector<uint32_t> bucket_offsets;
+    std::vector<uint32_t> centroid_new_ids;  // 跟 centroid_global_indices 一一对应
     int64_t total_in_buckets;
 };
 
 static ReorderInfo compute_bucket_reorder(
     const std::vector<int64_t>& assignments, int64_t N, int64_t n_buckets,
-    const std::vector<int32_t>& bucket_order)
+    const std::vector<int32_t>& bucket_order,
+    const std::vector<int64_t>& centroid_global_indices)
 {
     ReorderInfo r;
     r.bucket_offsets.assign(n_buckets + 1, 0);
@@ -3665,126 +3692,34 @@ static ReorderInfo compute_bucket_reorder(
     }
 
     r.total_in_buckets = static_cast<int64_t>(running);
-    r.perm.assign(N, 0xFFFFFFFFu);
     r.inverse_perm.assign(r.total_in_buckets, 0);
+    r.centroid_new_ids.assign(centroid_global_indices.size(), 0xFFFFFFFFu);
+
+    // old_id -> index into centroid_global_indices；只有 n_centroids 个条目，
+    // 不是 N 个——这就是不再需要全量 perm[] 数组的关键。
+    std::unordered_map<int64_t, size_t> centroid_old_id_to_k;
+    centroid_old_id_to_k.reserve(centroid_global_indices.size() * 2);
+    for (size_t k = 0; k < centroid_global_indices.size(); ++k)
+        centroid_old_id_to_k[centroid_global_indices[k]] = k;
 
     std::vector<uint32_t> cursor = new_id_range_start;
     for (int64_t old_id = 0; old_id < N; ++old_id) {
         int64_t b = assignments[old_id];
         if (b >= 0 && b < n_buckets) {
             uint32_t new_id = cursor[b]++;
-            r.perm[old_id] = new_id;
             r.inverse_perm[new_id] = static_cast<uint32_t>(old_id);
+            auto it = centroid_old_id_to_k.find(old_id);
+            if (it != centroid_old_id_to_k.end())
+                r.centroid_new_ids[it->second] = new_id;
         }
     }
     return r;
 }
 
-/**
- * 写出所有 reorder 产物（与 reorder.cpp 对齐，可被 optimize_chunked --method C/D 直接消费）：
- *   data_reordered.<ext>         重排后的 dataset，保留原始 DataT element type
- *   vector_knn_reordered.bin     重排 + 邻居 ID 重映射后的 KNN 图（仅当 neighbors_m > 0）
- *   bucket_offsets.bin           bucket 边界 (新 ID 空间)
- *   perm.bin / inverse_perm.bin  ID 翻译表 (uint32[N])
- *
- * data_reordered 现在从 bucket_vecs (最后一轮 Step 4 写的按 bucket 分组的
- * (gid, 原始向量) 磁盘缓存) 读，而不是整份常驻的 X_full；每条记录自带 gid，
- * 用 r.perm[gid] 直接算出这一行该落在新 ID 空间的哪个位置，不依赖桶内顺序。
- */
-template <typename DataT>
-static void write_reordered_outputs(
-    const std::string& output_dir,
-    const std::string& input_ext,
-    BucketVectorAccumulator<DataT>& bucket_vecs, int64_t N, int D,
-    const std::vector<int32_t>& vector_knn, int M_neighbors,
-    const ReorderInfo& r, int64_t n_buckets)
-{
-    const int64_t total = r.total_in_buckets;
-
-    // 1) data_reordered.<ext>：从按 bucket 分组的磁盘缓存里顺序读，
-    //    按每条记录自带的 gid 算出新 id，散写进 reord。
-    {
-        std::string path = output_dir + "/data_reordered" + input_ext;
-        std::ofstream out(path, std::ios::binary);
-        int32_t Nh = static_cast<int32_t>(total), Dh = static_cast<int32_t>(D);
-        out.write(reinterpret_cast<const char*>(&Nh), sizeof(int32_t));
-        out.write(reinterpret_cast<const char*>(&Dh), sizeof(int32_t));
-
-        std::vector<DataT> reord(static_cast<size_t>(total) * D);
-        std::vector<int64_t> bucket_ids;
-        std::vector<DataT>   bucket_data;
-        for (int64_t c = 0; c < n_buckets; ++c) {
-            int64_t cnt = bucket_vecs.count(c);
-            if (cnt == 0) continue;
-            bucket_ids.resize(static_cast<size_t>(cnt));
-            bucket_data.resize(static_cast<size_t>(cnt) * D);
-            bucket_vecs.read_bucket_into(c, bucket_ids.data(), bucket_data.data());
-            #pragma omp parallel for schedule(static)
-            for (int64_t i = 0; i < cnt; ++i) {
-                int64_t gid = bucket_ids[static_cast<size_t>(i)];
-                uint32_t new_id = r.perm[gid];
-                if (new_id == 0xFFFFFFFFu) continue;  // 未分配的点 (理论上不该出现)
-                std::memcpy(reord.data() + static_cast<size_t>(new_id) * D,
-                            bucket_data.data() + static_cast<size_t>(i) * D,
-                            static_cast<size_t>(D) * sizeof(DataT));
-            }
-        }
-        out.write(reinterpret_cast<const char*>(reord.data()),
-                  static_cast<std::streamsize>(reord.size() * sizeof(DataT)));
-        std::cout << "  Wrote " << path
-                  << " (" << reord.size() * sizeof(DataT) / 1e9 << " GB)\n";
-    }
-
-    // 2) vector_knn_reordered.bin（如果有 vector_knn）
-    if (M_neighbors > 0 && !vector_knn.empty()) {
-        std::vector<int32_t> reord_knn(static_cast<size_t>(total) * M_neighbors);
-        int64_t bad = 0;
-        #pragma omp parallel for schedule(static) reduction(+:bad)
-        for (int64_t new_id = 0; new_id < total; ++new_id) {
-            uint32_t old_id = r.inverse_perm[new_id];
-            const int32_t* src = vector_knn.data() + static_cast<size_t>(old_id) * M_neighbors;
-            int32_t* dst = reord_knn.data() + static_cast<size_t>(new_id) * M_neighbors;
-            for (int k = 0; k < M_neighbors; ++k) {
-                int32_t old_nb = src[k];
-                if (old_nb < 0) {
-                    dst[k] = -1;
-                } else if (static_cast<int64_t>(old_nb) >= N
-                           || r.perm[old_nb] == 0xFFFFFFFFu) {
-                    dst[k] = -1; bad++;
-                } else {
-                    dst[k] = static_cast<int32_t>(r.perm[old_nb]);
-                }
-            }
-        }
-        if (bad > 0)
-            std::cout << "  [Warn] " << bad
-                      << " neighbor entries → -1 (unassigned/out-of-range)\n";
-        write_vector_knn_to_disk(
-            output_dir + "/vector_knn_reordered.bin", reord_knn, total, M_neighbors);
-    }
-
-    // 3) bucket_offsets.bin / perm.bin / inverse_perm.bin
-    {
-        std::string p = output_dir + "/bucket_offsets.bin";
-        std::ofstream out(p, std::ios::binary);
-        int32_t nb32 = static_cast<int32_t>(n_buckets);
-        out.write(reinterpret_cast<const char*>(&nb32), sizeof(int32_t));
-        out.write(reinterpret_cast<const char*>(r.bucket_offsets.data()),
-                  static_cast<std::streamsize>(r.bucket_offsets.size() * sizeof(uint32_t)));
-        std::cout << "  Wrote " << p << "\n";
-    }
-    {
-        std::ofstream out(output_dir + "/perm.bin", std::ios::binary);
-        out.write(reinterpret_cast<const char*>(r.perm.data()),
-                  static_cast<std::streamsize>(r.perm.size() * sizeof(uint32_t)));
-    }
-    {
-        std::ofstream out(output_dir + "/inverse_perm.bin", std::ios::binary);
-        out.write(reinterpret_cast<const char*>(r.inverse_perm.data()),
-                  static_cast<std::streamsize>(r.inverse_perm.size() * sizeof(uint32_t)));
-    }
-    std::cout << "  Wrote perm.bin / inverse_perm.bin\n";
-}
+// write_reordered_outputs（事后重排，读 bucket_vecs 的按桶散写临时文件，重映射
+// vector_knn 邻居 ID）已经删掉了——它做的事现在在主循环 round 1 的 Step 4.5
+// 里内联完成（见 ReorderedDatasetWriter / compute_bucket_reorder 的调用处），
+// 不再需要事后单独一遍。
 
 // ============== Main ==============
 
@@ -3801,7 +3736,6 @@ int run_pipeline_impl(
     int search_max_iters,
     int neighbors_m,
     uint32_t nprobe,
-    bool do_reorder,
     int iterations,
     LoadConfig config,
     const std::string& ext,
@@ -3834,8 +3768,8 @@ int run_pipeline_impl(
         using Clock = std::chrono::high_resolution_clock;
         auto t_total_start = Clock::now();
         double elapsed_step1 = 0, elapsed_step2 = 0, elapsed_step3 = 0;
-        double elapsed_step3p5 = 0, elapsed_step4 = 0, elapsed_step5 = 0;
-        double elapsed_step6 = 0, elapsed_step7 = 0;
+        double elapsed_step3p5 = 0, elapsed_step4 = 0, elapsed_step45 = 0, elapsed_step5 = 0;
+        double elapsed_step6 = 0;
         double elapsed_write_knn = 0;
         double elapsed_final_merge_wait = 0;
 
@@ -3872,67 +3806,80 @@ int run_pipeline_impl(
         // 采样索引: sampled_indices[sample_idx] = raw_idx
         std::vector<int64_t> sampled_indices;
         std::vector<float> X_sampled;
-        int64_t working_N;
 
-        if (!mem_est.fits_in_gpu) {
-            // 只从 disk 读取采样行，不加载完整数据集
-            working_N = mem_est.sampled_data_rows;
-            sampled_indices = sample_without_replacement(N, working_N, config.seed);
-            // 排序以实现顺序磁盘读取 (SSD/NVMe 友好)
-            auto sorted_order = sampled_indices;
-            std::sort(sorted_order.begin(), sorted_order.end());
+        // 采样逻辑抽成 lambda：round 1 重排完之后，如果 iterations > 1，要对着
+        // 新坐标系的 data_reordered.<ext> 重新采一遍（否则第 2..t 轮选出来的
+        // centroid 会是旧坐标系的 ID，去新数据集里找点就全错了）——用同一份
+        // 逻辑读不同路径，不能各写一份容易漂移。N/D/mem_est 采样前后不变
+        // （round 1 重排不改变点数/维度，只改变 ID 的物理排列），可以直接复用。
+        auto sample_from = [&](const std::string& path) {
+            if (!mem_est.fits_in_gpu) {
+                // 只从 disk 读取采样行，不加载完整数据集
+                int64_t working_N = mem_est.sampled_data_rows;
+                sampled_indices = sample_without_replacement(N, working_N, config.seed);
+                // 排序以实现顺序磁盘读取 (SSD/NVMe 友好)
+                auto sorted_order = sampled_indices;
+                std::sort(sorted_order.begin(), sorted_order.end());
 
-            if (ext == ".fbin" || ext == ".bin") {
-                int32_t n_tmp, d_tmp;
-                load::read_fbin_sampled(input_path, sorted_order, X_sampled, n_tmp, d_tmp);
-            } else {
-                // u8bin/ibin: fallback 到全量读取再采样
-                // TODO: 为其他格式实现 sampled reader
-                std::vector<float> X_full_tmp;
-                if (ext == ".u8bin" || ext == ".i8bin") {
-                    int32_t n2, d2;
-                    load::read_u8bin_to_f32(input_path, X_full_tmp, n2, d2);
+                if (ext == ".fbin" || ext == ".bin") {
+                    int32_t n_tmp, d_tmp;
+                    load::read_fbin_sampled(path, sorted_order, X_sampled, n_tmp, d_tmp);
                 } else {
-                    std::vector<int32_t> itmp;
-                    int32_t n2, d2;
-                    load::read_ibin_i32(input_path, itmp, n2, d2);
-                    X_full_tmp.resize(itmp.size());
-                    for (size_t i = 0; i < itmp.size(); ++i) X_full_tmp[i] = static_cast<float>(itmp[i]);
+                    // u8bin/ibin: fallback 到全量读取再采样
+                    // TODO: 为其他格式实现 sampled reader
+                    std::vector<float> X_full_tmp;
+                    if (ext == ".u8bin" || ext == ".i8bin") {
+                        int32_t n2, d2;
+                        load::read_u8bin_to_f32(path, X_full_tmp, n2, d2);
+                    } else {
+                        std::vector<int32_t> itmp;
+                        int32_t n2, d2;
+                        load::read_ibin_i32(path, itmp, n2, d2);
+                        X_full_tmp.resize(itmp.size());
+                        for (size_t i = 0; i < itmp.size(); ++i) X_full_tmp[i] = static_cast<float>(itmp[i]);
+                    }
+                    X_sampled.resize(static_cast<size_t>(working_N) * D);
+                    #pragma omp parallel for schedule(static)
+                    for (int64_t i = 0; i < working_N; ++i) {
+                        std::memcpy(X_sampled.data() + i * D,
+                                    X_full_tmp.data() + sorted_order[i] * D,
+                                    D * sizeof(float));
+                    }
                 }
-                X_sampled.resize(static_cast<size_t>(working_N) * D);
-                #pragma omp parallel for schedule(static)
-                for (int64_t i = 0; i < working_N; ++i) {
-                    std::memcpy(X_sampled.data() + i * D,
-                                X_full_tmp.data() + sorted_order[i] * D,
-                                D * sizeof(float));
-                }
-            }
 
-            // sampled_indices 需要和 X_sampled 行顺序一致 (sorted_order)
-            sampled_indices = std::move(sorted_order);
-            std::cout << "  Sampled " << working_N << " rows from disk ("
-                      << X_sampled.size() * sizeof(float) / 1e9 << " GB)\n";
-        } else {
-            // 全量数据可放入 GPU — 此处仍需全量读取 (后续 step 也需要)
-            working_N = N;
-            sampled_indices.resize(N);
-            std::iota(sampled_indices.begin(), sampled_indices.end(), 0LL);
-
-            if (ext == ".fbin" || ext == ".bin") {
-                load::read_fbin_f32(input_path, X_sampled, N, D);
-            } else if (ext == ".u8bin" || ext == ".i8bin") {
-                load::read_u8bin_to_f32(input_path, X_sampled, N, D);
+                // sampled_indices 需要和 X_sampled 行顺序一致 (sorted_order)
+                sampled_indices = std::move(sorted_order);
+                std::cout << "  Sampled " << working_N << " rows from disk ("
+                          << X_sampled.size() * sizeof(float) / 1e9 << " GB)\n";
             } else {
-                std::vector<int32_t> tmp;
-                load::read_ibin_i32(input_path, tmp, N, D);
-                X_sampled.resize(tmp.size());
-                for (size_t i = 0; i < tmp.size(); ++i) X_sampled[i] = static_cast<float>(tmp[i]);
+                // 全量数据可放入 GPU — 此处仍需全量读取 (后续 step 也需要)
+                sampled_indices.resize(N);
+                std::iota(sampled_indices.begin(), sampled_indices.end(), 0LL);
+
+                if (ext == ".fbin" || ext == ".bin") {
+                    load::read_fbin_f32(path, X_sampled, N, D);
+                } else if (ext == ".u8bin" || ext == ".i8bin") {
+                    load::read_u8bin_to_f32(path, X_sampled, N, D);
+                } else {
+                    std::vector<int32_t> tmp;
+                    load::read_ibin_i32(path, tmp, N, D);
+                    X_sampled.resize(tmp.size());
+                    for (size_t i = 0; i < tmp.size(); ++i) X_sampled[i] = static_cast<float>(tmp[i]);
+                }
+                std::cout << "  Loaded full dataset: " << X_sampled.size() * sizeof(float) / 1e9 << " GB\n";
             }
-            std::cout << "  Loaded full dataset: " << X_sampled.size() * sizeof(float) / 1e9 << " GB\n";
-        }
+        };
+
+        sample_from(input_path);
 
         elapsed_step1 = std::chrono::duration<double>(Clock::now() - t1).count();
         std::cout << "  Step 1 done [" << std::fixed << std::setprecision(3) << elapsed_step1 << "s]\n";
+
+        // input_path 参数是 const&，round 1 分配完之后要把它换成
+        // data_reordered.<ext>——从这里往下（包括 Step4 的调用点）一律用这个
+        // 可变的本地副本，不要再直接用 input_path 参数。round 2..t 全程读的
+        // 就是这份重排后的文件。
+        std::string working_input_path = input_path;
 
         // ================================================================
         // Per-iteration outer loop (Steps 2-6 may repeat with varying seed)
@@ -4073,6 +4020,15 @@ int run_pipeline_impl(
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
         size_t Mbatch_bytes = static_cast<size_t>(free_bytes * 0.9);
 
+        // round 1 (iter==0) 分配完之后马上要做一次性重排，直接把数据写进
+        // data_reordered.<ext>（见本轮 Step4 之后的新增逻辑）；BucketVectorAccumulator
+        // 那份按桶散写的临时文件对 round 1 来说从头到尾都用不上，传 nullptr
+        // 让 batch_assign_with_cagra_anns 跳过这次写，省下这部分 I/O。
+        // bucket_vecs_ptr 本身仍然照常 create/start/finish（下面这些调用不用改），
+        // 只是 round 1 的这几个 bucket 文件全程是空的。
+        BucketVectorAccumulator<DataT>* bucket_vecs_for_step4 =
+            (iter == 0) ? nullptr : bucket_vecs_ptr.get();
+
         assignments.clear();
         if (mem_est.need_pq) {
             // PQ mode: centroids need to be encoded to uint8 on GPU
@@ -4094,8 +4050,8 @@ int run_pipeline_impl(
             d_centroids_f32 = nullptr;
 
             assignments = batch_assign_with_cagra_anns<DataT, uint8_t>(
-                input_path, N, D, n_centroids,
-                centroid_global_indices, *bucket_vecs_ptr,
+                working_input_path, N, D, n_centroids,
+                centroid_global_indices, bucket_vecs_for_step4,
                 d_centroids_u8, u8_bytes,
                 d_graph, graph_bytes,
                 K, quantizer, Mbatch_bytes, search_max_iters);
@@ -4104,8 +4060,8 @@ int run_pipeline_impl(
         } else {
             // Non-PQ mode: use float32 centroids directly
             assignments = batch_assign_with_cagra_anns<DataT, float>(
-                input_path, N, D, n_centroids,
-                centroid_global_indices, *bucket_vecs_ptr,
+                working_input_path, N, D, n_centroids,
+                centroid_global_indices, bucket_vecs_for_step4,
                 d_centroids_f32, centroid_gpu_bytes,
                 d_graph, graph_bytes,
                 K, quantizer, Mbatch_bytes, search_max_iters);
@@ -4114,8 +4070,8 @@ int run_pipeline_impl(
         }
 
         // Download centroid KNN graph to CPU before freeing (needed for Step 6,
-        // and for Step 7's bucket processing order when --reorder is set).
-        if (neighbors_m > 0 || do_reorder) {
+        // and for round 1's inline reorder just below, which always runs).
+        if (neighbors_m > 0 || iter == 0) {
             centroid_knn_graph_host.resize(static_cast<size_t>(n_centroids) * K);
             CUDA_CHECK(cudaMemcpy(centroid_knn_graph_host.data(), d_graph,
                                   graph_bytes, cudaMemcpyDeviceToHost));
@@ -4131,6 +4087,171 @@ int run_pipeline_impl(
         double iter_step4 = std::chrono::duration<double>(Clock::now() - t4).count();
         elapsed_step4 += iter_step4;
         std::cout << "  Step 4 done [" << std::fixed << std::setprecision(3) << iter_step4 << "s]\n";
+
+        // ================================================================
+        // Step 4.5 (round 1 only): inline reorder. Used to happen as a
+        // separate post-hoc Step 7 after all `iterations` rounds, using
+        // whichever round ran last; now it happens right after round 1's
+        // Step 4 (assignments for the *whole* dataset are known, which is
+        // the earliest point at which every bucket's final size -- and
+        // hence every point's final id -- can be computed at all), so
+        // rounds 2..t and the final merged vector_knn.bin are in this
+        // coordinate system from the moment they're produced, and no
+        // separate neighbor-id remapping pass is ever needed.
+        // ================================================================
+        std::vector<uint32_t> reorder_offsets_new;   // 处理位置索引；round1 的 Step6 要用
+        std::vector<int32_t>  reorder_pos_of;         // 原始 bucket id -> 处理位置；round1 的 Step6 要用
+        if (iter == 0) {
+            std::cout << "=== Step 4.5: Inline reorder (round 1) ===\n";
+            auto t45 = Clock::now();
+
+            // Pass 2：复用现成的 compute_bucket_reorder，只是这里喂的是 round 1
+            // 的 assignments（不是"最后一轮"的）。
+            int32_t order_window = (order_window_arg > 0)
+                ? order_window_arg
+                : std::max<int32_t>(4 * static_cast<int32_t>(K), 16);
+            auto bucket_process_order = bucket_order::compute_bucket_processing_order(
+                bucket_order::adjacency_from_flat_graph(
+                    centroid_knn_graph_host.data(), n_centroids, static_cast<int32_t>(K)),
+                order_window);
+            auto reorder_info = compute_bucket_reorder(assignments, N, n_centroids,
+                                                        bucket_process_order, centroid_global_indices);
+            std::cout << "  N=" << N
+                      << " total_in_buckets=" << reorder_info.total_in_buckets
+                      << " (unassigned=" << (N - reorder_info.total_in_buckets) << ")\n";
+            if (reorder_info.total_in_buckets != N) {
+                // batch_assign_with_cagra_anns 的分配逻辑（4d 步，最近/次近两个
+                // centroid 之间做均衡）总是给每个点分配一个桶，不存在拒绝分支，
+                // 这里应当恒不触发；触发说明别处有 bug，直接报错而不是悄悄丢点、
+                // 让后面所有轮次在一个变小的 N 上跑出一个不一致的 pipeline。
+                throw std::runtime_error(
+                    "Inline reorder: " + std::to_string(N - reorder_info.total_in_buckets) +
+                    " point(s) were not assigned to any bucket in round 1. "
+                    "batch_assign_with_cagra_anns is expected to always assign every point.");
+            }
+
+            reorder_pos_of.assign(static_cast<size_t>(n_centroids), 0);
+            for (int64_t pos = 0; pos < n_centroids; ++pos)
+                reorder_pos_of[static_cast<size_t>(bucket_process_order[static_cast<size_t>(pos)])] =
+                    static_cast<int32_t>(pos);
+            reorder_offsets_new = reorder_info.bucket_offsets;
+
+            // assignments 的新 ID 版本（只有 iterations==1 时 Step5 会用得上，
+            // 见下面）不需要经过 assignments[old_id]/perm 这层逐点查找——重排
+            // 之后每个桶在新坐标系里天然是连续区间，区间
+            // [offsets[pos],offsets[pos+1)) 里的新 ID 全都属于
+            // bucket_process_order[pos] 这个桶，直接按区间填充就行。只依赖
+            // bucket_process_order/reorder_offsets_new，跟 Pass 3、跟旧坐标系
+            // 的 assignments 完全没关系，所以可以放在 Pass 3 之前算——但下面
+            // "换到 assignments 这个变量名上"那一步还是要等 Pass 3 用完旧版本
+            // 才能做（见 Pass 3 之后的注释）。
+            std::vector<int64_t> assignments_by_bucket_range;
+            if (iterations == 1) {
+                assignments_by_bucket_range.resize(static_cast<size_t>(N));
+                for (int64_t pos = 0; pos < n_centroids; ++pos) {
+                    int64_t b = bucket_process_order[static_cast<size_t>(pos)];
+                    uint32_t lo = reorder_offsets_new[static_cast<size_t>(pos)];
+                    uint32_t hi = reorder_offsets_new[static_cast<size_t>(pos) + 1];
+                    for (uint32_t new_id = lo; new_id < hi; ++new_id)
+                        assignments_by_bucket_range[new_id] = b;
+                }
+            }
+
+            // Pass 3：单遍顺序扫一遍原始数据集（一个 ifstream 全程开着，不是
+            // 每批重开一次），按 assignments[] 分桶缓冲，精确定位 pwrite 进
+            // data_reordered.<ext>（见 reordered_dataset_io.hpp 的设计说明：
+            // Pass2 已经知道每个桶的精确最终大小，不需要事后合并）。
+            std::string data_reordered_path = output_dir + "/data_reordered" + ext;
+            {
+                auto writer = reordered_io::ReorderedDatasetWriter<DataT>::create(
+                    data_reordered_path, D, n_centroids,
+                    reorder_offsets_new, reorder_pos_of, config.bucket_vec_buffer_bytes);
+
+                std::ifstream scan_in(working_input_path, std::ios::binary);
+                if (!scan_in.is_open())
+                    throw std::runtime_error("Inline reorder: cannot open " + working_input_path);
+                scan_in.seekg(2 * sizeof(int32_t));  // 跳过 header (int32 N, int32 D)
+
+                constexpr int64_t kScanBatchRows = 1 << 16;
+                std::vector<DataT> scan_batch;
+                for (int64_t lo = 0; lo < N; lo += kScanBatchRows) {
+                    int64_t rows = std::min<int64_t>(kScanBatchRows, N - lo);
+                    scan_batch.resize(static_cast<size_t>(rows) * D);
+                    scan_in.read(reinterpret_cast<char*>(scan_batch.data()),
+                                static_cast<std::streamsize>(scan_batch.size() * sizeof(DataT)));
+                    if (!scan_in.good())
+                        throw std::runtime_error(
+                            "Inline reorder: failed reading dataset batch at row " + std::to_string(lo));
+                    for (int64_t r = 0; r < rows; ++r) {
+                        writer.add(assignments[static_cast<size_t>(lo + r)],
+                                  scan_batch.data() + static_cast<size_t>(r) * D);
+                    }
+                }
+                writer.finish();
+            }
+            std::cout << "  Wrote " << data_reordered_path << "\n";
+
+            // assignments[old_id]（原变量）到这里为止都还是 Pass 3 需要的
+            // *旧* 坐标系（Pass 3 按原始 input_path 的行序扫描，靠
+            // assignments[old_id] 分桶，必须保持旧坐标系直到这里）——现在
+            // Pass 3 已经用完它了，才能把上面按桶区间算好的新坐标系版本换过来。
+            // 如果 iterations==1，这一轮同时也是 Step5 要用的"最后一轮"，
+            // Step5 会直接拿 assignments/centroid_global_indices 写
+            // bucket_index.bin/bucket_data.bin/centroid_global_indices.bin，
+            // 而这时候 data_reordered.<ext>/vector_knn.bin/inverse_perm.bin
+            // 已经全都是新坐标系了，不换的话这几个诊断文件会跟其它产物对不上。
+            // iterations>1 时不需要：最后一轮的 Step4 本来就是在
+            // data_reordered.<ext> 上跑的，算出来的 assignments 天然已经是
+            // 新坐标系。
+            if (iterations == 1) {
+                assignments = std::move(assignments_by_bucket_range);
+
+                // centroid_global_indices 是几个具体的点（不是一段区间），没法
+                // 像上面 assignments 那样按桶区间直接填——但也不需要为此专门
+                // 查一张全量 perm 表，compute_bucket_reorder 已经在它自己那个
+                // O(N) 循环里顺手把这几个点的新 ID 摘出来了（centroid_new_ids，
+                // 只有 n_centroids 个），直接用就行。
+                for (int64_t k = 0; k < n_centroids; ++k)
+                    centroid_global_indices[static_cast<size_t>(k)] =
+                        static_cast<int64_t>(reorder_info.centroid_new_ids[static_cast<size_t>(k)]);
+            }
+
+            // 永久性的重排产物：这份 bucket_offsets/bucket_process_order/
+            // centroid_knn 从这里固定下来，round 2..t 不会再碰这几个文件名
+            // （Step 5 已经去掉了写 centroid_knn.bin 那部分，见下面）。
+            // 不写 perm.bin：它是 inverse_perm 的完全冗余信息（谁真需要
+            // old->new，反着扫一遍 inverse_perm 就有），而且现在整个代码库里
+            // 没有任何地方读它。
+            graph_io::write_bucket_offsets(output_dir + "/bucket_offsets.bin", reorder_offsets_new);
+            graph_io::write_bucket_process_order(output_dir + "/bucket_process_order.bin", bucket_process_order);
+            graph_io::write_vector_bin(output_dir + "/inverse_perm.bin", reorder_info.inverse_perm);
+            {
+                std::string p = output_dir + "/centroid_knn.bin";
+                std::ofstream out(p, std::ios::binary);
+                int64_t nc = n_centroids;
+                int32_t Kw = static_cast<int32_t>(K);
+                out.write(reinterpret_cast<const char*>(&nc), sizeof(int64_t));
+                out.write(reinterpret_cast<const char*>(&Kw), sizeof(int32_t));
+                out.write(reinterpret_cast<const char*>(centroid_knn_graph_host.data()),
+                          static_cast<std::streamsize>(centroid_knn_graph_host.size() * sizeof(uint32_t)));
+                std::cout << "  Wrote " << p << " (K=" << K << ")\n";
+            }
+
+            working_input_path = data_reordered_path;
+
+            // Step 2 选 centroid 用的 X_sampled/sampled_indices 是对着旧坐标系
+            // 采的样；数据集坐标系已经变了，round 2..t 要用的话必须重新采一遍
+            // (见 sample_from 定义处的注释)，否则第 2..t 轮选出来的
+            // centroid_global_indices 会是错坐标系下的 ID。
+            if (iterations > 1) {
+                std::cout << "  Re-sampling for rounds 2.." << iterations
+                          << " from the reordered dataset...\n";
+                sample_from(working_input_path);
+            }
+
+            elapsed_step45 = std::chrono::duration<double>(Clock::now() - t45).count();
+            std::cout << "  Step 4.5 done [" << std::fixed << std::setprecision(3) << elapsed_step45 << "s]\n";
+        }
 
         // ================================================================
         // Step 5: Write bucket assignments to disk (last iteration only,
@@ -4151,20 +4272,11 @@ int run_pipeline_impl(
                           n_centroids * sizeof(int64_t));
             }
 
-            // Save the centroid KNN graph too, so reorder.cpp (the standalone,
-            // post-hoc equivalent of Step 7) can recompute the same DiskJoin-
-            // style bucket processing order without rebuilding it from scratch.
-            if (!centroid_knn_graph_host.empty()) {
-                std::string p = output_dir + "/centroid_knn.bin";
-                std::ofstream out(p, std::ios::binary);
-                int64_t nc = n_centroids;
-                int32_t Kw = static_cast<int32_t>(K);
-                out.write(reinterpret_cast<const char*>(&nc), sizeof(int64_t));
-                out.write(reinterpret_cast<const char*>(&Kw), sizeof(int32_t));
-                out.write(reinterpret_cast<const char*>(centroid_knn_graph_host.data()),
-                          static_cast<std::streamsize>(centroid_knn_graph_host.size() * sizeof(uint32_t)));
-                std::cout << "  Wrote " << p << " (K=" << K << ")\n";
-            }
+            // centroid_knn.bin is NOT (re-)written here: round 1's Step 4.5
+            // already wrote the permanent copy tied to bucket_offsets.bin/
+            // bucket_process_order.bin. Overwriting it here with whichever
+            // round happens to run last would silently break prune_windowed
+            // (its bucket_process_order.bin would no longer match this file).
 
             elapsed_step5 = std::chrono::duration<double>(Clock::now() - t5).count();
             std::cout << "  Step 5 done [" << std::fixed << std::setprecision(3) << elapsed_step5 << "s]\n";
@@ -4194,14 +4306,27 @@ int run_pipeline_impl(
             // 每轮开始前先开新文件。
             knn_acc->start_iteration(iter);
 
-            build_vector_knn_with_tensorcore(
-                N, D,
-                *bucket_vecs_ptr,
-                graph_ptr,
-                n_centroids, graph_K, neighbors_m,
-                *knn_acc,
-                centroid_knn_graph_host.data(), K,
-                order_window_arg, step6_cache_bytes);
+            // round 1: 数据集已经在 Step 4.5 里重排写进 data_reordered.<ext> 了，
+            // 直接按 offset 读，不用碰 BucketVectorAccumulator 那份全空的临时
+            // 文件（batch_assign_with_cagra_anns 在 round 1 传了 nullptr 跳过
+            // 了它）。round 2..t 照旧用 BucketVectorAccumulator。
+            if (iter == 0) {
+                reordered_io::ReorderedDatasetBucketReader<DataT> reader(
+                    working_input_path, D, reorder_offsets_new, reorder_pos_of);
+                build_vector_knn_with_tensorcore(
+                    N, D, reader, graph_ptr,
+                    n_centroids, graph_K, neighbors_m,
+                    *knn_acc,
+                    centroid_knn_graph_host.data(), K,
+                    order_window_arg, step6_cache_bytes);
+            } else {
+                build_vector_knn_with_tensorcore(
+                    N, D, *bucket_vecs_ptr, graph_ptr,
+                    n_centroids, graph_K, neighbors_m,
+                    *knn_acc,
+                    centroid_knn_graph_host.data(), K,
+                    order_window_arg, step6_cache_bytes);
+            }
 
             // flush 掉这一轮剩余的 write buffer；merge_iteration 本身扔到
             // 后台线程做，让下一轮的 Step 2~6 立刻开始跑，不用等 merge 跑完
@@ -4262,80 +4387,16 @@ int run_pipeline_impl(
             elapsed_write_knn = std::chrono::duration<double>(Clock::now() - t_write).count();
         }
 
-        // ================================================================
-        // Step 7: Bucket-aligned ID reorder (optional, --reorder)
-        //
-        // 已知限制: assignments/centroid_global_indices (以及 bucket_index.bin/
-        // bucket_data.bin) 都只保留"最后一轮" iteration 的分桶结果 (见上面
-        // "这些值由最后一次 iteration 决定" 的注释)。当 iterations > 1 时，
-        // 最终合并出的 vector_knn 里的边可能来自任意一轮的分桶，并不都落在
-        // "最后一轮"划出的桶边界内——所以这里按最后一轮的桶结构重排，只是让
-        // 那一轮产生的边对齐，其余轮的边不保证对齐，reorder 的"bucket-aligned"
-        // 效果在多轮场景下是打了折扣的近似，不是严格保证。暂时按这个近似做，
-        // 没有为多轮场景单独设计一套对齐方案。
-        // ================================================================
-        if (do_reorder) {
-            std::cout << "=== Step 7: Bucket-aligned reorder ===\n";
-            auto t7 = Clock::now();
+        // Step 7（事后重排）已经不存在了——它的工作现在在 round 1 的
+        // Step 4.5 里就做完了，round 2..t 和最终合并出的 vector_knn.bin
+        // 从诞生起就已经是重排后的坐标系。
 
-            // Order buckets so ranges that end up adjacent in the new ID space
-            // are also adjacent in feature space (DiskJoin's task ordering,
-            // Algorithm 2 - see bucket_order.hpp), using the centroid KNN
-            // graph already built in Step 3 as the bucket dependency graph.
-            int32_t order_window = (order_window_arg > 0)
-                ? order_window_arg
-                : std::max<int32_t>(4 * static_cast<int32_t>(K), 16);
-            auto bucket_process_order = bucket_order::compute_bucket_processing_order(
-                bucket_order::adjacency_from_flat_graph(
-                    centroid_knn_graph_host.data(), n_centroids, static_cast<int32_t>(K)),
-                order_window);
-            std::cout << "  order_window=" << order_window << "\n";
-
-            auto reorder_info = compute_bucket_reorder(assignments, N, n_centroids,
-                                                        bucket_process_order);
-            std::cout << "  N=" << N
-                      << " total_in_buckets=" << reorder_info.total_in_buckets
-                      << " (unassigned=" << (N - reorder_info.total_in_buckets) << ")\n";
-
-            // order[pos] = raw bucket id at position pos -- written so
-            // prune_windowed can recover "which raw bucket owns new-id range
-            // [offsets[pos],offsets[pos+1])" exactly, without recomputing
-            // compute_bucket_processing_order a second time (which would
-            // silently drift if --order-window doesn't match). Same file,
-            // same format as reorder.cpp's standalone path writes.
-            graph_io::write_bucket_process_order(
-                output_dir + "/bucket_process_order.bin", bucket_process_order);
-
-            // write_reordered_outputs 需要整份 vector_knn 在内存里做按 id 重排；
-            // 现在它活在磁盘上，这里读回来（顺序读，一次性，只有 --reorder 时
-            // 才会触发）。
-            std::vector<int32_t> vector_knn;
-            if (neighbors_m > 0) {
-                std::ifstream in(output_dir + "/vector_knn.bin", std::ios::binary);
-                if (!in.is_open())
-                    throw std::runtime_error("Cannot open vector_knn.bin for reorder");
-                in.seekg(static_cast<std::streamoff>(knn_file_header_bytes()));
-                vector_knn.resize(static_cast<size_t>(N) * neighbors_m);
-                in.read(reinterpret_cast<char*>(vector_knn.data()),
-                       static_cast<std::streamsize>(vector_knn.size() * sizeof(int32_t)));
-                if (!in.good())
-                    throw std::runtime_error("Failed reading vector_knn.bin for reorder");
-            }
-
-            write_reordered_outputs(output_dir, ext, *bucket_vecs_ptr, N, D,
-                                    vector_knn, neighbors_m,
-                                    reorder_info, n_centroids);
-
-            elapsed_step7 = std::chrono::duration<double>(Clock::now() - t7).count();
-            std::cout << "  Step 7 done [" << std::fixed << std::setprecision(3)
-                      << elapsed_step7 << "s]\n";
-        }
-
-        // 最后一轮的 bucket 分组磁盘缓存 (Step 7 如果跑了，刚刚还在用) 到这里
-        // 可以清掉了。用 remove_all 而不是 bucket_vecs_ptr->remove_all_files()，
-        // 因为不同轮 n_centroids 可能不完全一样，remove_all_files() 只按最后
-        // 一轮的 n_centroids 删，可能漏掉更早某轮 (n_centroids 更大时) 留下的
-        // 文件；直接删整个临时目录更彻底。
+        // bucket_vecs_ptr 这份按桶散写的临时目录到这里可以清掉了（round 1
+        // 全程是空文件，round 2..t 的内容 Step 6 已经读完不再需要）。用
+        // remove_all 而不是 bucket_vecs_ptr->remove_all_files()，因为不同轮
+        // n_centroids 可能不完全一样，remove_all_files() 只按最后一轮的
+        // n_centroids 删，可能漏掉更早某轮 (n_centroids 更大时) 留下的文件；
+        // 直接删整个临时目录更彻底。
         std::filesystem::remove_all(bucket_vec_dir);
 
         double elapsed_total = std::chrono::duration<double>(Clock::now() - t_total_start).count();
@@ -4349,36 +4410,31 @@ int run_pipeline_impl(
         std::cout << "  Step 3   (Centroid KNN graph):  " << elapsed_step3 << "s\n";
         std::cout << "  Step 3.5 (Load full dataset):   " << elapsed_step3p5 << "s\n";
         std::cout << "  Step 4   (Batch assignment):    " << elapsed_step4 << "s\n";
+        std::cout << "  Step 4.5 (Inline reorder, round 1 only): " << elapsed_step45 << "s\n";
         std::cout << "  Step 5   (Write buckets):       " << elapsed_step5 << "s\n";
         if (neighbors_m > 0) {
             std::cout << "  Step 6   (Per-vector KNN, merge included):      " << elapsed_step6 << "s\n";
             std::cout << "  Wait     (final iteration's background merge):  " << elapsed_final_merge_wait << "s\n";
             std::cout << "  Write    (close + .npy convert):    " << elapsed_write_knn << "s\n";
         }
-        if (do_reorder)
-            std::cout << "  Step 7   (Bucket reorder):      " << elapsed_step7 << "s\n";
         std::cout << "  --------------------------------\n";
         std::cout << "  Total:                        " << elapsed_total << "s\n";
         std::cout << "  Output: " << output_dir << "/\n";
-        std::cout << "    bucket_index.bin  — offset/count table for each centroid\n";
-        std::cout << "    bucket_data.bin   — packed int32 point IDs per bucket\n";
-        std::cout << "    centroid_global_indices.bin — centroid-to-original-data mapping\n";
-        if (!centroid_knn_graph_host.empty()) {
-            std::cout << "    centroid_knn.bin  — centroid KNN graph (K=" << K
-                      << "), lets reorder.cpp reproduce Step 7's bucket order\n";
-        }
+        std::cout << "    data_reordered" << ext
+                  << "            — round-1 bucket-aligned dataset (preserves input format)\n";
+        std::cout << "    bucket_offsets.bin           — bucket boundaries (new ID space)\n";
+        std::cout << "    bucket_process_order.bin     — for prune_windowed (bucket id at each position)\n";
+        std::cout << "    inverse_perm.bin  — ID translation table (new id -> original id; "
+                     "see translate_ids for translating a final graph back to original order)\n";
+        std::cout << "    centroid_knn.bin             — round-1 centroid KNN graph (K=" << K
+                  << "), for prune_windowed\n";
+        std::cout << "    bucket_index.bin / bucket_data.bin — last-round bucket membership (diagnostic; "
+                     "IDs are already in the new/reordered space)\n";
+        std::cout << "    centroid_global_indices.bin  — last-round centroid-to-data mapping (diagnostic)\n";
         if (neighbors_m > 0) {
-            std::cout << "    vector_knn.bin    — per-vector " << neighbors_m << "-NN index\n";
+            std::cout << "    vector_knn.bin    — per-vector " << neighbors_m
+                      << "-NN index, already in the reordered ID space\n";
             std::cout << "    neighbors.npy     — same as above in NumPy format (for search.py)\n";
-        }
-        if (do_reorder) {
-            std::cout << "    data_reordered" << ext
-                      << "       — bucket-aligned dataset (preserves input format)\n";
-            if (neighbors_m > 0)
-                std::cout << "    vector_knn_reordered.bin  — KNN graph in new ID space\n";
-            std::cout << "    bucket_offsets.bin        — bucket boundaries (new ID space)\n";
-            std::cout << "    bucket_process_order.bin  — for prune_windowed (bucket id at each position)\n";
-            std::cout << "    perm.bin / inverse_perm.bin — ID translation tables\n";
         }
 
         return 0;
@@ -4470,13 +4526,11 @@ int main(int argc, char** argv) {
             ("iterations,t",  po::value<int>()->default_value(1),
                 "Run Step 2-6 multiple times with seed+iter, dedupe-merge per-vector KNN. "
                 "Bucket files (Step 5) reflect the last iteration only. Default 1.")
-            ("reorder",       po::bool_switch()->default_value(false),
-                "Also output bucket-aligned reordered files (data_reordered.<ext>, "
-                "vector_knn_reordered.bin, bucket_offsets.bin, bucket_process_order.bin, "
-                "perm.bin, inverse_perm.bin) for optimize_chunked --method C/D/E and prune_windowed")
             ("order-window",  po::value<int32_t>()->default_value(0),
-                "Sliding-window size for the bucket processing order used by --reorder "
-                "(DiskJoin-style task ordering over the centroid KNN graph; 0 = auto: 4*knn-k)")
+                "Sliding-window size for the round-1 bucket processing order (always computed -- "
+                "the dataset is always reordered inline after round 1's assignment; DiskJoin-style "
+                "task ordering over the centroid KNN graph; 0 = auto: 4*knn-k). Also reused for "
+                "Step6's own Belady bucket-cache ordering.")
             ("cache-mb",      po::value<size_t>()->default_value(0),
                 "Step6 Belady bucket-vector read cache budget in MB, keyed on the same "
                 "DiskJoin-style processing order as --order-window (0 = auto: cpu-limit/2)");
@@ -4495,7 +4549,6 @@ int main(int argc, char** argv) {
         int search_max_iters    = vm["search-iters"].as<int>();
         int neighbors_m         = vm["neighbors-m"].as<int>();
         uint32_t nprobe         = vm["nprobe"].as<uint32_t>();
-        bool do_reorder         = vm["reorder"].as<bool>();
         int iterations          = vm["iterations"].as<int>();
         int32_t order_window_arg = vm["order-window"].as<int32_t>();
         size_t cache_mb_arg      = vm["cache-mb"].as<size_t>();
@@ -4527,23 +4580,23 @@ int main(int argc, char** argv) {
 
         if (ext == ".fbin" || ext == ".bin") {
             return run_pipeline_impl<float>(input_path, output_root, search_max_iters,
-                                            neighbors_m, nprobe, do_reorder, iterations,
+                                            neighbors_m, nprobe, iterations,
                                             config, ext, order_window_arg, cache_mb_arg);
         } else if (ext == ".u8bin") {
             return run_pipeline_impl<uint8_t>(input_path, output_root, search_max_iters,
-                                              neighbors_m, nprobe, do_reorder, iterations,
+                                              neighbors_m, nprobe, iterations,
                                               config, ext, order_window_arg, cache_mb_arg);
         } else if (ext == ".i8bin") {
             return run_pipeline_impl<int8_t>(input_path, output_root, search_max_iters,
-                                             neighbors_m, nprobe, do_reorder, iterations,
+                                             neighbors_m, nprobe, iterations,
                                              config, ext, order_window_arg, cache_mb_arg);
         } else if (ext == ".ibin") {
             return run_pipeline_impl<int32_t>(input_path, output_root, search_max_iters,
-                                              neighbors_m, nprobe, do_reorder, iterations,
+                                              neighbors_m, nprobe, iterations,
                                               config, ext, order_window_arg, cache_mb_arg);
         } else if (ext == ".ubin") {
             return run_pipeline_impl<uint32_t>(input_path, output_root, search_max_iters,
-                                               neighbors_m, nprobe, do_reorder, iterations,
+                                               neighbors_m, nprobe, iterations,
                                                config, ext, order_window_arg, cache_mb_arg);
         } else {
             throw std::runtime_error("Unsupported file extension: " + ext +

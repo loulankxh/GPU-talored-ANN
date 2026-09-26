@@ -170,3 +170,20 @@ target_link_libraries(prune_windowed
 set_target_properties(prune_windowed PROPERTIES
     BUILD_RPATH ${CONDA_LIB}
 )
+
+# translate_ids: CPU-only tool that translates a final graph/index from the
+# reordered ("new") id space bucket2/optimize_chunked/prune_windowed all work
+# in back to the original dataset's id order, using inverse_perm.bin (from
+# bucket2's inline reorder) -- e.g. for comparing against ground truth files
+# that reference original ids.
+add_executable(translate_ids ${BUILD_SRC_PATH}/translate_ids.cpp)
+
+target_link_libraries(translate_ids
+    PRIVATE
+    OpenMP::OpenMP_CXX
+    boost_program_options
+)
+
+set_target_properties(translate_ids PROPERTIES
+    BUILD_RPATH ${CONDA_LIB}
+)
