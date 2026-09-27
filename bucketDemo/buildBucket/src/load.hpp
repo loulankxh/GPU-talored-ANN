@@ -8,6 +8,7 @@
 //
 // This file provides:
 //   - read_fbin_f32 / read_u8bin_to_f32 / read_ibin_i32
+//   - read_npy_int64_2d(path, out, N, M)      // reads .npy v1.0/v2.0, little-endian int64
 //   - write_npy_int64_2d(path, data, N, M)    // writes .npy v1.0, little-endian int64
 //
 // Build note: header-only; just include in your .cpp and compile with -std=c++17.
@@ -314,6 +315,58 @@ inline size_t element_size_for_ext(const std::string& ext) {
     if (ext == ".hbin")                     return sizeof(uint16_t);  // fp16, treated as raw
     require(false, "Unsupported BIGANN extension: " + ext);
     return 0;
+}
+
+// ---------- NPY reader for int64 2D array (matches np.save / np.load) ----------
+// Reads .npy v1.0/v2.0, little-endian int64, C-order, shape (N,M).
+inline void read_npy_int64_2d(const std::string& path,
+                              std::vector<int64_t>& out,
+                              int64_t& N, int64_t& M) {
+    std::ifstream in(path, std::ios::binary);
+    require(in.is_open(), "Cannot open file: " + path);
+
+    char magic[6];
+    in.read(magic, 6);
+    require(in.good() && magic[0] == '\x93' && std::string(magic + 1, 5) == "NUMPY",
+            "Not a valid .npy file: " + path);
+
+    uint8_t ver_major, ver_minor;
+    in.read(reinterpret_cast<char*>(&ver_major), 1);
+    in.read(reinterpret_cast<char*>(&ver_minor), 1);
+
+    uint32_t header_len = 0;
+    if (ver_major == 1) {
+        uint16_t hlen16;
+        in.read(reinterpret_cast<char*>(&hlen16), sizeof(uint16_t));
+        header_len = hlen16;
+    } else if (ver_major == 2) {
+        in.read(reinterpret_cast<char*>(&header_len), sizeof(uint32_t));
+    } else {
+        require(false, "Unsupported .npy version: " + std::to_string(ver_major));
+    }
+
+    std::string header(header_len, '\0');
+    in.read(&header[0], header_len);
+    require(in.good(), "Failed to read .npy header from: " + path);
+
+    auto shape_pos = header.find("'shape'");
+    require(shape_pos != std::string::npos, "No 'shape' in .npy header: " + path);
+    auto paren_open = header.find('(', shape_pos);
+    auto paren_close = header.find(')', paren_open);
+    require(paren_open != std::string::npos && paren_close != std::string::npos,
+            "Malformed shape in .npy header: " + path);
+    std::string shape_str = header.substr(paren_open + 1, paren_close - paren_open - 1);
+
+    auto comma = shape_str.find(',');
+    require(comma != std::string::npos, "Expected 2D shape in .npy: " + path);
+    N = std::stoll(shape_str.substr(0, comma));
+    M = std::stoll(shape_str.substr(comma + 1));
+    require(N > 0 && M > 0, "Invalid shape in .npy: " + path);
+
+    uint64_t cnt = static_cast<uint64_t>(N) * static_cast<uint64_t>(M);
+    out.resize(cnt);
+    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(cnt * sizeof(int64_t)));
+    require(in.good(), "Failed to read int64 payload from: " + path);
 }
 
 // ---------- NPY writer (matches np.save for a contiguous int64 2D array) ----------

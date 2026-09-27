@@ -21,6 +21,12 @@
 // stream around needing random access to the whole table. The graph itself
 // is read/written in a streaming fashion (row batches via pwrite to each
 // row's known destination), never fully resident.
+//
+// translate_npy_to_original_order() below does the same translation for a
+// .npy [N, K] int64 graph (e.g. neighbors.npy) instead of the raw
+// forward-graph .bin format; unlike the .bin path it is fully in-memory
+// (npy graphs here are small enough) and treats -1 entries as padding,
+// leaving them untranslated.
 
 #pragma once
 
@@ -36,6 +42,7 @@
 #include <unistd.h>
 
 #include "graph_io.hpp"
+#include "load.hpp"
 
 namespace translate_ids {
 
@@ -136,6 +143,36 @@ inline void translate_graph_to_original_order(
 
     if (::close(fd) != 0)
         throw std::runtime_error("translate_ids: close failed for " + output_path);
+}
+
+// Same translation as translate_graph_to_original_order, but for a .npy
+// [N, K] int64 graph (e.g. neighbors.npy) instead of the raw forward-graph
+// .bin format. -1 entries are padding (short neighbor lists) and are left
+// as -1 rather than translated.
+inline void translate_npy_to_original_order(
+    const std::string& npy_path,
+    const std::string& inverse_perm_path,
+    const std::string& output_path)
+{
+    std::vector<int64_t> graph;
+    int64_t N = 0, K_out = 0;
+    load::read_npy_int64_2d(npy_path, graph, N, K_out);
+
+    std::vector<uint32_t> inverse_perm = read_inverse_perm(inverse_perm_path, N);
+
+    std::vector<int64_t> out(static_cast<size_t>(N) * K_out, -1);
+
+    #pragma omp parallel for schedule(static)
+    for (int64_t new_id = 0; new_id < N; ++new_id) {
+        const int64_t* src = graph.data() + static_cast<size_t>(new_id) * K_out;
+        int64_t* dst = out.data() + static_cast<size_t>(inverse_perm[new_id]) * K_out;
+        for (int64_t k = 0; k < K_out; ++k) {
+            int64_t nb = src[k];
+            dst[k] = (nb < 0) ? -1 : static_cast<int64_t>(inverse_perm[static_cast<size_t>(nb)]);
+        }
+    }
+
+    load::write_npy_int64_2d(output_path, out, N, K_out);
 }
 
 }  // namespace translate_ids

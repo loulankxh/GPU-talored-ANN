@@ -5,13 +5,24 @@
 // can be compared against ground truth files or handed to anything else that
 // expects original ids. See translate_graph_ids.hpp for the algorithm.
 //
+// Format is picked from --graph's extension: ".npy" uses the npy [N,K]
+// int64 path (e.g. neighbors.npy), anything else uses the raw forward-graph
+// .bin path (e.g. vector_knn.bin / cagra_graph.bin). --output should use a
+// matching extension.
+//
 // Usage:
 //   ./translate_ids \
 //       -g output/.../cagra_graph_merged.bin \
 //       -p output/.../inverse_perm.bin \
 //       -o output/.../cagra_graph_original_order.bin
+//
+//   ./translate_ids \
+//       -g output/.../neighbors.npy \
+//       -p output/.../inverse_perm.bin \
+//       -o output/.../neighbors_original_order.npy
 
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -29,7 +40,8 @@ int main(int argc, char** argv)
         desc.add_options()
             ("help,h", "Show help")
             ("graph,g", po::value<std::string>()->required(),
-                "Final graph in new/reordered id space (e.g. optimize_chunked's output)")
+                "Final graph in new/reordered id space (e.g. optimize_chunked's output, "
+                "or a neighbors.npy)")
             ("inverse-perm,p", po::value<std::string>()->required(),
                 "inverse_perm.bin (from bucket2's inline reorder, inverse_perm[new_id]=old_id)")
             ("output,o", po::value<std::string>()->required(),
@@ -47,7 +59,12 @@ int main(int argc, char** argv)
         using Clock = std::chrono::steady_clock;
         auto t0 = Clock::now();
 
-        translate_ids::translate_graph_to_original_order(graph_path, inv_perm_path, output_path);
+        const bool is_npy = std::filesystem::path(graph_path).extension() == ".npy";
+        if (is_npy) {
+            translate_ids::translate_npy_to_original_order(graph_path, inv_perm_path, output_path);
+        } else {
+            translate_ids::translate_graph_to_original_order(graph_path, inv_perm_path, output_path);
+        }
 
         double elapsed = std::chrono::duration<double>(Clock::now() - t0).count();
         std::cout << "Wrote " << output_path << " [" << elapsed << "s]\n";
