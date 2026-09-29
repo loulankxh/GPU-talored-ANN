@@ -2955,7 +2955,7 @@ void build_vector_knn_with_tensorcore(
     // 到 250+，代进去会直接算不动；用原始度数 (通常 32 量级) 求出的顺序，"近邻
     // 集合重叠多的桶排一起"这个大方向依然成立，足够给缓存用。
     // future_access 则必须用 centroid_knn_graph/K (真实展开后的图)，因为它要
-    // 精确预测"每个桶未来会在哪些位置被访问"，跟主循环里 append_bucket 实际
+    // 精确预测"每个桶未来会在哪些位置被访问"，跟主循环里 resolve_bucket 实际
     // 读取的近邻集合必须一致，否则 Belady 缓存的淘汰决策会跟真实访问模式脱节。
     auto order_adj = bucket_order::adjacency_from_flat_graph(
         order_graph, n_centroids, static_cast<int32_t>(order_graph_K));
@@ -3039,8 +3039,8 @@ void build_vector_knn_with_tensorcore(
     // ---- 显存预算: 不再有整份数据集常驻的全局 buffer，只有 per-slot ----
     // d_B_raw 存原始 DataT (从磁盘/缓存读来的 pool 数据, 未转型)；d_B 是转型/
     // 位移之后喂给 cuBLAS 的 GemmInT 视图。A (bucket 自己) 不再单独占一份
-    // buffer——pool 的前 bucket_size 行本来就是 A 的数据 (append_bucket 总是
-    // 先 append 自己)，GEMM 直接拿 d_B 的前缀当 A 操作数即可，省掉一份重复的
+    // buffer——pool 的前 bucket_size 行本来就是 A 的数据 (resolve_bucket 总是
+    // 先 resolve 自己)，GEMM 直接拿 d_B 的前缀当 A 操作数即可，省掉一份重复的
     // CPU memcpy + H2D 传输 + gather/shift kernel。
     size_t bytes_B_raw        = max_pool_size_ub * D * sizeof(DataT);
     size_t bytes_B            = max_pool_size_ub * D * sizeof(GemmInT);
@@ -3128,7 +3128,7 @@ void build_vector_knn_with_tensorcore(
     // d_B/d_dots 类型由 GemmInT/GemmOutT 决定（INT8 路径 / FP32 路径不同）
     // C++ partial init: {nullptr, nullptr} 后面的 slot 会被零初始化为 nullptr
     // A (bucket 自己) 没有独立 buffer：GEMM 直接用 d_B 的前 bucket_size 行当
-    // A 操作数 (append_bucket 总是先 append 自己，pool 前缀天然就是 A 的数据)。
+    // A 操作数 (resolve_bucket 总是先 resolve 自己，pool 前缀天然就是 A 的数据)。
     DataT*       d_B_raw[MAX_SLOTS]         = {nullptr};
     GemmInT*     d_B[MAX_SLOTS]             = {nullptr};
     GemmOutT*    d_dots[MAX_SLOTS]          = {nullptr};
@@ -3212,6 +3212,19 @@ void build_vector_knn_with_tensorcore(
     std::vector<int32_t> scatter_new_n(M);
     std::vector<float>   scatter_new_d(M);
 
+    // pool 拼装 (3b) 的 resolve/memcpy 两趟之间传递的 job 描述：resolve 趟顺序
+    // 调 bucket_cache.get()，只记源指针/大小/目标偏移；memcpy 趟再用 OpenMP
+    // 并行做实际搬运。复用同一块 vector (clear() 不释放容量)，避免每个 pool
+    // 都堆分配一次。
+    struct CopyJob {
+        const int64_t* src_ids;
+        const DataT*    src_vecs;
+        size_t count;
+        size_t dest_ofs;
+    };
+    std::vector<CopyJob> copy_jobs;
+    copy_jobs.reserve(static_cast<size_t>(K) + 1);
+
     auto scatter_pending = [&](int slot) {
         if (pending[slot].c < 0) return;
         // h_ids_bucket[slot] 这时候还是"上一次派到这个 slot 的那个 bucket"的
@@ -3278,29 +3291,48 @@ void build_vector_knn_with_tensorcore(
         // 自己 bucket 里 → 各 bucket 互不相交，拼出来的 pool 不会重复。
         // cache.get() 命中就是纯内存 memcpy，不命中才真的从 bucket_vecs 读盘；
         // 因为 bucket_order_seq 让相邻处理的桶尽量共享近邻集合，大部分近邻桶
-        // 应该都能命中。每次 get() 后立刻 memcpy 出来，不跨下一次 get() 调用
-        // 持有引用 (BeladyBucketCache 的使用约定，见 bucket_order.hpp)。
+        // 应该都能命中。
+        //
+        // 拆成两趟：先顺序把这个 pool 里每个桶的 get() 都做完 —— 不能并行，
+        // BeladyBucketCache 不是线程安全的，且它的使用约定要求取到的引用必须
+        // 在下一次 get() 调用前用掉 —— 这一趟只记源指针/大小/目标偏移，不做
+        // 实际搬运；memcpy 本身再用 OpenMP 并行做 (profiling 显示这是循环里
+        // 真正的大头，H2D 传输反而很便宜)。同一个 pos 内的这些桶在
+        // future_access 里对这个 pos 都记了一条，彼此不会互相淘汰 (现在顺序
+        // 版本能跑对就是证据)，所以只要并行 memcpy 趟不跨到下一个 pos 才开始，
+        // 这里存的源指针在整个并行拷贝期间都还有效；每个 job 写的目标区间也
+        // 互不重叠 (按累加的 ofs 切分)，不需要加锁。
         int64_t* ids_pool64 = h_ids_pool64[slot];
         DataT*   vecs_pool   = h_B_raw[slot];
         size_t ofs = 0;  // 以"点数"计，不是字节
-        auto append_bucket = [&](int64_t bid) {
+        copy_jobs.clear();
+        auto resolve_bucket = [&](int64_t bid) {
             if (bucket_count[bid] == 0) return;
             auto ga0 = diag_now();
             const VecBucket<DataT>& vb = bucket_cache.get(pos, static_cast<int32_t>(bid), bucket_loader);
             auto ga1 = diag_now();
             t_cache_get += diag_secs(ga0, ga1);
             size_t cnt = vb.ids.size();
-            std::memcpy(ids_pool64 + ofs, vb.ids.data(), cnt * sizeof(int64_t));
-            std::memcpy(vecs_pool + ofs * D, vb.vecs.data(), cnt * static_cast<size_t>(D) * sizeof(DataT));
+            copy_jobs.push_back(CopyJob{vb.ids.data(), vb.vecs.data(), cnt, ofs});
             ofs += cnt;
-            t_pool_memcpy += diag_secs(ga1, diag_now());
         };
-        append_bucket(c);
+        resolve_bucket(c);
         for (uint32_t k = 0; k < K; ++k) {
             uint32_t nb_c = centroid_knn_graph[c * K + k];
             if (nb_c < static_cast<uint32_t>(n_centroids)) {
-                append_bucket(static_cast<int64_t>(nb_c));
+                resolve_bucket(static_cast<int64_t>(nb_c));
             }
+        }
+        {
+            auto gm0 = diag_now();
+            #pragma omp parallel for schedule(dynamic)
+            for (int64_t j = 0; j < static_cast<int64_t>(copy_jobs.size()); ++j) {
+                const CopyJob& job = copy_jobs[static_cast<size_t>(j)];
+                std::memcpy(ids_pool64 + job.dest_ofs, job.src_ids, job.count * sizeof(int64_t));
+                std::memcpy(vecs_pool + job.dest_ofs * D, job.src_vecs,
+                            job.count * static_cast<size_t>(D) * sizeof(DataT));
+            }
+            t_pool_memcpy += diag_secs(gm0, diag_now());
         }
         int pool_size   = static_cast<int>(ofs);
         int bucket_size = static_cast<int>(bucket_count[c]);
