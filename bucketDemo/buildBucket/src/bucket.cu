@@ -1017,6 +1017,11 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
 {
     constexpr bool is_pq = std::is_same<CentroidT, uint8_t>::value;
 
+    using Clock = std::chrono::high_resolution_clock;
+    auto ba_t0 = Clock::now();
+    double t_centroid_prewrite = 0, t_setup = 0;
+    double t_read = 0, t_convert_upload = 0, t_search = 0, t_download = 0, t_cpu_assign = 0, t_bucket_write = 0;
+
     // ================================================================
     // Step 0: 建立 centroid 集合，收集非 centroid 点索引
     // ================================================================
@@ -1036,6 +1041,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     // 的原始向量补写进各自的 bucket 文件。n_centroids 条，一次性小读，不是要
     // 避免的那种"整份数据集常驻"。
     {
+        auto t_pre0 = Clock::now();
         if (bucket_vecs) {
             std::vector<T> centroid_vecs_raw;
             int32_t N_tmp, D_tmp;
@@ -1046,6 +1052,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                                 centroid_vecs_raw.data() + static_cast<size_t>(c) * D);
             }
         }
+        t_centroid_prewrite = std::chrono::duration<double>(Clock::now() - t_pre0).count();
     }
 
     std::cout << "[BatchAssign] N=" << N
@@ -1101,6 +1108,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     // ================================================================
     // Step 4: 构造 cagra::index<CentroidT, uint32_t> (zero-copy view, 只构造一次)
     // ================================================================
+    auto t_setup0 = Clock::now();
     raft::resources res;
     auto dataset_view = raft::make_device_matrix_view<const CentroidT, int64_t>(
         d_centroids, n_centroids, static_cast<int64_t>(D));
@@ -1131,6 +1139,8 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
 
     std::vector<uint32_t> h_top2(Nv * TOP_K);
 
+    t_setup = std::chrono::duration<double>(Clock::now() - t_setup0).count();
+
     for (int64_t batch_start = 0; batch_start < N_nc; batch_start += Nv) {
         int64_t batch_end = std::min(batch_start + Nv, N_nc);
         int64_t batch_size = batch_end - batch_start;
@@ -1139,6 +1149,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         // non_centroid_indices 在这个 batch 内基本连续 (只跳过零星的 centroid
         // id)，所以整段 [lo, hi] 一次顺序读比逐点 seek 快得多；读出来多覆盖的
         // 那几个 centroid 行的数据直接不用，忽略即可。
+        auto tb0 = Clock::now();
         int64_t batch_lo = non_centroid_indices[batch_start];
         int64_t batch_hi = non_centroid_indices[batch_end - 1];
         std::vector<T> raw_batch;
@@ -1147,6 +1158,8 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             load::read_bigann_raw_range<T>(input_path, batch_lo, batch_hi - batch_lo + 1,
                                             raw_batch, N_tmp, D_tmp);
         }
+        auto tb1 = Clock::now();
+        t_read += std::chrono::duration<double>(tb1 - tb0).count();
 
         if constexpr (is_pq) {
             // PQ 模式：读取原始 T 数据 -> 转为 float32 -> encode uint8 -> 上传
@@ -1181,6 +1194,8 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                                   batch_size * D * sizeof(CentroidT),
                                   cudaMemcpyHostToDevice));
         }
+        auto tb2 = Clock::now();
+        t_convert_upload += std::chrono::duration<double>(tb2 - tb1).count();
 
         // ---- 4b: cagra::search (k=2, queries 不在 dataset 里, 无 self-exclusion) ----
         auto queries_view = raft::make_device_matrix_view<const CentroidT, int64_t>(
@@ -1194,11 +1209,15 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             queries_view, neighbors_view, distances_view);
 
         CUDA_CHECK(cudaDeviceSynchronize());
+        auto tb3 = Clock::now();
+        t_search += std::chrono::duration<double>(tb3 - tb2).count();
 
         // ---- 4c: 下载 top-2 local centroid indices ----
         CUDA_CHECK(cudaMemcpy(h_top2.data(), d_top2,
                               batch_size * TOP_K * sizeof(uint32_t),
                               cudaMemcpyDeviceToHost));
+        auto tb4 = Clock::now();
+        t_download += std::chrono::duration<double>(tb4 - tb3).count();
 
         // ---- 4d: CPU 并行: local idx -> global idx 映射 + 均衡分配 ----
         #pragma omp parallel for schedule(static)
@@ -1224,6 +1243,8 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             assignments[gi] = chosen;
             cluster_sizes[chosen].fetch_add(1, std::memory_order_relaxed);
         }
+        auto tb5 = Clock::now();
+        t_cpu_assign += std::chrono::duration<double>(tb5 - tb4).count();
 
         // ---- 4e: 串行把这批点的原始向量写进各自 bucket 的文件 ----
         // 分配结果已经在上面那个并行循环里拍板定案、不会再改；raw_batch 这批
@@ -1237,6 +1258,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 bucket_vecs->add(assignments[gi], gi, raw_batch.data() + local * D);
             }
         }
+        t_bucket_write += std::chrono::duration<double>(Clock::now() - tb5).count();
 
         if ((batch_start / Nv) % 10 == 0 || batch_end == N_nc) {
             std::cout << "[BatchAssign] " << batch_end << "/" << N_nc << "\n";
@@ -1264,6 +1286,16 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     std::cout << "[BatchAssign] Done. Cluster size: min=" << min_sz
               << " max=" << max_sz
               << " avg=" << std::fixed << std::setprecision(1) << avg_sz << "\n";
+    double ba_total = std::chrono::duration<double>(Clock::now() - ba_t0).count();
+    std::cout << "  [Step4 timing] centroid_prewrite=" << std::fixed << std::setprecision(3) << t_centroid_prewrite
+              << "s setup=" << t_setup
+              << "s read=" << t_read
+              << "s convert_upload=" << t_convert_upload
+              << "s search=" << t_search
+              << "s download=" << t_download
+              << "s cpu_assign=" << t_cpu_assign
+              << "s bucket_write=" << t_bucket_write
+              << "s total=" << ba_total << "s\n";
 
     return assignments;
 }
@@ -1347,6 +1379,11 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
 {
     std::cout << "[GPU Centroid Selection - KMeans|| + KMeans++]\n";
 
+    using Clock = std::chrono::high_resolution_clock;
+    auto step2_t0 = Clock::now();
+    auto step2_elapsed = [&]() { return std::chrono::duration<double>(Clock::now() - step2_t0).count(); };
+    double t_upload = 0, t_kmeans_par = 0, t_select = 0;
+
     float* allocated_centroids = nullptr;
 
     try {
@@ -1387,6 +1424,9 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
                               dataset_gpu.data_handle(),
                               static_cast<int64_t>(D), working_N,
                               raft::linalg::L2Norm, true, stream);
+
+        raft::resource::sync_stream(res, stream);
+        t_upload = step2_elapsed();
 
         // ================================================================
         // Stage 4: KMeans|| oversampling
@@ -1563,6 +1603,7 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
 
         int64_t n_candidates = potentialCentroids.extent(0);
         std::cout << "  KMeans|| done: " << n_candidates << " candidates oversampled\n";
+        t_kmeans_par = step2_elapsed() - t_upload;
 
         // ================================================================
         // Stage 5: 从候选集中选 n_centroids 个实际数据点
@@ -1630,6 +1671,11 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
 
         std::cout << "  Centroids on GPU: " << centroid_bytes / 1e6 << " MB\n";
         std::cout << "  Generated " << n_selected << " centroids\n";
+        t_select = step2_elapsed() - t_upload - t_kmeans_par;
+        std::cout << "  [Step2 timing] upload+norms=" << std::fixed << std::setprecision(3) << t_upload
+                  << "s kmeans_parallel=" << t_kmeans_par
+                  << "s select_final=" << t_select
+                  << "s total=" << step2_elapsed() << "s\n";
 
         return centroid_sample_indices;
 
@@ -2903,6 +2949,7 @@ void build_vector_knn_with_tensorcore(
     int32_t order_window_arg,
     size_t cache_bytes)
 {
+    auto func_t0 = std::chrono::high_resolution_clock::now();
     constexpr bool want_distances = true;  // 合并去重总是需要距离
     // ============= Stage 2 路径选择（INT8 IMMA / fp32 fallback）=============
     // - int8/uint8 → 走 INT8 IMMA Tensor Core（uint8 入口先减 128 转 int8）
@@ -3249,6 +3296,9 @@ void build_vector_knn_with_tensorcore(
 
     int64_t processed_buckets = 0;
     auto loop_t0 = std::chrono::high_resolution_clock::now();
+    double t_setup_before_loop = std::chrono::duration<double>(loop_t0 - func_t0).count();
+    std::cout << "  [VectorKNN] setup before bucket loop: " << std::fixed << std::setprecision(3)
+              << t_setup_before_loop << "s\n";
 
     // ---- TEMP DIAGNOSTIC: fine-grained bucket-loop breakdown ----
     // pure GEMM is already timed via cudaEvent above; this splits the
@@ -3553,6 +3603,13 @@ void build_vector_knn_with_tensorcore(
     }
     cublasDestroy(cublas_handle);
 
+    double func_total = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - func_t0).count();
+    double t_cleanup = func_total - t_setup_before_loop - (loop_ms / 1000.0);
+    std::cout << "  [VectorKNN] function total: " << std::fixed << std::setprecision(3) << func_total
+              << "s (setup=" << t_setup_before_loop
+              << "s, bucket_loop=" << (loop_ms / 1000.0)
+              << "s, cleanup=" << t_cleanup << "s)\n";
     std::cout << "[VectorKNN] Done. Output shape: (" << N << ", " << M << ")"
               << " merged into running KNN file on disk\n";
 }
@@ -4138,6 +4195,8 @@ int run_pipeline_impl(
         if (iter == 0) {
             std::cout << "=== Step 4.5: Inline reorder (round 1) ===\n";
             auto t45 = Clock::now();
+            double t45_order = 0, t45_reorder_info = 0, t45_assign_range = 0;
+            double t45_pass3 = 0, t45_artifacts = 0, t45_resample = 0;
 
             // Pass 2：复用现成的 compute_bucket_reorder，只是这里喂的是 round 1
             // 的 assignments（不是"最后一轮"的）。
@@ -4148,8 +4207,16 @@ int run_pipeline_impl(
                 bucket_order::adjacency_from_flat_graph(
                     centroid_knn_graph_host.data(), n_centroids, static_cast<int32_t>(K)),
                 order_window);
+            {
+                auto tnow = Clock::now();
+                t45_order = std::chrono::duration<double>(tnow - t45).count();
+            }
             auto reorder_info = compute_bucket_reorder(assignments, N, n_centroids,
                                                         bucket_process_order, centroid_global_indices);
+            {
+                auto tnow = Clock::now();
+                t45_reorder_info = std::chrono::duration<double>(tnow - t45).count() - t45_order;
+            }
             std::cout << "  N=" << N
                       << " total_in_buckets=" << reorder_info.total_in_buckets
                       << " (unassigned=" << (N - reorder_info.total_in_buckets) << ")\n";
@@ -4190,6 +4257,11 @@ int run_pipeline_impl(
                         assignments_by_bucket_range[new_id] = b;
                 }
             }
+            {
+                auto tnow = Clock::now();
+                t45_assign_range = std::chrono::duration<double>(tnow - t45).count()
+                                    - t45_order - t45_reorder_info;
+            }
 
             // Pass 3：单遍顺序扫一遍原始数据集（一个 ifstream 全程开着，不是
             // 每批重开一次），按 assignments[] 分桶缓冲，精确定位 pwrite 进
@@ -4224,6 +4296,11 @@ int run_pipeline_impl(
                 writer.finish();
             }
             std::cout << "  Wrote " << data_reordered_path << "\n";
+            {
+                auto tnow = Clock::now();
+                t45_pass3 = std::chrono::duration<double>(tnow - t45).count()
+                            - t45_order - t45_reorder_info - t45_assign_range;
+            }
 
             // assignments[old_id]（原变量）到这里为止都还是 Pass 3 需要的
             // *旧* 坐标系（Pass 3 按原始 input_path 的行序扫描，靠
@@ -4270,6 +4347,11 @@ int run_pipeline_impl(
                           static_cast<std::streamsize>(centroid_knn_graph_host.size() * sizeof(uint32_t)));
                 std::cout << "  Wrote " << p << " (K=" << K << ")\n";
             }
+            {
+                auto tnow = Clock::now();
+                t45_artifacts = std::chrono::duration<double>(tnow - t45).count()
+                                - t45_order - t45_reorder_info - t45_assign_range - t45_pass3;
+            }
 
             working_input_path = data_reordered_path;
 
@@ -4280,10 +4362,19 @@ int run_pipeline_impl(
             if (iterations > 1) {
                 std::cout << "  Re-sampling for rounds 2.." << iterations
                           << " from the reordered dataset...\n";
+                auto tresample0 = Clock::now();
                 sample_from(working_input_path);
+                t45_resample = std::chrono::duration<double>(Clock::now() - tresample0).count();
             }
 
             elapsed_step45 = std::chrono::duration<double>(Clock::now() - t45).count();
+            std::cout << "  [Step4.5 timing] order=" << std::fixed << std::setprecision(3) << t45_order
+                      << "s reorder_info=" << t45_reorder_info
+                      << "s assign_range=" << t45_assign_range
+                      << "s pass3_write=" << t45_pass3
+                      << "s artifacts=" << t45_artifacts
+                      << "s resample=" << t45_resample
+                      << "s total=" << elapsed_step45 << "s\n";
             std::cout << "  Step 4.5 done [" << std::fixed << std::setprecision(3) << elapsed_step45 << "s]\n";
         }
 
@@ -4335,6 +4426,7 @@ int run_pipeline_impl(
                 search_max_iters);
             const uint32_t* graph_ptr = centroid_topK.data();
             uint32_t graph_K = effective_nprobe;
+            double t6_topk_expand = std::chrono::duration<double>(Clock::now() - t6).count();
 
             // 这一轮的写入目标是专属的 chunk 文件 (chunk_<c>_iter<iter>.bin)，
             // 每轮开始前先开新文件。
@@ -4361,6 +4453,8 @@ int run_pipeline_impl(
                     centroid_knn_graph_host.data(), K,
                     order_window_arg, step6_cache_bytes);
             }
+            double t6_after_build = std::chrono::duration<double>(Clock::now() - t6).count();
+            double t6_build_vector_knn = t6_after_build - t6_topk_expand;
 
             // flush 掉这一轮剩余的 write buffer；merge_iteration 本身扔到
             // 后台线程做，让下一轮的 Step 2~6 立刻开始跑，不用等 merge 跑完
@@ -4369,11 +4463,13 @@ int run_pipeline_impl(
             // iterations 是 1 还是多轮，都是同一条代码路径——第 0 轮直接当
             // 全 sentinel 处理，不需要为它单独分支。
             knn_acc->finish_iteration_writes();
+            double t6_finish_writes = std::chrono::duration<double>(Clock::now() - t6).count() - t6_after_build;
+            double t6_wait = 0;
             if (pending_knn_merge.valid()) {
                 auto t_wait = Clock::now();
                 pending_knn_merge.get();
-                double wait_s = std::chrono::duration<double>(Clock::now() - t_wait).count();
-                std::cout << "  [ChunkedKNN] waited " << wait_s
+                t6_wait = std::chrono::duration<double>(Clock::now() - t_wait).count();
+                std::cout << "  [ChunkedKNN] waited " << t6_wait
                           << "s for previous iteration's background merge\n";
             }
             {
@@ -4385,6 +4481,11 @@ int run_pipeline_impl(
             cudaDeviceSynchronize();
             double iter_step6 = std::chrono::duration<double>(Clock::now() - t6).count();
             elapsed_step6 += iter_step6;
+            std::cout << "  [Step6 timing] centroid_topk_expand=" << std::fixed << std::setprecision(3) << t6_topk_expand
+                      << "s build_vector_knn=" << t6_build_vector_knn
+                      << "s finish_writes=" << t6_finish_writes
+                      << "s merge_wait=" << t6_wait
+                      << "s total=" << iter_step6 << "s\n";
             std::cout << "  Step 6 done [" << std::fixed << std::setprecision(3) << iter_step6 << "s]\n";
         }
 
