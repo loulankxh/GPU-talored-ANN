@@ -2981,6 +2981,8 @@ void build_vector_knn_with_tensorcore(
     for (int64_t c = 0; c < n_centroids; ++c) {
         bucket_count[c] = bucket_vecs.count(c);
     }
+    double t_setup_bucket_count = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - func_t0).count();
 
     // ================================================================
     // Step 0.5: DiskJoin 风格的桶处理顺序 + Belady 最优离线缓存 (见
@@ -3010,10 +3012,14 @@ void build_vector_knn_with_tensorcore(
         ? order_window_arg
         : std::max<int32_t>(4 * static_cast<int32_t>(order_graph_K), 16);
     auto bucket_order_seq = bucket_order::compute_bucket_processing_order(order_adj, order_window);
+    double t_setup_order = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - func_t0).count() - t_setup_bucket_count;
 
     auto access_adj = bucket_order::adjacency_from_flat_graph(
         centroid_knn_graph, n_centroids, static_cast<int32_t>(K));
     auto future_access = bucket_order::compute_future_access_lists(bucket_order_seq, access_adj);
+    double t_setup_future_access = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - func_t0).count() - t_setup_bucket_count - t_setup_order;
 
     auto vec_bucket_bytes = [](const VecBucket<DataT>& b) {
         return b.ids.size() * sizeof(int64_t) + b.vecs.size() * sizeof(DataT);
@@ -3027,6 +3033,9 @@ void build_vector_knn_with_tensorcore(
     };
     std::cout << "  [VectorKNN] bucket order_window=" << order_window
               << ", cache_budget=" << (cache_bytes / 1e6) << " MB\n";
+    double t_setup_cache_ctor = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - func_t0).count()
+        - t_setup_bucket_count - t_setup_order - t_setup_future_access;
 
     // ================================================================
     // Step 1: cuBLAS handle 初始化
@@ -3297,8 +3306,14 @@ void build_vector_knn_with_tensorcore(
     int64_t processed_buckets = 0;
     auto loop_t0 = std::chrono::high_resolution_clock::now();
     double t_setup_before_loop = std::chrono::duration<double>(loop_t0 - func_t0).count();
+    double t_setup_gpu_alloc = t_setup_before_loop
+        - t_setup_bucket_count - t_setup_order - t_setup_future_access - t_setup_cache_ctor;
     std::cout << "  [VectorKNN] setup before bucket loop: " << std::fixed << std::setprecision(3)
-              << t_setup_before_loop << "s\n";
+              << t_setup_before_loop << "s (bucket_count=" << t_setup_bucket_count
+              << "s, order=" << t_setup_order
+              << "s, future_access=" << t_setup_future_access
+              << "s, cache_ctor=" << t_setup_cache_ctor
+              << "s, gpu_buffer_alloc=" << t_setup_gpu_alloc << "s)\n";
 
     // ---- TEMP DIAGNOSTIC: fine-grained bucket-loop breakdown ----
     // pure GEMM is already timed via cudaEvent above; this splits the
@@ -4038,6 +4053,7 @@ int run_pipeline_impl(
         std::vector<int64_t> centroid_sample_indices = select_centroids_on_gpu_kmeans_parallel(
             X_sampled.data(), sampled_indices,
             working_N, D, iter_config, mem_est, &quantizer, &d_centroids_f32);
+        double t2_select_call = std::chrono::duration<double>(Clock::now() - t2).count();
 
         // sample_idx → raw_idx
         centroid_global_indices.assign(centroid_sample_indices.size(), 0);
@@ -4046,18 +4062,28 @@ int run_pipeline_impl(
         }
 
         n_centroids = static_cast<int64_t>(centroid_global_indices.size());
+        double t2_idx_map = std::chrono::duration<double>(Clock::now() - t2).count() - t2_select_call;
 
         // bucket 磁盘缓存跟着这一轮的 n_centroids 重新建 (bufs 大小依赖它)；
         // 磁盘上的文件名固定是 bucket_vec_<c>.bin，start_iteration() 会把本轮
         // 用到的都 truncate 掉，不用手动清上一轮的。
+        auto t2_bvc0 = Clock::now();
         bucket_vecs_ptr = std::make_unique<BucketVectorAccumulator<DataT>>(
             BucketVectorAccumulator<DataT>::create(
                 bucket_vec_dir, n_centroids, D, config.bucket_vec_buffer_bytes));
+        double t2_bucket_vec_create = std::chrono::duration<double>(Clock::now() - t2_bvc0).count();
+        auto t2_bvs0 = Clock::now();
         bucket_vecs_ptr->start_iteration();
+        double t2_bucket_vec_start = std::chrono::duration<double>(Clock::now() - t2_bvs0).count();
 
         cudaDeviceSynchronize();
         double iter_step2 = std::chrono::duration<double>(Clock::now() - t2).count();
         elapsed_step2 += iter_step2;
+        std::cout << "  [Step2 outer timing] select_call=" << std::fixed << std::setprecision(3) << t2_select_call
+                  << "s idx_map=" << t2_idx_map
+                  << "s bucket_vec_create=" << t2_bucket_vec_create
+                  << "s bucket_vec_start=" << t2_bucket_vec_start
+                  << "s total=" << iter_step2 << "s\n";
         std::cout << "  Step 2 done [" << std::fixed << std::setprecision(3) << iter_step2 << "s]\n";
 
         // ================================================================
@@ -4105,6 +4131,7 @@ int run_pipeline_impl(
             CUDA_CHECK(cudaMemcpy(centroids_host_for_step6.data(), d_centroids_f32,
                                   centroid_gpu_bytes, cudaMemcpyDeviceToHost));
         }
+        double t4_centroids_dl = std::chrono::duration<double>(Clock::now() - t4).count();
 
         // Compute available GPU memory for batch processing
         size_t free_bytes = 0, total_bytes = 0;
@@ -4159,6 +4186,7 @@ int run_pipeline_impl(
 
             CUDA_CHECK(cudaFree(d_centroids_f32));
         }
+        double t4_assign_call = std::chrono::duration<double>(Clock::now() - t4).count() - t4_centroids_dl;
 
         // Download centroid KNN graph to CPU before freeing (needed for Step 6,
         // and for round 1's inline reorder just below, which always runs).
@@ -4171,12 +4199,21 @@ int run_pipeline_impl(
         // Free KNN graph from GPU
         CUDA_CHECK(cudaFree(d_graph));
         cudaDeviceSynchronize();
+        double t4_graph_dl_free = std::chrono::duration<double>(Clock::now() - t4).count()
+                                   - t4_centroids_dl - t4_assign_call;
 
         // flush 掉这一轮所有 bucket 的写缓冲区，Step 6 才能安全地整块读它们。
+        auto t4_fin0 = Clock::now();
         bucket_vecs_ptr->finish_iteration();
+        double t4_finish_iteration = std::chrono::duration<double>(Clock::now() - t4_fin0).count();
 
         double iter_step4 = std::chrono::duration<double>(Clock::now() - t4).count();
         elapsed_step4 += iter_step4;
+        std::cout << "  [Step4 outer timing] centroids_dl=" << std::fixed << std::setprecision(3) << t4_centroids_dl
+                  << "s assign_call=" << t4_assign_call
+                  << "s graph_dl_free=" << t4_graph_dl_free
+                  << "s finish_iteration=" << t4_finish_iteration
+                  << "s total=" << iter_step4 << "s\n";
         std::cout << "  Step 4 done [" << std::fixed << std::setprecision(3) << iter_step4 << "s]\n";
 
         // ================================================================
