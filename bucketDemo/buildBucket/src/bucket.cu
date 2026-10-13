@@ -2947,7 +2947,8 @@ void build_vector_knn_with_tensorcore(
     const uint32_t* order_graph,   // (n_centroids, order_graph_K) row-major, 原始 CAGRA 图
     uint32_t order_graph_K,
     int32_t order_window_arg,
-    size_t cache_bytes)
+    size_t cache_bytes,
+    const std::vector<int32_t>* precomputed_order = nullptr)
 {
     auto func_t0 = std::chrono::high_resolution_clock::now();
     constexpr bool want_distances = true;  // 合并去重总是需要距离
@@ -3006,12 +3007,18 @@ void build_vector_knn_with_tensorcore(
     // future_access 则必须用 centroid_knn_graph/K (真实展开后的图)，因为它要
     // 精确预测"每个桶未来会在哪些位置被访问"，跟主循环里 resolve_bucket 实际
     // 读取的近邻集合必须一致，否则 Belady 缓存的淘汰决策会跟真实访问模式脱节。
-    auto order_adj = bucket_order::adjacency_from_flat_graph(
-        order_graph, n_centroids, static_cast<int32_t>(order_graph_K));
     int32_t order_window = (order_window_arg > 0)
         ? order_window_arg
         : std::max<int32_t>(4 * static_cast<int32_t>(order_graph_K), 16);
-    auto bucket_order_seq = bucket_order::compute_bucket_processing_order(order_adj, order_window);
+    // round1 调用方 (iter==0) 已经用完全相同的 centroid_knn_graph/K/order_window
+    // 在 Step 4.5 里算过一遍 bucket_process_order 了 (结果必然逐位相同，输入
+    // 一样)，这时候 caller 会把它传进来，这里直接复用，连 order_adj 都不用建。
+    std::vector<int32_t> bucket_order_seq = precomputed_order
+        ? *precomputed_order
+        : bucket_order::compute_bucket_processing_order(
+              bucket_order::adjacency_from_flat_graph(
+                  order_graph, n_centroids, static_cast<int32_t>(order_graph_K)),
+              order_window);
     double t_setup_order = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - func_t0).count() - t_setup_bucket_count;
 
@@ -4064,13 +4071,21 @@ int run_pipeline_impl(
         n_centroids = static_cast<int64_t>(centroid_global_indices.size());
         double t2_idx_map = std::chrono::duration<double>(Clock::now() - t2).count() - t2_select_call;
 
-        // bucket 磁盘缓存跟着这一轮的 n_centroids 重新建 (bufs 大小依赖它)；
+        // bucket 磁盘缓存跟着这一轮的 n_centroids 重建 (bufs 大小依赖它)——但
+        // n_centroids/D 在实践中逐轮不变 (KMeans|| 候选数只要够用，最终选出的
+        // 数量恒等于 config.centroid_ratio 定的目标值)，这时候整个对象重新
+        // make_unique/create 纯粹是重新分配一遍跟上一轮内容无关的 ~1GB host
+        // buffer，白白浪费。只有维度真的变了 (或者还没创建过) 才重新 create；
+        // 否则复用同一个对象，靠 start_iteration() 重置状态 + 重新截断打开
+        // 每个桶的文件 (下面那一步，不受这里影响)。
         // 磁盘上的文件名固定是 bucket_vec_<c>.bin，start_iteration() 会把本轮
         // 用到的都 truncate 掉，不用手动清上一轮的。
         auto t2_bvc0 = Clock::now();
-        bucket_vecs_ptr = std::make_unique<BucketVectorAccumulator<DataT>>(
-            BucketVectorAccumulator<DataT>::create(
-                bucket_vec_dir, n_centroids, D, config.bucket_vec_buffer_bytes));
+        if (!bucket_vecs_ptr || bucket_vecs_ptr->n_centroids != n_centroids || bucket_vecs_ptr->D != D) {
+            bucket_vecs_ptr = std::make_unique<BucketVectorAccumulator<DataT>>(
+                BucketVectorAccumulator<DataT>::create(
+                    bucket_vec_dir, n_centroids, D, config.bucket_vec_buffer_bytes));
+        }
         double t2_bucket_vec_create = std::chrono::duration<double>(Clock::now() - t2_bvc0).count();
         auto t2_bvs0 = Clock::now();
         bucket_vecs_ptr->start_iteration();
@@ -4229,6 +4244,11 @@ int run_pipeline_impl(
         // ================================================================
         std::vector<uint32_t> reorder_offsets_new;   // 处理位置索引；round1 的 Step6 要用
         std::vector<int32_t>  reorder_pos_of;         // 原始 bucket id -> 处理位置；round1 的 Step6 要用
+        // round1 自己算出来的 bucket 处理顺序，直接传给下面 Step6 复用——Step6
+        // 内部原本会用同一份 centroid_knn_graph_host/K/order_window 重新算一遍
+        // compute_bucket_processing_order，结果跟这里必然逐位相同 (输入完全
+        // 一样)，纯属重复计算 (实测 ~3s)，没必要算两次。
+        std::vector<int32_t> bucket_process_order_round1;
         if (iter == 0) {
             std::cout << "=== Step 4.5: Inline reorder (round 1) ===\n";
             auto t45 = Clock::now();
@@ -4240,10 +4260,11 @@ int run_pipeline_impl(
             int32_t order_window = (order_window_arg > 0)
                 ? order_window_arg
                 : std::max<int32_t>(4 * static_cast<int32_t>(K), 16);
-            auto bucket_process_order = bucket_order::compute_bucket_processing_order(
+            bucket_process_order_round1 = bucket_order::compute_bucket_processing_order(
                 bucket_order::adjacency_from_flat_graph(
                     centroid_knn_graph_host.data(), n_centroids, static_cast<int32_t>(K)),
                 order_window);
+            const auto& bucket_process_order = bucket_process_order_round1;
             {
                 auto tnow = Clock::now();
                 t45_order = std::chrono::duration<double>(tnow - t45).count();
@@ -4481,7 +4502,8 @@ int run_pipeline_impl(
                     n_centroids, graph_K, neighbors_m,
                     *knn_acc,
                     centroid_knn_graph_host.data(), K,
-                    order_window_arg, step6_cache_bytes);
+                    order_window_arg, step6_cache_bytes,
+                    &bucket_process_order_round1);
             } else {
                 build_vector_knn_with_tensorcore<DataT>(
                     N, D, *bucket_vecs_ptr, graph_ptr,

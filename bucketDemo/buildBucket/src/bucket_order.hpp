@@ -26,7 +26,6 @@
 #include <functional>
 #include <limits>
 #include <map>
-#include <queue>
 #include <utility>
 #include <vector>
 
@@ -54,9 +53,112 @@ using Adjacency = std::vector<std::vector<int32_t>>;
 // to keep resident together" (a GPU/CPU cache budget for Step 4, or a
 // chunk size for optimize_chunked's method C/D).
 //
-// Complexity: O(B * K^2 * log(B*K^2)) for a K-regular graph, matching the
+// Complexity: O(B * K^2 * log(B)) for a K-regular graph, matching the
 // paper's O(sum_v outdeg(v)^2) with an added log factor for the priority
 // queue.
+//
+// ---------------------------------------------------------------------
+// IndexedMaxHeap: a max-heap over an externally-owned score[] array where
+// every bucket has at most one resident entry at a time, updated in place
+// (sift up/down) instead of being blindly re-pushed on every score change.
+// A naive std::priority_queue with lazy deletion (push a new entry every
+// time a score changes, discard stale entries only when popped) lets the
+// heap grow to O(B*K^2) total pushes over the whole run instead of staying
+// bounded at O(B) resident entries -- at B~10^4, K~32 scale that's ~2*10^7
+// pushes into an ever-growing heap (and often several stale pops before
+// finding a live entry), which is the dominant real cost of
+// compute_bucket_processing_order at that scale. This class keeps the same
+// O(B*K^2*log(B)) asymptotic shape but with a much smaller constant
+// factor, by capping the heap at the number of live (unvisited, touched)
+// buckets.
+// ---------------------------------------------------------------------
+class IndexedMaxHeap {
+public:
+    // score must outlive this heap; score[v] is read on every comparison,
+    // so the caller updates score[v] in place and then calls push/update.
+    explicit IndexedMaxHeap(const std::vector<int64_t>& score)
+        : score_(score), pos_(score.size(), -1) {}
+
+    bool contains(int32_t v) const { return pos_[static_cast<size_t>(v)] >= 0; }
+    bool empty() const { return heap_.empty(); }
+
+    void push(int32_t v) {
+        heap_.push_back(v);
+        int32_t i = static_cast<int32_t>(heap_.size()) - 1;
+        pos_[static_cast<size_t>(v)] = i;
+        sift_up(i);
+    }
+
+    // score_[v] must already reflect the new value; sifts in whichever
+    // direction is needed (only one of sift_up/sift_down actually moves
+    // anything).
+    void update(int32_t v) {
+        int32_t i = pos_[static_cast<size_t>(v)];
+        sift_up(i);
+        sift_down(pos_[static_cast<size_t>(v)]);
+    }
+
+    void push_or_update(int32_t v) {
+        if (contains(v)) update(v); else push(v);
+    }
+
+    // Pre: !empty().
+    int32_t pop_max() {
+        int32_t top = heap_[0];
+        pos_[static_cast<size_t>(top)] = -1;
+        int32_t last = heap_.back();
+        heap_.pop_back();
+        if (!heap_.empty()) {
+            heap_[0] = last;
+            pos_[static_cast<size_t>(last)] = 0;
+            sift_down(0);
+        }
+        return top;
+    }
+
+private:
+    // Same tie-break as the old std::pair<score,bucket> max-heap: higher
+    // score wins; among equal scores, higher bucket id wins. Keeping this
+    // identical makes the heap swap a pure performance change -- the
+    // chosen `order` doesn't change.
+    bool less(int32_t a, int32_t b) const {
+        int64_t sa = score_[static_cast<size_t>(a)], sb = score_[static_cast<size_t>(b)];
+        if (sa != sb) return sa < sb;
+        return a < b;
+    }
+
+    void swap_at(int32_t i, int32_t j) {
+        std::swap(heap_[static_cast<size_t>(i)], heap_[static_cast<size_t>(j)]);
+        pos_[static_cast<size_t>(heap_[static_cast<size_t>(i)])] = i;
+        pos_[static_cast<size_t>(heap_[static_cast<size_t>(j)])] = j;
+    }
+
+    void sift_up(int32_t i) {
+        while (i > 0) {
+            int32_t parent = (i - 1) / 2;
+            if (!less(heap_[static_cast<size_t>(parent)], heap_[static_cast<size_t>(i)])) break;
+            swap_at(parent, i);
+            i = parent;
+        }
+    }
+
+    void sift_down(int32_t i) {
+        int32_t n = static_cast<int32_t>(heap_.size());
+        for (;;) {
+            int32_t l = 2 * i + 1, r = 2 * i + 2, largest = i;
+            if (l < n && less(heap_[static_cast<size_t>(largest)], heap_[static_cast<size_t>(l)])) largest = l;
+            if (r < n && less(heap_[static_cast<size_t>(largest)], heap_[static_cast<size_t>(r)])) largest = r;
+            if (largest == i) break;
+            swap_at(i, largest);
+            i = largest;
+        }
+    }
+
+    const std::vector<int64_t>& score_;
+    std::vector<int32_t> pos_;    // bucket id -> index in heap_, -1 if absent
+    std::vector<int32_t> heap_;   // bucket ids, heap-ordered by score_[]
+};
+
 inline std::vector<int32_t> compute_bucket_processing_order(
     const Adjacency& adj, int32_t window) {
     const int32_t B = static_cast<int32_t>(adj.size());
@@ -82,10 +184,11 @@ inline std::vector<int32_t> compute_bucket_processing_order(
     std::vector<char> visited(B, 0);
     std::vector<int64_t> score(B, 0);  // sum_{j in window} |N(P[j]) ^ N(v)|
 
-    // Lazy-deletion max-heap: entries become stale as `score` changes, and
-    // are discarded on pop by comparing against the current score.
-    using Entry = std::pair<int64_t, int32_t>;  // (score, bucket)
-    std::priority_queue<Entry> pq;
+    // Indexed max-heap over `score`: every bucket has at most one resident
+    // entry (push_or_update sifts it in place instead of re-pushing), so
+    // pop_max() always returns a live, up-to-date candidate directly - no
+    // stale-entry filtering loop needed (see IndexedMaxHeap's comment).
+    IndexedMaxHeap heap(score);
 
     auto bump = [&](int32_t entering_or_leaving, int64_t delta) {
         for (int32_t u : adj[entering_or_leaving]) {
@@ -93,7 +196,7 @@ inline std::vector<int32_t> compute_bucket_processing_order(
             for (int32_t v : rev[u]) {
                 if (visited[v]) continue;
                 score[v] += delta;
-                pq.push({score[v], v});
+                heap.push_or_update(v);
             }
         }
     };
@@ -107,14 +210,11 @@ inline std::vector<int32_t> compute_bucket_processing_order(
         // drop the oldest one's contribution.
         if (i > window) bump(order[i - window - 1], -1);
 
-        int32_t pick = -1;
-        while (!pq.empty()) {
-            auto [s, v] = pq.top();
-            pq.pop();
-            if (visited[v] || s != score[v]) continue;  // stale entry
-            pick = v;
-            break;
-        }
+        // A visited bucket can never be in the heap (bump() never touches
+        // one, and pop_max() below removes it from the heap the moment
+        // it's picked), so whatever pop_max() returns is always live -
+        // unlike the old lazy-deletion queue, no filtering loop is needed.
+        int32_t pick = heap.empty() ? -1 : heap.pop_max();
         if (pick < 0) {
             // No scored candidate left (e.g. a disconnected component, or
             // score 0 everywhere and the heap ran dry of live entries) -
