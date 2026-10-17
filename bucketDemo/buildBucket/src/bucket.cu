@@ -898,6 +898,13 @@ struct BucketVectorAccumulator {
         }
         mout.close();
 
+        // merged_in may already be open from a previous iteration when this
+        // object is being reused across rounds (not freshly make_unique'd) -
+        // open() on an already-open stream is a no-op (fails silently,
+        // leaves the stale fd/eofbit in place) per the standard, so it must
+        // be closed and have its error flags cleared first.
+        if (merged_in.is_open()) merged_in.close();
+        merged_in.clear();
         merged_in.open(merged_path, std::ios::binary);
         if (!merged_in.is_open())
             throw std::runtime_error("BucketVectorAccumulator: cannot open " + merged_path + " for read");
