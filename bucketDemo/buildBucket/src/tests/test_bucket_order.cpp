@@ -17,6 +17,11 @@
 //     of in-degree hot nodes, mimicking a real KNN graph's skew) timing
 //     old vs new -- informational only (hardware-dependent), but the new
 //     implementation should never be slower.
+//  4. BeladyBucketCache eviction differential: the cache's victim
+//     selection (now via IndexedMaxHeap instead of a std::multimap) must
+//     pick the exact same victims, every time, as an independent O(B)
+//     linear-scan oracle that implements the same "farthest next-use,
+//     ties -> higher id" rule without any heap/tree at all.
 
 #include <algorithm>
 #include <cassert>
@@ -224,11 +229,140 @@ static void test_benchmark_large_skewed_graph() {
            new_s > 0 ? old_s / new_s : 0.0);
 }
 
+// ---------------------------------------------------------------------
+// BeladyBucketCache eviction oracle: picks the victim by linearly
+// scanning all resident buckets for the farthest next-use (ties -> higher
+// bucket id) -- the same rule the real cache implements via
+// next_use_heap_, just with no heap/tree, so it's a trustworthy
+// independent check on whether the heap-based cache evicts the same
+// bucket, every time, as the obviously-correct O(resident) approach.
+// ---------------------------------------------------------------------
+struct TestBucket {
+    int32_t id = -1;
+    size_t bytes = 0;
+};
+
+class ReferenceBeladyCache {
+public:
+    ReferenceBeladyCache(std::vector<std::vector<int32_t>> future_access,
+                          size_t capacity_bytes, size_t bucket_bytes)
+        : future_access_(std::move(future_access)),
+          capacity_bytes_(capacity_bytes),
+          bucket_bytes_(bucket_bytes),
+          B_(static_cast<int32_t>(future_access_.size())),
+          next_ptr_(static_cast<size_t>(B_), 0),
+          resident_(static_cast<size_t>(B_), 0) {}
+
+    // Returns true iff this access is a cache hit (mirrors
+    // BeladyBucketCache::get's hit/miss split, same call order: evict for
+    // room on a miss BEFORE advancing bucket_id's own pointer).
+    bool access(int32_t position, int32_t bucket_id) {
+        bool hit = resident_[static_cast<size_t>(bucket_id)] != 0;
+        if (!hit) {
+            while (resident_count_ > 0 && used_bytes_ + bucket_bytes_ > capacity_bytes_) {
+                int32_t victim = pick_victim();
+                resident_[static_cast<size_t>(victim)] = 0;
+                used_bytes_ -= bucket_bytes_;
+                --resident_count_;
+            }
+            resident_[static_cast<size_t>(bucket_id)] = 1;
+            used_bytes_ += bucket_bytes_;
+            ++resident_count_;
+        }
+        advance(bucket_id, position);
+        return hit;
+    }
+
+private:
+    int32_t next_use(int32_t bucket_id) const {
+        const auto& fa = future_access_[static_cast<size_t>(bucket_id)];
+        size_t ptr = next_ptr_[static_cast<size_t>(bucket_id)];
+        return (ptr < fa.size()) ? fa[ptr] : std::numeric_limits<int32_t>::max();
+    }
+    void advance(int32_t bucket_id, int32_t position) {
+        auto& ptr = next_ptr_[static_cast<size_t>(bucket_id)];
+        const auto& fa = future_access_[static_cast<size_t>(bucket_id)];
+        while (ptr < fa.size() && fa[ptr] <= position) ++ptr;
+    }
+    int32_t pick_victim() const {
+        int32_t best = -1, best_use = -1;
+        for (int32_t v = 0; v < B_; ++v) {
+            if (!resident_[static_cast<size_t>(v)]) continue;
+            int32_t nu = next_use(v);
+            if (best < 0 || nu > best_use || (nu == best_use && v > best)) {
+                best = v;
+                best_use = nu;
+            }
+        }
+        return best;
+    }
+
+    std::vector<std::vector<int32_t>> future_access_;
+    size_t capacity_bytes_, bucket_bytes_, used_bytes_ = 0;
+    int32_t B_;
+    std::vector<size_t> next_ptr_;
+    std::vector<char> resident_;
+    size_t resident_count_ = 0;
+};
+
+static void test_belady_cache_eviction_differential() {
+    int before = g_failures;
+    struct Config { int32_t B, N; size_t capacity_buckets; };
+    std::vector<Config> configs = {
+        {200, 5000, 60},   // ~30% of the working set resident -> frequent eviction
+        {50, 2000, 1},     // pathological: room for exactly one bucket at a time
+        {50, 2000, 50},    // capacity == B -> nothing ever evicted
+        {1000, 8000, 300},
+    };
+    std::mt19937 rng(777);
+
+    for (const auto& cfg : configs) {
+        std::uniform_int_distribution<int32_t> bucket_dist(0, cfg.B - 1);
+        std::vector<int32_t> access_bucket(static_cast<size_t>(cfg.N));
+        for (int32_t i = 0; i < cfg.N; ++i) access_bucket[static_cast<size_t>(i)] = bucket_dist(rng);
+
+        std::vector<std::vector<int32_t>> future_access(static_cast<size_t>(cfg.B));
+        for (int32_t pos = 0; pos < cfg.N; ++pos)
+            future_access[static_cast<size_t>(access_bucket[static_cast<size_t>(pos)])].push_back(pos);
+
+        const size_t bucket_bytes = 1;
+        ReferenceBeladyCache ref(future_access, cfg.capacity_buckets * bucket_bytes, bucket_bytes);
+        bucket_order::BeladyBucketCache<TestBucket> actual(
+            future_access, cfg.capacity_buckets * bucket_bytes,
+            [](const TestBucket& b) { return b.bytes; });
+
+        int32_t misses = 0;
+        for (int32_t pos = 0; pos < cfg.N; ++pos) {
+            int32_t bid = access_bucket[static_cast<size_t>(pos)];
+            bool ref_hit = ref.access(pos, bid);
+
+            bool loader_called = false;
+            const TestBucket& got = actual.get(pos, bid, [&](int32_t id) {
+                loader_called = true;
+                return TestBucket{id, bucket_bytes};
+            });
+            CHECK(got.id == bid);
+            bool actual_hit = !loader_called;
+            if (!actual_hit) ++misses;
+
+            CHECK(actual_hit == ref_hit);
+            if (actual_hit != ref_hit) {
+                std::fprintf(stderr, "  mismatch at B=%d N=%d cap=%zu pos=%d bucket=%d: actual_hit=%d ref_hit=%d\n",
+                             cfg.B, cfg.N, cfg.capacity_buckets, pos, bid, actual_hit, ref_hit);
+            }
+        }
+        printf("  B=%d N=%d cap=%zu: %d misses / %d accesses\n",
+               cfg.B, cfg.N, cfg.capacity_buckets, misses, cfg.N);
+    }
+    printf("test_belady_cache_eviction_differential: %s\n", g_failures == before ? "ok" : "FAILED");
+}
+
 int main() {
     test_differential_random_graphs();
     test_empty_graph();
     test_future_access_sanity();
     test_benchmark_large_skewed_graph();
+    test_belady_cache_eviction_differential();
 
     if (g_failures == 0) {
         printf("\nALL PASSED\n");

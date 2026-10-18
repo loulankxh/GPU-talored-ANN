@@ -25,7 +25,6 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
-#include <map>
 #include <utility>
 #include <vector>
 
@@ -318,12 +317,18 @@ inline std::vector<std::vector<int32_t>> compute_future_access_lists(
 // ever gets evicted, that per-call hashing was pure overhead; at the actual
 // target scale, where eviction is genuinely happening, the flat arrays are
 // still strictly cheaper than hashing for the same book-keeping - this
-// isn't a fast path that only helps the easy case, it helps both. The one
-// piece that's still a tree (by_next_use_, a multimap ordered by next-use
-// position) is inherent to the algorithm: picking "the resident bucket
-// needed farthest in the future" needs an ordered structure, and swapping
-// that out isn't the part that shows up as pure per-call constant-factor
-// waste in the profiling.
+// isn't a fast path that only helps the easy case, it helps both.
+//
+// Picking "the resident bucket needed farthest in the future" needs an
+// ordered structure, but it doesn't need a node-based tree: eviction order
+// is tracked with the same IndexedMaxHeap used by
+// compute_bucket_processing_order (max-heap over next_use_, by bucket id),
+// so advance_pointer()'s per-call update - run on *every* get(), hit or
+// miss - is an in-place sift instead of a std::multimap erase+insert (two
+// node allocations per call). Same fix as that function's heap, same
+// reason: the structure itself was never O(B^2), but a tree that reallocates
+// on every touch has a much worse constant factor than an array-backed
+// heap at this call volume.
 template <typename BucketT>
 class BeladyBucketCache {
 public:
@@ -339,8 +344,8 @@ public:
           resident_(static_cast<size_t>(B_), 0),
           slot_(static_cast<size_t>(B_)),
           byte_size_(static_cast<size_t>(B_), 0),
-          has_order_iter_(static_cast<size_t>(B_), 0),
-          order_iter_(static_cast<size_t>(B_)) {}
+          next_use_(static_cast<size_t>(B_), 0),
+          next_use_heap_(next_use_) {}
 
     template <typename Loader>
     const BucketT& get(int32_t position, int32_t bucket_id, Loader&& loader) {
@@ -374,20 +379,22 @@ private:
             ? fa[ptr]
             : std::numeric_limits<int32_t>::max();
 
-        if (has_order_iter_[bucket_id]) by_next_use_.erase(order_iter_[bucket_id]);
-        order_iter_[bucket_id] = by_next_use_.emplace(next_use, bucket_id);
-        has_order_iter_[bucket_id] = 1;
+        // Every resident bucket has at most one entry in the heap; this is
+        // called on EVERY get() (hit or miss), so it must stay allocation-
+        // free - push_or_update sifts the existing entry in place instead
+        // of erase+insert into a node-based tree (see IndexedMaxHeap).
+        next_use_[bucket_id] = next_use;
+        next_use_heap_.push_or_update(bucket_id);
     }
 
     void make_room(size_t incoming_bytes) {
         while (resident_count_ > 0 && used_bytes_ + incoming_bytes > capacity_bytes_) {
-            // by_next_use_ is sorted ascending by next-use position, so the
-            // last entry is whichever resident bucket is needed farthest in
-            // the future (or never again, sentinel = INT32_MAX).
-            auto victim_it = std::prev(by_next_use_.end());
-            int32_t victim = victim_it->second;
-            by_next_use_.erase(victim_it);
-            has_order_iter_[victim] = 0;
+            // Evict whichever resident bucket is needed farthest in the
+            // future (or never again, sentinel = INT32_MAX) - i.e. Belady's
+            // optimal offline policy. Ties broken by higher bucket id;
+            // eviction choice among ties only affects which bucket gets
+            // reloaded later, never the correctness of what get() returns.
+            int32_t victim = next_use_heap_.pop_max();
             used_bytes_ -= byte_size_[victim];
             byte_size_[victim] = 0;
             slot_[victim] = BucketT();  // release its heap memory, not just the accounting
@@ -410,9 +417,8 @@ private:
     std::vector<char> resident_;
     std::vector<BucketT> slot_;
     std::vector<size_t> byte_size_;
-    std::multimap<int32_t, int32_t> by_next_use_;  // next_use_pos -> bucket_id
-    std::vector<char> has_order_iter_;
-    std::vector<std::multimap<int32_t, int32_t>::iterator> order_iter_;
+    std::vector<int64_t> next_use_;   // bucket id -> current next-use position
+    IndexedMaxHeap next_use_heap_;    // max-heap over next_use_, by bucket id
     size_t resident_count_ = 0;
 };
 
