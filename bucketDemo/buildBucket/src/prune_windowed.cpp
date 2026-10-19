@@ -227,6 +227,13 @@ int main(int argc, char** argv)
         std::vector<BucketWindowBlock> position_scratch_owned;
         position_scratch_owned.reserve(static_cast<size_t>(ck.K) + 1);
 
+        // Hoisted out of the position loop and reused (clear()+reserve()
+        // each iteration) rather than constructed fresh per position --
+        // see the comment at its use below for why (measured end-to-end
+        // wall time, not the window_build sub-timer alone, is what settled
+        // this).
+        prune_windowed::WindowLookup window;
+
         // Per-phase wall-clock breakdown of Step 3, since "Prune = 69.95s"
         // alone doesn't say whether the time went into cache fetch (disk +
         // Belady bookkeeping / defensive copies), the *serial* per-position
@@ -235,11 +242,16 @@ int main(int argc, char** argv)
         // thread, one position at a time) and sit squarely in the critical
         // path even with high thread counts, so they're worth isolating
         // explicitly rather than assuming the OMP region dominates just
-        // because it's the only parallel part.
-        double t_fetch = 0, t_window_build = 0, t_compute = 0, t_write = 0;
+        // because it's the only parallel part. t_iter_total wraps the
+        // *whole* loop body (not just these four sub-regions) so any future
+        // untimed sliver (like the per-position-destructor gap this file
+        // hit before) shows up immediately as sum-of-parts < t_iter_total,
+        // instead of silently reappearing as an unexplained wall-vs-sum gap.
+        double t_fetch = 0, t_window_build = 0, t_compute = 0, t_write = 0, t_iter_total = 0;
         int64_t min_center_count = std::numeric_limits<int64_t>::max(), max_center_count = 0;
 
         for (int32_t pos = 0; pos < n_buckets; ++pos) {
+            auto titer0 = Clock::now();
             int32_t b = order[static_cast<size_t>(pos)];
 
             // Once the cache holds every bucket (resident_count() ==
@@ -277,21 +289,27 @@ int main(int argc, char** argv)
             }
             t_fetch += std::chrono::duration<double>(Clock::now() - tf0).count();
 
-            // Deliberately *not* hoisted+reused across positions: measured
-            // slower that way (7.8s vs 4.5s here on Sift1M). Bucket size is
-            // wildly skewed (min=1, max=705, avg=100 in that run) --
-            // unordered_map's bucket-array capacity only ever grows, never
-            // shrinks, so the first oversized position's window (up to
-            // ~700*(K+1) entries) locks in a bucket array sized for that
-            // outlier, and every *other* (typically ~100*(K+1)-sized)
-            // position then pays worse insert/clear locality hashing into a
-            // table ~10x sparser than it needs, instead of each position
-            // getting a table sized to its own actual need. A fresh map per
-            // position costs a few incremental rehashes to grow from empty,
-            // but that's cheaper than permanently inheriting one rare
-            // position's size for the other ~9999.
+            // Hoisted outside the position loop (see its declaration above)
+            // and reused via clear()+reserve() instead of being constructed
+            // fresh here. A *previous* attempt at this measured
+            // window_build itself as slower in isolation (7.8s vs 4.5s) and
+            // got reverted on that basis -- that comparison was wrong: a
+            // freshly-constructed-per-position WindowLookup's destructor
+            // runs at the bottom of this loop's scope, *after* t_write has
+            // already stopped timing, so its O(~3300-node-free) teardown
+            // cost was invisible to every per-phase timer and only showed
+            // up as an unexplained gap between the timing breakdown's sum
+            // and the measured wall time (~4.7s, consistently, across two
+            // separate runs of the fresh-construct version). Reusing one
+            // map for the whole run has no such per-position teardown, and
+            // measured faster end-to-end (15.4s vs 17.3s) despite the
+            // insert phase alone looking worse -- trust total wall time
+            // over a sum of narrowly-scoped sub-timers.
             auto tw0 = Clock::now();
-            prune_windowed::WindowLookup window;
+            window.clear();
+            size_t window_needed = 0;
+            for (const auto* blkp : position_scratch) window_needed += static_cast<size_t>(blkp->count);
+            window.reserve(window_needed);
             for (const auto* blkp : position_scratch) {
                 const auto& blk = *blkp;
                 for (int64_t k = 0; k < blk.count; ++k) {
@@ -336,6 +354,8 @@ int main(int argc, char** argv)
             auto tr0 = Clock::now();
             writer.write_rows(row_block.data(), center.first_global_id, center.count);
             t_write += std::chrono::duration<double>(Clock::now() - tr0).count();
+
+            t_iter_total += std::chrono::duration<double>(Clock::now() - titer0).count();
         }
 
         if (writer.rows_written() != N)
@@ -352,7 +372,9 @@ int main(int argc, char** argv)
         std::cout << "  [Stats] bucket size: min=" << min_center_count
                   << " max=" << max_center_count
                   << " avg=" << (n_buckets ? static_cast<double>(N) / n_buckets : 0.0) << "\n";
-        std::cout << "  [Timing] breakdown: fetch=" << std::fixed << std::setprecision(3) << t_fetch
+        std::cout << "  [Timing] loop body total (incl. any untimed slivers) = "
+                  << std::fixed << std::setprecision(3) << t_iter_total << "s\n";
+        std::cout << "  [Timing] breakdown: fetch=" << t_fetch
                   << "s window_build=" << t_window_build
                   << "s compute(parallel)=" << t_compute
                   << "s write=" << t_write << "s (sum=" << (t_fetch + t_window_build + t_compute + t_write)
