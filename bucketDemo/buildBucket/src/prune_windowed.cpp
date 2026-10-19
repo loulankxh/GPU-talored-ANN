@@ -227,16 +227,6 @@ int main(int argc, char** argv)
         std::vector<BucketWindowBlock> position_scratch_owned;
         position_scratch_owned.reserve(static_cast<size_t>(ck.K) + 1);
 
-        // Reused across positions instead of reconstructed from scratch
-        // each time: std::unordered_map::clear() keeps its bucket array
-        // allocated, so clear()+refill avoids paying the hash table's
-        // incremental grow-by-rehash cost on every single position (it
-        // only pays it once, the first time the window reaches its
-        // steady-state size). reserve() is called with each position's
-        // actual needed size -- a no-op once capacity has already grown
-        // to cover it.
-        prune_windowed::WindowLookup window;
-
         // Per-phase wall-clock breakdown of Step 3, since "Prune = 69.95s"
         // alone doesn't say whether the time went into cache fetch (disk +
         // Belady bookkeeping / defensive copies), the *serial* per-position
@@ -287,11 +277,21 @@ int main(int argc, char** argv)
             }
             t_fetch += std::chrono::duration<double>(Clock::now() - tf0).count();
 
+            // Deliberately *not* hoisted+reused across positions: measured
+            // slower that way (7.8s vs 4.5s here on Sift1M). Bucket size is
+            // wildly skewed (min=1, max=705, avg=100 in that run) --
+            // unordered_map's bucket-array capacity only ever grows, never
+            // shrinks, so the first oversized position's window (up to
+            // ~700*(K+1) entries) locks in a bucket array sized for that
+            // outlier, and every *other* (typically ~100*(K+1)-sized)
+            // position then pays worse insert/clear locality hashing into a
+            // table ~10x sparser than it needs, instead of each position
+            // getting a table sized to its own actual need. A fresh map per
+            // position costs a few incremental rehashes to grow from empty,
+            // but that's cheaper than permanently inheriting one rare
+            // position's size for the other ~9999.
             auto tw0 = Clock::now();
-            window.clear();
-            size_t window_needed = 0;
-            for (const auto* blkp : position_scratch) window_needed += static_cast<size_t>(blkp->count);
-            window.reserve(window_needed);
+            prune_windowed::WindowLookup window;
             for (const auto* blkp : position_scratch) {
                 const auto& blk = *blkp;
                 for (int64_t k = 0; k < blk.count; ++k) {
