@@ -48,6 +48,12 @@ struct PointData {
 class WindowLookup {
 public:
     void clear() { map_.clear(); }
+    // Grows the bucket-array capacity if needed, never shrinks -- so it's
+    // cheap (no-op) once the steady-state window size has been seen once.
+    // Meant to be called once per use on a *reused* WindowLookup (clear()
+    // between uses) so repeated fill cycles don't each pay for the hash
+    // table's own incremental growth/rehash from empty.
+    void reserve(size_t n) { map_.reserve(n); }
     void add(uint32_t global_id, const int32_t* candidates, const float* vector) {
         map_[global_id] = PointData{candidates, vector};
     }

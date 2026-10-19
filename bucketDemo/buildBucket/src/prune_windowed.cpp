@@ -214,40 +214,86 @@ int main(int argc, char** argv)
         graph_io::StreamingGraphWriter writer(out_path, N, output_degree);
 
         uint64_t total_lookups = 0, total_hits = 0;
-        std::vector<BucketWindowBlock> position_scratch;  // owned copies for this position only
+
+        // position_scratch holds pointers, not copies -- see the fetch_one
+        // lambda below for when a pointer is actually safe to hold.
+        // position_scratch_owned is the defensive-copy backing store used
+        // only during cache warm-up; reserved once to its max possible size
+        // (center + every centroid-knn neighbor) so that filling it within
+        // one position's fetch loop can never reallocate and dangle a
+        // pointer already pushed into position_scratch for an earlier
+        // fetch in the *same* position.
+        std::vector<const BucketWindowBlock*> position_scratch;
+        std::vector<BucketWindowBlock> position_scratch_owned;
+        position_scratch_owned.reserve(static_cast<size_t>(ck.K) + 1);
+
+        // Reused across positions instead of reconstructed from scratch
+        // each time: std::unordered_map::clear() keeps its bucket array
+        // allocated, so clear()+refill avoids paying the hash table's
+        // incremental grow-by-rehash cost on every single position (it
+        // only pays it once, the first time the window reaches its
+        // steady-state size). reserve() is called with each position's
+        // actual needed size -- a no-op once capacity has already grown
+        // to cover it.
+        prune_windowed::WindowLookup window;
 
         // Per-phase wall-clock breakdown of Step 3, since "Prune = 69.95s"
         // alone doesn't say whether the time went into cache fetch (disk +
-        // Belady bookkeeping), the *serial* per-position window rebuild, the
-        // OpenMP-parallel detour/select compute, or the streaming write.
-        // fetch/window/write are inherently serial (one thread, one
-        // position at a time) and sit squarely in the critical path even
-        // with high thread counts, so they're worth isolating explicitly
-        // rather than assuming the OMP region dominates just because it's
-        // the only parallel part.
+        // Belady bookkeeping / defensive copies), the *serial* per-position
+        // window rebuild, the OpenMP-parallel detour/select compute, or the
+        // streaming write. fetch/window/write are inherently serial (one
+        // thread, one position at a time) and sit squarely in the critical
+        // path even with high thread counts, so they're worth isolating
+        // explicitly rather than assuming the OMP region dominates just
+        // because it's the only parallel part.
         double t_fetch = 0, t_window_build = 0, t_compute = 0, t_write = 0;
         int64_t min_center_count = std::numeric_limits<int64_t>::max(), max_center_count = 0;
 
         for (int32_t pos = 0; pos < n_buckets; ++pos) {
             int32_t b = order[static_cast<size_t>(pos)];
 
-            // Fetch center + neighbors one at a time, copying each out of
-            // the cache immediately -- BeladyBucketCache::get()'s contract
-            // says a reference is only valid until the *next* get() call
-            // for a different id at this position, so we can't hold
-            // multiple such references across calls.
+            // Once the cache holds every bucket (resident_count() ==
+            // n_buckets), BeladyBucketCache::make_room() can never run
+            // again -- it only runs on a cache *miss*, and there are no
+            // bucket ids left to miss on. So every slot_[id] reference
+            // handed back by get() from this point on is stable for the
+            // rest of the program's lifetime, and the copy-out-immediately
+            // contract (needed in general, since a later miss *can* evict
+            // an earlier hit within the same position while still warming
+            // up) becomes unnecessary -- on the actual run that motivated
+            // this file (cache-mb big enough to hold the whole dataset),
+            // this fast path covers all but the first handful of positions
+            // and turns ~768MB of redundant copying (every bucket gets
+            // copied once per window that references it, i.e. ~(1+K)x
+            // over the whole run) into plain pointer handoffs.
+            const bool safe_ref = (cache.resident_count() == static_cast<size_t>(n_buckets));
+
             auto tf0 = Clock::now();
             position_scratch.clear();
-            position_scratch.push_back(cache.get(pos, b, loader));   // index 0 = center
+            auto fetch_one = [&](int32_t id) {
+                const BucketWindowBlock& blk = cache.get(pos, id, loader);
+                if (safe_ref) {
+                    position_scratch.push_back(&blk);
+                } else {
+                    position_scratch_owned.push_back(blk);  // defensive copy
+                    position_scratch.push_back(&position_scratch_owned.back());
+                }
+            };
+            if (!safe_ref) position_scratch_owned.clear();
+            fetch_one(b);   // index 0 = center
             for (int32_t nb : adj[static_cast<size_t>(b)]) {
                 if (nb < 0 || nb >= n_buckets) continue;
-                position_scratch.push_back(cache.get(pos, nb, loader));
+                fetch_one(nb);
             }
             t_fetch += std::chrono::duration<double>(Clock::now() - tf0).count();
 
             auto tw0 = Clock::now();
-            prune_windowed::WindowLookup window;
-            for (const auto& blk : position_scratch) {
+            window.clear();
+            size_t window_needed = 0;
+            for (const auto* blkp : position_scratch) window_needed += static_cast<size_t>(blkp->count);
+            window.reserve(window_needed);
+            for (const auto* blkp : position_scratch) {
+                const auto& blk = *blkp;
                 for (int64_t k = 0; k < blk.count; ++k) {
                     window.add(static_cast<uint32_t>(blk.first_global_id + k),
                               blk.candidates.data() + k * blk.M_in,
@@ -256,7 +302,7 @@ int main(int argc, char** argv)
             }
             t_window_build += std::chrono::duration<double>(Clock::now() - tw0).count();
 
-            const BucketWindowBlock& center = position_scratch[0];
+            const BucketWindowBlock& center = *position_scratch[0];
             min_center_count = std::min(min_center_count, center.count);
             max_center_count = std::max(max_center_count, center.count);
             std::vector<uint32_t> row_block(static_cast<size_t>(center.count) * output_degree);

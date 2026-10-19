@@ -29,6 +29,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -102,8 +103,19 @@ public:
     }
 
     // total_buffer_budget_bytes: shared across all chunks (not per-chunk).
+    // max_records_per_chunk: optional cap -- this buffer is a pure
+    // write-behind staging area (flushed to disk via flush_chunk() the
+    // moment it's full, see add_records()), so it never needs to hold more
+    // than one chunk's worth of a run's total edges. Without this cap, a
+    // generous total_buffer_budget_bytes (sized for many chunks) handed to
+    // a run with few chunks -- e.g. num_chunks=1 -- allocates and
+    // zero-initializes the *entire* budget as one std::vector<char>::resize
+    // (several seconds for a multi-GB buffer that will only ever hold a
+    // small fraction of that before flushing), the same pathology as
+    // optimize_chunked.cu's capacity_per_chunk.
     static EdgeChunkAccumulator create(const std::string& dir, int32_t num_chunks,
-                                        size_t total_buffer_budget_bytes) {
+                                        size_t total_buffer_budget_bytes,
+                                        size_t max_records_per_chunk = std::numeric_limits<size_t>::max()) {
         EdgeChunkAccumulator acc;
         acc.dir = dir;
         acc.num_chunks = num_chunks;
@@ -113,6 +125,7 @@ public:
         size_t nb = static_cast<size_t>(std::max<int32_t>(1, num_chunks));
         size_t buf_bytes = std::max<size_t>(kMinBufferBytes, total_buffer_budget_bytes / nb);
         size_t cap_records = std::max<size_t>(1, buf_bytes / sizeof(EdgeRecord));
+        cap_records = std::min<size_t>(cap_records, max_records_per_chunk);
 
         acc.bufs.resize(static_cast<size_t>(num_chunks));
         for (auto& b : acc.bufs) {

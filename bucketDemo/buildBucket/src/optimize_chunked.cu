@@ -1415,8 +1415,13 @@ static void run_method_E(
     std::cout << "  [Timing] Alloc: device=" << std::fixed << std::setprecision(2) << t_alloc_device
               << "s, pinned-host=" << t_alloc_pinned << "s\n";
 
-    auto acc = edge_chunk::EdgeChunkAccumulator::create(tmp_dir, num_chunks, edge_buffer_bytes);
+    auto t_acc_create0 = Clock::now();
+    auto acc = edge_chunk::EdgeChunkAccumulator::create(tmp_dir, num_chunks, edge_buffer_bytes,
+        static_cast<size_t>(N) * static_cast<size_t>(K_out));
     acc.start();
+    double t_acc_create = std::chrono::duration<double>(Clock::now() - t_acc_create0).count();
+    std::cout << "  [Timing] acc.create()+start()=" << std::fixed << std::setprecision(2)
+              << t_acc_create << "s\n";
 
     // -------- Phase 1: 单遍扫描 forward_graph.bin，散射进 per-chunk buffer --------
     auto tA = Clock::now();
