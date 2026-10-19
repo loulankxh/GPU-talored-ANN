@@ -131,6 +131,38 @@ static std::vector<uint32_t> sanitize_to_uint32(
     return dst;
 }
 
+// Lightweight header-only peek at vector_knn.bin (int64 N, int32 M) -- no
+// payload read, so the GPU-fit check below can decide whether to bail
+// *before* paying for a potentially multi-GB dataset/graph load.
+static void peek_vector_knn_header(const std::string& path, int64_t& N, int32_t& M)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open())
+        throw std::runtime_error("Cannot open KNN graph file: " + path);
+    in.read(reinterpret_cast<char*>(&N), sizeof(int64_t));
+    in.read(reinterpret_cast<char*>(&M), sizeof(int32_t));
+    if (!in.good() || N <= 0 || M <= 0)
+        throw std::runtime_error("Invalid vector_knn.bin header: " + path);
+}
+
+// Heuristic only, not exact accounting: raft's sort_knn_graph/optimize
+// (graph_core.cuh) manage their own internal device working buffers
+// (reverse-graph construction, detour counting, etc.) that aren't visible
+// from this call site, so the raw dataset+graph+output byte count alone
+// would underestimate real usage. `margin` is a blunt safety multiplier to
+// cover that unknown overhead -- tune with --gpu-fit-margin if it's
+// rejecting runs that would actually fit, or if you still hit a CUDA OOM
+// despite this check passing.
+static size_t estimate_required_gpu_bytes(int64_t N, int32_t D, int32_t M_in,
+                                           int32_t K_out, double margin)
+{
+    size_t dataset_bytes   = static_cast<size_t>(N) * static_cast<size_t>(D) * sizeof(float);
+    size_t candidate_bytes = static_cast<size_t>(N) * static_cast<size_t>(M_in) * sizeof(uint32_t);
+    size_t output_bytes    = static_cast<size_t>(N) * static_cast<size_t>(K_out) * sizeof(uint32_t);
+    size_t base = dataset_bytes + candidate_bytes + output_bytes;
+    return static_cast<size_t>(static_cast<double>(base) * margin);
+}
+
 // 输出 CAGRA 图到磁盘
 //   int64_t  N
 //   int32_t  output_degree
@@ -172,7 +204,23 @@ int main(int argc, char** argv)
             ("skip-sort",     po::bool_switch()->default_value(false),
                 "Skip sort_knn_graph (assume input is already sorted by L2)")
             ("save-npy",      po::bool_switch()->default_value(false),
-                "Also write a numpy .npy alongside the .bin (int64, padding-free)");
+                "Also write a numpy .npy alongside the .bin (int64, padding-free)")
+            ("force-chunked", po::bool_switch()->default_value(false),
+                "This tool IS the 'fits on one GPU, run raft's native "
+                "sort_knn_graph+optimize directly' path -- by default (false) "
+                "it auto-checks dataset+graph+output against free GPU memory "
+                "and only proceeds if it fits (see --gpu-fit-margin). Pass "
+                "true to force it to refuse and point at prune_windowed + "
+                "optimize_chunked instead, even on a dataset (e.g. Sift1M) "
+                "that would actually fit -- for validating the chunked "
+                "pipeline's output against this one's on the same data.")
+            ("gpu-fit-margin", po::value<double>()->default_value(3.0),
+                "Safety multiplier on the dataset+graph+output byte estimate "
+                "before comparing against free GPU memory -- raft's internal "
+                "working buffers aren't visible from here, so this is a "
+                "heuristic, not exact accounting. Raise it if you hit a CUDA "
+                "OOM despite the check passing; lower it if it rejects runs "
+                "that would actually fit.");
 
         po::variables_map vm;
         po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -185,12 +233,55 @@ int main(int argc, char** argv)
         const int32_t     K_out      = vm["output-degree"].as<int32_t>();
         const bool        skip_sort  = vm["skip-sort"].as<bool>();
         const bool        save_npy   = vm["save-npy"].as<bool>();
+        const bool        force_chunked   = vm["force-chunked"].as<bool>();
+        const double      gpu_fit_margin  = vm["gpu-fit-margin"].as<double>();
 
         if (K_out <= 0)
             throw std::runtime_error("--output-degree must be > 0");
 
         using Clock = std::chrono::steady_clock;
         auto t_start = Clock::now();
+
+        // ---------------------------------------------------------------
+        // Step 0: GPU-fit check. This tool IS the "data fits on one GPU,
+        // call raft's own sort_knn_graph+optimize directly" path -- the
+        // ~3s-on-Sift1M baseline raft gives you is exactly this. Header-only
+        // peeks (no payload read) so a reject is cheap, not a multi-GB
+        // load followed by a refusal. When it doesn't fit (or
+        // --force-chunked asks to validate the other path on purpose), the
+        // right tool is prune_windowed + optimize_chunked -- this one
+        // doesn't invoke them itself (disjoint, bucket-specific argument
+        // set: bucket-offsets/bucket-process-order/centroid-knn/cache-mb/
+        // gpu-budget-mb/...), it just says so and exits.
+        // ---------------------------------------------------------------
+        {
+            auto [N32_peek, D_peek] = load::read_fbin_header(input_path);
+            int64_t N_peek = 0; int32_t M_peek = 0;
+            peek_vector_knn_header(knn_path, N_peek, M_peek);
+
+            size_t required = estimate_required_gpu_bytes(N_peek, D_peek, M_peek, K_out, gpu_fit_margin);
+            size_t free_bytes = 0, total_bytes = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+
+            std::cout << "=== Step 0: GPU-fit check ===\n";
+            std::cout << "  N=" << N32_peek << " D=" << D_peek << " M_in=" << M_peek
+                      << " K_out=" << K_out << "\n";
+            std::cout << "  Estimated requirement (x" << gpu_fit_margin << " margin): "
+                      << required / 1e9 << " GB, GPU free: " << free_bytes / 1e9
+                      << " GB / " << total_bytes / 1e9 << " GB\n";
+
+            const bool fits = (required <= free_bytes);
+            if (force_chunked || !fits) {
+                std::cout << "  -> " << (force_chunked ? "--force-chunked set"
+                                                        : "does not fit free GPU memory")
+                          << " -- this tool will NOT run. Use the chunked pipeline instead:\n"
+                          << "       prune_windowed  (--cache-mb sized to host budget)\n"
+                          << "       optimize_chunked -m E  (--gpu-budget-mb sized to this GPU)\n"
+                          << "     See Readme.md for the full bucket-pipeline argument list.\n";
+                return 2;
+            }
+            std::cout << "  -> fits, proceeding with raft native path.\n";
+        }
 
         // ---------------------------------------------------------------
         // Step 1: Load original dataset (host float32)
