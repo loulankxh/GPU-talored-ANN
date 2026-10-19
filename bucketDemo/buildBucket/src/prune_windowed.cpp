@@ -44,6 +44,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <omp.h>
 #include <string>
@@ -215,6 +216,18 @@ int main(int argc, char** argv)
         uint64_t total_lookups = 0, total_hits = 0;
         std::vector<BucketWindowBlock> position_scratch;  // owned copies for this position only
 
+        // Per-phase wall-clock breakdown of Step 3, since "Prune = 69.95s"
+        // alone doesn't say whether the time went into cache fetch (disk +
+        // Belady bookkeeping), the *serial* per-position window rebuild, the
+        // OpenMP-parallel detour/select compute, or the streaming write.
+        // fetch/window/write are inherently serial (one thread, one
+        // position at a time) and sit squarely in the critical path even
+        // with high thread counts, so they're worth isolating explicitly
+        // rather than assuming the OMP region dominates just because it's
+        // the only parallel part.
+        double t_fetch = 0, t_window_build = 0, t_compute = 0, t_write = 0;
+        int64_t min_center_count = std::numeric_limits<int64_t>::max(), max_center_count = 0;
+
         for (int32_t pos = 0; pos < n_buckets; ++pos) {
             int32_t b = order[static_cast<size_t>(pos)];
 
@@ -223,13 +236,16 @@ int main(int argc, char** argv)
             // says a reference is only valid until the *next* get() call
             // for a different id at this position, so we can't hold
             // multiple such references across calls.
+            auto tf0 = Clock::now();
             position_scratch.clear();
             position_scratch.push_back(cache.get(pos, b, loader));   // index 0 = center
             for (int32_t nb : adj[static_cast<size_t>(b)]) {
                 if (nb < 0 || nb >= n_buckets) continue;
                 position_scratch.push_back(cache.get(pos, nb, loader));
             }
+            t_fetch += std::chrono::duration<double>(Clock::now() - tf0).count();
 
+            auto tw0 = Clock::now();
             prune_windowed::WindowLookup window;
             for (const auto& blk : position_scratch) {
                 for (int64_t k = 0; k < blk.count; ++k) {
@@ -238,11 +254,23 @@ int main(int argc, char** argv)
                               blk.vectors.data() + k * blk.D);
                 }
             }
+            t_window_build += std::chrono::duration<double>(Clock::now() - tw0).count();
 
             const BucketWindowBlock& center = position_scratch[0];
+            min_center_count = std::min(min_center_count, center.count);
+            max_center_count = std::max(max_center_count, center.count);
             std::vector<uint32_t> row_block(static_cast<size_t>(center.count) * output_degree);
 
-            #pragma omp parallel for schedule(dynamic, 256) reduction(+:total_lookups,total_hits)
+            // static (not dynamic,256): center.count is a single bucket's
+            // row count, which averages N/n_buckets and is typically far
+            // smaller than a 256-row dynamic chunk (e.g. 100 for Sift1M's
+            // 10k buckets) -- with chunk > count, dynamic scheduling hands
+            // the *entire* bucket to one thread while the other
+            // omp_get_max_threads()-1 threads sit idle through the
+            // fork/join, repeated once per bucket (n_buckets times). static
+            // always spreads a bucket's rows across all threads instead.
+            auto tc0 = Clock::now();
+            #pragma omp parallel for schedule(static) reduction(+:total_lookups,total_hits)
             for (int64_t lk = 0; lk < center.count; ++lk) {
                 uint32_t a_id = static_cast<uint32_t>(center.first_global_id + lk);
                 const int32_t* raw = center.candidates.data() + lk * center.M_in;
@@ -257,8 +285,11 @@ int main(int argc, char** argv)
                     a_id, raw, M_in, center.D, window, output_degree,
                     row_block.data() + static_cast<size_t>(lk) * output_degree);
             }
+            t_compute += std::chrono::duration<double>(Clock::now() - tc0).count();
 
+            auto tr0 = Clock::now();
             writer.write_rows(row_block.data(), center.first_global_id, center.count);
+            t_write += std::chrono::duration<double>(Clock::now() - tr0).count();
         }
 
         if (writer.rows_written() != N)
@@ -272,6 +303,14 @@ int main(int argc, char** argv)
                   << " (" << std::fixed << std::setprecision(2) << pct_hit << "%)\n";
         std::cout << "  [Stats] cache: resident_count=" << cache.resident_count()
                   << " used_bytes=" << cache.used_bytes() / 1e6 << " MB\n";
+        std::cout << "  [Stats] bucket size: min=" << min_center_count
+                  << " max=" << max_center_count
+                  << " avg=" << (n_buckets ? static_cast<double>(N) / n_buckets : 0.0) << "\n";
+        std::cout << "  [Timing] breakdown: fetch=" << std::fixed << std::setprecision(3) << t_fetch
+                  << "s window_build=" << t_window_build
+                  << "s compute(parallel)=" << t_compute
+                  << "s write=" << t_write << "s (sum=" << (t_fetch + t_window_build + t_compute + t_write)
+                  << "s vs wall=" << t_prune << "s)\n";
         std::cout << "  [Timing] Prune = " << t_prune << "s\n";
 
         if (save_npy) {

@@ -1339,6 +1339,23 @@ static void run_method_E(
     size_t chunk_buf_budget = static_cast<size_t>(gpu_budget_bytes * 0.5);
     size_t capacity_per_chunk = std::max<size_t>(
         16, chunk_buf_budget / static_cast<size_t>(num_chunks) / sizeof(edge_chunk::EdgeRecord));
+    // Clamp against the only bound that actually matters: the whole forward
+    // graph has exactly N*K_out edges, so no single chunk can ever receive
+    // more than that -- regardless of how generous --gpu-budget-mb is. When
+    // num_chunks is small (e.g. 1, because the bucket-aligned chunker only
+    // needed one chunk to stay under budget), the unclamped formula hands
+    // the *entire* chunk_buf_budget to that one chunk even though it will
+    // only ever hold N*K_out records, which can be 10-30x smaller. That
+    // difference is multiple GB of wasted cudaMalloc (device) and, worse,
+    // cudaMallocHost (pinned host, for h_drain_buf below) -- pinned
+    // allocations of that size routinely cost many seconds of wall time
+    // that lands *before* the Phase 1 timer starts, so it never shows up in
+    // "[Timing] Phase 1" despite dominating the "Done [Xs]" total. Shrinking
+    // capacity_per_chunk here only makes the per-chunk buffer flush to disk
+    // sooner/more often (still correct -- overflow_cap below is sized
+    // independently and absorbs any edges that don't fit), never drops data.
+    capacity_per_chunk = std::min<size_t>(capacity_per_chunk,
+        static_cast<size_t>(N) * static_cast<size_t>(K_out));
     size_t chunk_buf_bytes = static_cast<size_t>(num_chunks) * capacity_per_chunk * sizeof(edge_chunk::EdgeRecord);
 
     size_t remaining = (gpu_budget_bytes > chunk_buf_bytes)
@@ -1357,6 +1374,13 @@ static void run_method_E(
               << ", overflow_cap=" << overflow_cap << "\n";
 
     // -------- GPU 侧分配 --------
+    // Timed explicitly: cudaMallocHost (pinned) on a multi-GB buffer can
+    // itself cost several seconds (page-locking is far slower than a plain
+    // malloc), and this whole block sits *before* the Phase 1 timer starts
+    // -- so without this printout that cost is invisible, silently folded
+    // into "Done [Xs]" minus "Phase 1" minus "Phase 2" instead of being
+    // attributed to allocation.
+    auto t_alloc0 = Clock::now();
     std::vector<uint32_t> starts_u32(plan.starts.begin(), plan.starts.end());
     uint32_t* d_chunk_starts = nullptr;
     CUDA_CHECK(cudaMalloc(&d_chunk_starts, starts_u32.size() * sizeof(uint32_t)));
@@ -1377,7 +1401,9 @@ static void run_method_E(
 
     uint32_t* d_fwd_batch = nullptr;
     CUDA_CHECK(cudaMalloc(&d_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t)));
+    double t_alloc_device = std::chrono::duration<double>(Clock::now() - t_alloc0).count();
 
+    auto t_alloc1 = Clock::now();
     uint32_t* h_fwd_batch = nullptr;
     CUDA_CHECK(cudaMallocHost(&h_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t)));
     std::vector<uint32_t> h_chunk_count(static_cast<size_t>(num_chunks));
@@ -1385,6 +1411,9 @@ static void run_method_E(
     CUDA_CHECK(cudaMallocHost(&h_overflow_buf, static_cast<size_t>(overflow_cap) * sizeof(edge_chunk::EdgeRecord)));
     edge_chunk::EdgeRecord* h_drain_buf = nullptr;
     CUDA_CHECK(cudaMallocHost(&h_drain_buf, capacity_per_chunk * sizeof(edge_chunk::EdgeRecord)));
+    double t_alloc_pinned = std::chrono::duration<double>(Clock::now() - t_alloc1).count();
+    std::cout << "  [Timing] Alloc: device=" << std::fixed << std::setprecision(2) << t_alloc_device
+              << "s, pinned-host=" << t_alloc_pinned << "s\n";
 
     auto acc = edge_chunk::EdgeChunkAccumulator::create(tmp_dir, num_chunks, edge_buffer_bytes);
     acc.start();
@@ -1477,9 +1506,12 @@ static void run_method_E(
         std::cout << "  [Timing] Phase 1 (scatter) = " << t_phase1 << "s\n";
     }
 
+    auto t_finish0 = Clock::now();
     acc.finish();
+    double t_acc_finish = std::chrono::duration<double>(Clock::now() - t_finish0).count();
 
     // -------- 清理 Phase 1 的 GPU/host 分配 --------
+    auto t_free0 = Clock::now();
     cudaFree(d_chunk_starts);
     cudaFree(d_chunk_buf);
     cudaFree(d_chunk_count);
@@ -1489,6 +1521,9 @@ static void run_method_E(
     cudaFreeHost(h_fwd_batch);
     cudaFreeHost(h_overflow_buf);
     cudaFreeHost(h_drain_buf);
+    double t_free = std::chrono::duration<double>(Clock::now() - t_free0).count();
+    std::cout << "  [Timing] acc.finish()=" << std::fixed << std::setprecision(2) << t_acc_finish
+              << "s, free buffers=" << t_free << "s\n";
 
     // -------- Phase 2: 按 chunk 顺序重新顺序读一遍 forward_graph.bin（这次
     // 是当"底稿"用，不是当边的源表用——两次顺序读，用途不同，参见此前的
@@ -1539,7 +1574,10 @@ static void run_method_E(
     double t_phase2 = std::chrono::duration<double>(Clock::now() - tB).count();
     std::cout << "  [Timing] Phase 2 (merge + stream write) = " << t_phase2 << "s\n";
 
+    auto t_cleanup0 = Clock::now();
     std::filesystem::remove_all(tmp_dir);
+    double t_cleanup = std::chrono::duration<double>(Clock::now() - t_cleanup0).count();
+    std::cout << "  [Timing] tmp_dir cleanup=" << std::fixed << std::setprecision(2) << t_cleanup << "s\n";
 }
 
 // =====================================================================
