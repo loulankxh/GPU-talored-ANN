@@ -747,25 +747,35 @@ __global__ void greedy_graph_search_topK_kernel(
 // ============== Per-bucket disk-backed original-vector cache ==============
 //
 // 目的: Step 4 算完每个点的 bucket 分配后，把它的原始向量 (D 个 DataT 分量)
-// 连同 gid 一起顺序追加写进"这个 bucket 专属"的文件里——数据只经过一次磁盘
-// 读 (batch 读入原始数据) + 一次磁盘写 (追加进 bucket 文件)，不会被重复读。
+// 连同 gid 一起写进"这个 bucket 专属"的字节区间里，供 Step 6/7 顺序读取。
 //
 // 每条记录格式: int64_t gid + D 个 DataT 分量。记录自带 gid，Step 6/7 读回
 // 来的时候不需要依赖"文件第 i 行对应某个外部列表第 i 个 id"这种隐式顺序假设。
 //
 // 写缓冲区大小: 不能像 ChunkedKnnAccumulator 那样每个 key 固定分配一块 (那是
-// 因为 num_chunks 量级是几十；这里 n_centroids 可能是几千上万)，而是先定一个
-// 总缓冲区内存预算，再除以 n_centroids 分给每个 bucket，这样总内存不会随桶数
-// 线性暴涨。
+// 因为 num_chunks 量级是几十；这里 n_centroids 可能是几千上万、未来测大数据集
+// 时还会再扩大百倍千倍)，而是先定一个总缓冲区内存预算，再除以 n_centroids
+// 分给每个 bucket，这样总内存不会随桶数线性暴涨。
 //
-// 读侧 (合并进单文件): Step 6 对每个 bucket c 要读它自己 + centroid KNN 图上
-// K 个邻居 bucket 的向量，而同一个 bucket 平均会被 ~K 个不同的 c 当作邻居
-// 读到——如果像写侧那样每个 bucket 各自一个小文件、每次读都重新 open，
-// n_centroids * (1+K) 量级的 open()/close() 系统调用开销才是真正的瓶颈
-// (远超实际读盘字节数对应的带宽耗时)。所以 finish_iteration() 末尾会把所有
-// 小文件顺序拷贝合并成一个大文件 + 只有 n_centroids 个 int64 的 offset 表
-// (任何规模都不是内存问题)，之后 Step 6/7 全程只在这一个已经打开的句柄上
-// seekg+read，不再重复 open。
+// 整个 iteration 全程只用一个磁盘文件 (merged_path)，不会有"每个 bucket 一个
+// 小文件、最后再合并"这一步——这不只是 Step 6 的读侧需要 (n_centroids*(1+K)
+// 量级的 open()/close() 本身就是瓶颈，远超实际读盘字节数对应的带宽耗时，这件
+// 事在读侧已经通过单一持久句柄解决了)，写侧如果也按"每桶一个小文件、结束时
+// 读回来拷进合并文件再删掉"来做，一样是 n_centroids 量级的小文件创建/打开/
+// 关闭/删除，而且这个量级直接随 bucket 数线性增长、跟数据集本身大小无关——
+// bucket 数一旦扩大百倍千倍 (未来大数据集测试的场景)，这部分系统调用开销会
+// 比实际搬动的数据量大得多。
+//
+// 做法: start_iteration() 要求调用方先给出这一轮每个 bucket 最终会收到多少
+// 条记录 (bucket_counts，来自对完整 assignments[] 做一次 histogram——分配
+// 结果本来就要在任何向量真正落盘之前全部算完，这个 histogram 只是多扫一遍
+// 一个 int64 数组，代价和数据集大小、bucket 数都无关，可以忽略)。有了每个
+// bucket 的最终大小，就能提前算出它在合并文件里的字节区间 (前缀和)，直接把
+// 合并文件撑到最终总大小；每个 bucket 自己的写缓冲区攒满或者 finish_iteration
+// 收尾时，用 seekp 定位到这个 bucket 自己算好的游标位置写进去——数据从第一个
+//字节开始就已经躺在最终合并文件的正确位置上，不会有任何"先写小文件、再读
+// 回来、再拷贝、再删除"的回头路。add() 的调用方只保证"写之前 assignments[]
+// 已经全部算完"，不要求写入顺序跟 bucket id 顺序一致。
 template <typename DataT>
 struct BucketVectorAccumulator {
     std::string dir;
@@ -775,22 +785,20 @@ struct BucketVectorAccumulator {
     struct BucketBuf {
         std::vector<char> data;
         size_t capacity_records = 0;
-        size_t count = 0;         // 当前缓冲区里还没 flush 的记录数
-        int64_t total_count = 0;  // 这个 bucket 本轮总共写了多少条 (跨 flush 累计)
-        std::ofstream file;
+        size_t count = 0;           // 当前缓冲区里还没 flush 的记录数
+        int64_t total_count = 0;    // histogram 给出的、这个 bucket 本轮最终的记录数
+        int64_t added_so_far = 0;   // 实际 add() 调用次数，用来校验跟 histogram 是否一致
+        int64_t write_cursor = 0;   // 下次 flush 要 seekp 到的合并文件绝对字节偏移
     };
     std::vector<BucketBuf> bufs;
 
     std::string merged_path;
     std::vector<int64_t> merged_offset;  // 每个 bucket 在合并文件里的起始字节偏移
+    std::fstream merged_out;             // 本轮写句柄 (随机位置 seekp+write)
     std::ifstream merged_in;             // Step 6/7 共用的持久读句柄
 
     static constexpr size_t record_bytes(int64_t D) {
         return sizeof(int64_t) + static_cast<size_t>(D) * sizeof(DataT);
-    }
-
-    static std::string bucket_path(const std::string& dir, int64_t c) {
-        return dir + "/bucket_vec_" + std::to_string(c) + ".bin";
     }
 
     // total_buffer_budget_bytes: 所有 bucket 的写缓冲区加起来的总内存预算
@@ -822,14 +830,33 @@ struct BucketVectorAccumulator {
         return acc;
     }
 
-    void start_iteration() {
+    // bucket_counts[c] = 这一轮 bucket c 最终会被 add() 多少次 (来自对完整
+    // assignments[] 做 histogram，必须在任何 add() 调用之前就已知)。
+    void start_iteration(const std::vector<int64_t>& bucket_counts) {
+        size_t rec_bytes = record_bytes(D);
+        merged_offset.assign(static_cast<size_t>(n_centroids), 0);
+        int64_t pos = 0;
         for (int64_t c = 0; c < n_centroids; ++c) {
             auto& b = bufs[static_cast<size_t>(c)];
             b.count = 0;
-            b.total_count = 0;
-            b.file.open(bucket_path(dir, c), std::ios::binary | std::ios::out | std::ios::trunc);
-            if (!b.file.is_open())
-                throw std::runtime_error("BucketVectorAccumulator: cannot open " + bucket_path(dir, c));
+            b.total_count = bucket_counts[static_cast<size_t>(c)];
+            b.added_so_far = 0;
+            merged_offset[static_cast<size_t>(c)] = pos;
+            b.write_cursor = pos;
+            pos += b.total_count * static_cast<int64_t>(rec_bytes);
+        }
+
+        if (merged_out.is_open()) merged_out.close();
+        merged_out.clear();
+        merged_out.open(merged_path, std::ios::binary | std::ios::out | std::ios::trunc);
+        if (!merged_out.is_open())
+            throw std::runtime_error("BucketVectorAccumulator: cannot open " + merged_path + " for write");
+        if (pos > 0) {
+            // 提前把文件撑到这一轮的最终总大小，这样任何 bucket (包括最后一个,
+            // 即使它恰好是 0 条) 的 seekp 都落在一个早已存在、大小正确的文件里,
+            // 不依赖"写到哪文件才自动涨到哪"这种隐式行为。
+            merged_out.seekp(static_cast<std::streamoff>(pos - 1));
+            merged_out.put('\0');
         }
     }
 
@@ -837,66 +864,52 @@ struct BucketVectorAccumulator {
         auto& b = bufs[static_cast<size_t>(c)];
         if (b.count == 0) return;
         size_t rec_bytes = record_bytes(D);
-        b.file.write(b.data.data(), static_cast<std::streamsize>(b.count * rec_bytes));
-        if (!b.file.good())
+        size_t nbytes = b.count * rec_bytes;
+        merged_out.seekp(static_cast<std::streamoff>(b.write_cursor));
+        merged_out.write(b.data.data(), static_cast<std::streamsize>(nbytes));
+        if (!merged_out.good())
             throw std::runtime_error("BucketVectorAccumulator: flush failed for bucket " + std::to_string(c));
+        b.write_cursor += static_cast<int64_t>(nbytes);
         b.count = 0;
     }
 
-    // vec 必须指向恰好 D 个 DataT 分量。
+    // vec 必须指向恰好 D 个 DataT 分量。调用前 bucket_id 的 total_count (这一轮
+    // 最终会收到多少条) 必须已经通过 start_iteration 的 histogram 定好——add()
+    // 调用次数超过 histogram 给的数会直接越界写进下一个 bucket 的区间，所以这里
+    // 主动校验、宁可报错也不要静默写坏数据。
     void add(int64_t bucket_id, int64_t gid, const DataT* vec) {
         auto& b = bufs[static_cast<size_t>(bucket_id)];
+        if (b.added_so_far >= b.total_count)
+            throw std::runtime_error(
+                "BucketVectorAccumulator: add() exceeded histogram count for bucket "
+                + std::to_string(bucket_id) + " (histogram said "
+                + std::to_string(b.total_count) + ")");
+        ++b.added_so_far;
+
         size_t rec_bytes = record_bytes(D);
         size_t off = b.count * rec_bytes;
         std::memcpy(b.data.data() + off, &gid, sizeof(int64_t));
         std::memcpy(b.data.data() + off + sizeof(int64_t), vec, static_cast<size_t>(D) * sizeof(DataT));
         ++b.count;
-        ++b.total_count;
         if (b.count == b.capacity_records) flush_bucket(bucket_id);
     }
 
-    // 1) flush + 关闭所有 per-bucket 写文件; 2) 按 bucket 顺序把它们的内容
-    // 顺序拷贝进一个合并文件 (纯顺序 I/O，磁盘带宽 bound，不是 open 开销
-    // bound)，记录每个 bucket 的字节偏移，随后删掉对应的小文件; 3) 打开一个
-    // 持久的读句柄供 Step 6/7 使用。
+    // flush 每个 bucket 剩余的缓冲区尾部 (已经写在它自己算好的最终位置上，不需要
+    // 再合并/拷贝/删除任何东西)，校验每个 bucket 实际收到的记录数跟 histogram
+    // 一致 (否则说明调用方的 assignments/histogram 跟实际 add() 不匹配，数据
+    // 已经错位，必须立刻报错而不是让 Step 6 读到看似正常但错位的内容)，然后
+    // 打开一个持久的读句柄供 Step 6/7 使用。
     void finish_iteration() {
         for (int64_t c = 0; c < n_centroids; ++c) {
+            auto& b = bufs[static_cast<size_t>(c)];
             flush_bucket(c);
-            bufs[static_cast<size_t>(c)].file.close();
+            if (b.added_so_far != b.total_count)
+                throw std::runtime_error(
+                    "BucketVectorAccumulator: bucket " + std::to_string(c) + " got "
+                    + std::to_string(b.added_so_far) + " add() calls, expected "
+                    + std::to_string(b.total_count) + " from histogram");
         }
-
-        merged_offset.assign(static_cast<size_t>(n_centroids), 0);
-        std::ofstream mout(merged_path, std::ios::binary | std::ios::trunc);
-        if (!mout.is_open())
-            throw std::runtime_error("BucketVectorAccumulator: cannot open " + merged_path + " for write");
-
-        size_t rec_bytes = record_bytes(D);
-        int64_t pos = 0;
-        std::vector<char> copy_buf;
-        for (int64_t c = 0; c < n_centroids; ++c) {
-            merged_offset[static_cast<size_t>(c)] = pos;
-            int64_t cnt = bufs[static_cast<size_t>(c)].total_count;
-            if (cnt == 0) continue;
-
-            std::string p = bucket_path(dir, c);
-            size_t nbytes = static_cast<size_t>(cnt) * rec_bytes;
-            copy_buf.resize(nbytes);
-            {
-                std::ifstream in(p, std::ios::binary);
-                if (!in.is_open())
-                    throw std::runtime_error("BucketVectorAccumulator: cannot open " + p + " for merge");
-                in.read(copy_buf.data(), static_cast<std::streamsize>(nbytes));
-                if (!in.good())
-                    throw std::runtime_error("BucketVectorAccumulator: merge-read failed for bucket " + std::to_string(c));
-            }
-            mout.write(copy_buf.data(), static_cast<std::streamsize>(nbytes));
-            if (!mout.good())
-                throw std::runtime_error("BucketVectorAccumulator: merge-write failed for bucket " + std::to_string(c));
-            pos += static_cast<int64_t>(nbytes);
-
-            std::filesystem::remove(p);
-        }
-        mout.close();
+        merged_out.close();
 
         // merged_in may already be open from a previous iteration when this
         // object is being reused across rounds (not freshly make_unique'd) -
@@ -957,7 +970,8 @@ struct BucketVectorAccumulator {
     }
 
     void remove_all_files() {
-        merged_in.close();
+        if (merged_out.is_open()) merged_out.close();
+        if (merged_in.is_open()) merged_in.close();
         std::filesystem::remove(merged_path);
     }
 };
@@ -987,8 +1001,6 @@ struct VecBucket {
  * @param D                      向量维度
  * @param n_centroids            centroid 数量
  * @param centroid_global_indices 每个 centroid 在原始数据中的全局索引
- * @param bucket_vecs            每个点分配结果一确定，就把它的原始向量顺手写
- *                               进对应 bucket 的磁盘文件 (供 Step 6 顺序读取)
  * @param d_centroids            centroid 数据 (n_centroids * D, CentroidT, 已在 GPU)
  * @param centroid_gpu_bytes     centroid 数据在 GPU 上占用的字节数
  * @param d_graph                centroid KNN 图 (n_centroids * K, uint32, 已在 GPU)
@@ -997,11 +1009,12 @@ struct VecBucket {
  * @param quantizer              量化器（仅 CentroidT=uint8_t 时使用）
  * @param Mbatch_bytes           GPU 剩余可用空间 (bytes), 默认 10GB
  * @param search_max_iters       图搜索最大迭代次数, 默认 64
- * @param bucket_vecs            按桶散写原始向量的累加器；传 nullptr 跳过这次散写
- *                               （round 1 的 Step4 用——round 1 分配完之后马上会做
- *                               一次性重排直接写 data_reordered.<ext>，这份按桶散
- *                               写的临时文件对 round 1 来说本来就是白写，见
- *                               bucket.cu 主循环里 round 1 分支的注释）
+ *
+ * 本函数只负责算出 assignments[]，不写任何 bucket 向量数据——写入需要先知道
+ * 完整的 assignments[] 才能对每个 bucket 做 histogram、算出它在合并文件里的
+ * 字节区间 (见 BucketVectorAccumulator 的注释)，所以单独放在
+ * write_bucket_vectors_from_assignments() 里，由 caller 在拿到这个函数的
+ * 返回值之后再调用。
  *
  * @return  (N,) 每个点分配到的 local centroid index [0, n_centroids)
  */
@@ -1012,7 +1025,6 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     int64_t D,
     int64_t n_centroids,
     const std::vector<int64_t>& centroid_global_indices,
-    BucketVectorAccumulator<T>* bucket_vecs,
     CentroidT* d_centroids,
     size_t centroid_gpu_bytes,
     uint32_t* d_graph,
@@ -1026,8 +1038,8 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
 
     using Clock = std::chrono::high_resolution_clock;
     auto ba_t0 = Clock::now();
-    double t_centroid_prewrite = 0, t_setup = 0;
-    double t_read = 0, t_convert_upload = 0, t_search = 0, t_download = 0, t_cpu_assign = 0, t_bucket_write = 0;
+    double t_setup = 0;
+    double t_read = 0, t_convert_upload = 0, t_search = 0, t_download = 0, t_cpu_assign = 0;
 
     // ================================================================
     // Step 0: 建立 centroid 集合，收集非 centroid 点索引
@@ -1043,24 +1055,6 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         }
     }
     int64_t N_nc = static_cast<int64_t>(non_centroid_indices.size());
-
-    // centroid 自己的点不走下面的 batch 循环 (提前分配给自身)，这里单独把它们
-    // 的原始向量补写进各自的 bucket 文件。n_centroids 条，一次性小读，不是要
-    // 避免的那种"整份数据集常驻"。
-    {
-        auto t_pre0 = Clock::now();
-        if (bucket_vecs) {
-            std::vector<T> centroid_vecs_raw;
-            int32_t N_tmp, D_tmp;
-            load::read_bigann_raw_sampled<T>(input_path, centroid_global_indices,
-                                              centroid_vecs_raw, N_tmp, D_tmp);
-            for (int64_t c = 0; c < n_centroids; ++c) {
-                bucket_vecs->add(c, centroid_global_indices[c],
-                                centroid_vecs_raw.data() + static_cast<size_t>(c) * D);
-            }
-        }
-        t_centroid_prewrite = std::chrono::duration<double>(Clock::now() - t_pre0).count();
-    }
 
     std::cout << "[BatchAssign] N=" << N
               << ", centroids=" << n_centroids
@@ -1250,22 +1244,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             assignments[gi] = chosen;
             cluster_sizes[chosen].fetch_add(1, std::memory_order_relaxed);
         }
-        auto tb5 = Clock::now();
-        t_cpu_assign += std::chrono::duration<double>(tb5 - tb4).count();
-
-        // ---- 4e: 串行把这批点的原始向量写进各自 bucket 的文件 ----
-        // 分配结果已经在上面那个并行循环里拍板定案、不会再改；raw_batch 这批
-        // 原始向量本来就在内存里 (刚从磁盘顺序读出来的)，直接顺手写掉，不需要
-        // 再读一遍磁盘。串行是因为多个点可能落到同一个 bucket，避免并发写同一
-        // 个 BucketBuf 的数据竞争；这一步只是内存 memcpy + 偶尔 flush，很快。
-        if (bucket_vecs) {
-            for (int64_t i = 0; i < batch_size; ++i) {
-                int64_t gi = non_centroid_indices[batch_start + i];
-                int64_t local = gi - batch_lo;
-                bucket_vecs->add(assignments[gi], gi, raw_batch.data() + local * D);
-            }
-        }
-        t_bucket_write += std::chrono::duration<double>(Clock::now() - tb5).count();
+        t_cpu_assign += std::chrono::duration<double>(Clock::now() - tb4).count();
 
         if ((batch_start / Nv) % 10 == 0 || batch_end == N_nc) {
             std::cout << "[BatchAssign] " << batch_end << "/" << N_nc << "\n";
@@ -1294,17 +1273,108 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
               << " max=" << max_sz
               << " avg=" << std::fixed << std::setprecision(1) << avg_sz << "\n";
     double ba_total = std::chrono::duration<double>(Clock::now() - ba_t0).count();
-    std::cout << "  [Step4 timing] centroid_prewrite=" << std::fixed << std::setprecision(3) << t_centroid_prewrite
-              << "s setup=" << t_setup
+    std::cout << "  [Step4 timing] setup=" << std::fixed << std::setprecision(3) << t_setup
               << "s read=" << t_read
               << "s convert_upload=" << t_convert_upload
               << "s search=" << t_search
               << "s download=" << t_download
               << "s cpu_assign=" << t_cpu_assign
-              << "s bucket_write=" << t_bucket_write
               << "s total=" << ba_total << "s\n";
 
     return assignments;
+}
+
+/**
+ * 把完整的 assignments[]（batch_assign_with_cagra_anns 的返回值，这一轮每个
+ * 点最终分到哪个 bucket 已经全部拍板）写进 bucket_vecs：先对 assignments[]
+ * 做一次 histogram 得到每个 bucket 最终的记录数，用它调用
+ * BucketVectorAccumulator::start_iteration()（这样每个 bucket 在合并文件里
+ * 的字节区间提前算好，add() 直接写到最终位置，不会有任何小文件/合并/删除的
+ * 来回——见 BucketVectorAccumulator 顶部的注释），再顺序分块重新读一遍原始
+ * 数据集（纯 I/O，不需要 GPU，所以跟 batch_assign_with_cagra_anns 的 GPU
+ * batch 大小无关，这里用单独的、只受 host 内存约束的 chunk 大小），对每个点
+ * 调用 add()。
+ *
+ * 之所以要再读一遍磁盘而不是复用 batch_assign 内部已经读过的 raw_batch：
+ * 对点 i 的 bucket 分配是否已经最终确定，取决于之后所有点的分配结果（负载
+ * 均衡用的 cluster_sizes 是全程累计的），所以在 batch_assign 返回、
+ * assignments[] 完全确定之前，不能提前对任何一个 bucket 做 histogram、也
+ * 不能对任何一条记录定下它在合并文件里的最终位置——这意味着"边算边写"
+ * (原来的做法) 和"先算完、histogram、再写"这两种方式，天然要么牺牲掉
+ * histogram（原来的小文件方案），要么多付一次顺序读的代价（这里）。多一次
+ * 顺序读的开销只跟数据集总大小成正比，而小文件方案的系统调用开销是跟桶的
+ * 数量成正比——未来桶数量再扩大百倍千倍时，顺序读的代价不变规律，小文件的
+ * 代价会线性放大，所以这个取舍在大规模场景下是划算的。
+ */
+template <typename DataT>
+void write_bucket_vectors_from_assignments(
+    const std::string& input_path,
+    int64_t N,
+    int64_t D,
+    int64_t n_centroids,
+    const std::vector<int64_t>& centroid_global_indices,
+    const std::vector<int64_t>& assignments,
+    BucketVectorAccumulator<DataT>& bucket_vecs,
+    int64_t chunk_bytes_budget = 512LL * 1024 * 1024)
+{
+    using Clock = std::chrono::high_resolution_clock;
+    auto t0 = Clock::now();
+
+    // ---- histogram + start_iteration: 提前给每个 bucket 定好最终字节区间 ----
+    std::vector<int64_t> bucket_counts(static_cast<size_t>(n_centroids), 0);
+    for (int64_t i = 0; i < N; ++i) {
+        int64_t c = assignments[static_cast<size_t>(i)];
+        if (c >= 0) ++bucket_counts[static_cast<size_t>(c)];
+    }
+    bucket_vecs.start_iteration(bucket_counts);
+    double t_hist_start = std::chrono::duration<double>(Clock::now() - t0).count();
+
+    // ---- centroid 自己的向量: n_centroids 条，一次性小读 ----
+    auto t_pre0 = Clock::now();
+    {
+        std::vector<DataT> centroid_vecs_raw;
+        int32_t N_tmp, D_tmp;
+        load::read_bigann_raw_sampled<DataT>(input_path, centroid_global_indices,
+                                              centroid_vecs_raw, N_tmp, D_tmp);
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            bucket_vecs.add(c, centroid_global_indices[c],
+                             centroid_vecs_raw.data() + static_cast<size_t>(c) * D);
+        }
+    }
+    double t_centroid_write = std::chrono::duration<double>(Clock::now() - t_pre0).count();
+
+    // ---- 剩下的点: 顺序分块重新读磁盘 + add()，纯 I/O，不需要 GPU batching 的
+    //      那套内存约束，chunk 大小只受 host 内存预算控制 ----
+    std::unordered_set<int64_t> centroid_set(
+        centroid_global_indices.begin(), centroid_global_indices.end());
+    int64_t chunk_points = std::max<int64_t>(
+        1, chunk_bytes_budget / std::max<int64_t>(1, D * static_cast<int64_t>(sizeof(DataT))));
+
+    double t_read = 0, t_write = 0;
+    for (int64_t lo = 0; lo < N; lo += chunk_points) {
+        int64_t hi = std::min(lo + chunk_points, N) - 1;
+
+        auto tr0 = Clock::now();
+        std::vector<DataT> raw_chunk;
+        int32_t N_tmp, D_tmp;
+        load::read_bigann_raw_range<DataT>(input_path, lo, hi - lo + 1, raw_chunk, N_tmp, D_tmp);
+        t_read += std::chrono::duration<double>(Clock::now() - tr0).count();
+
+        auto tw0 = Clock::now();
+        for (int64_t gi = lo; gi <= hi; ++gi) {
+            if (centroid_set.find(gi) != centroid_set.end()) continue;  // 上面已经写过
+            bucket_vecs.add(assignments[static_cast<size_t>(gi)], gi,
+                             raw_chunk.data() + static_cast<size_t>(gi - lo) * D);
+        }
+        t_write += std::chrono::duration<double>(Clock::now() - tw0).count();
+    }
+
+    double total = std::chrono::duration<double>(Clock::now() - t0).count();
+    std::cout << "  [BucketWrite timing] hist_start=" << std::fixed << std::setprecision(3) << t_hist_start
+              << "s centroid_write=" << t_centroid_write
+              << "s read=" << t_read
+              << "s write=" << t_write
+              << "s total=" << total << "s\n";
 }
 
 // ============== Phase 9: GPU helper kernels ==============
@@ -4082,11 +4152,10 @@ int run_pipeline_impl(
         // n_centroids/D 在实践中逐轮不变 (KMeans|| 候选数只要够用，最终选出的
         // 数量恒等于 config.centroid_ratio 定的目标值)，这时候整个对象重新
         // make_unique/create 纯粹是重新分配一遍跟上一轮内容无关的 ~1GB host
-        // buffer，白白浪费。只有维度真的变了 (或者还没创建过) 才重新 create；
-        // 否则复用同一个对象，靠 start_iteration() 重置状态 + 重新截断打开
-        // 每个桶的文件 (下面那一步，不受这里影响)。
-        // 磁盘上的文件名固定是 bucket_vec_<c>.bin，start_iteration() 会把本轮
-        // 用到的都 truncate 掉，不用手动清上一轮的。
+        // buffer，白白浪费。只有维度真的变了 (或者还没创建过) 才重新 create。
+        // start_iteration() 现在需要知道这一轮每个 bucket 最终的记录数 (histogram)
+        // 才能把它们在合并文件里的字节区间提前算好——这个数要等 Step 4 的
+        // assignments[] 全部算完才知道，所以挪到 Step 4 里调用，这里只管 create。
         auto t2_bvc0 = Clock::now();
         if (!bucket_vecs_ptr || bucket_vecs_ptr->n_centroids != n_centroids || bucket_vecs_ptr->D != D) {
             bucket_vecs_ptr = std::make_unique<BucketVectorAccumulator<DataT>>(
@@ -4094,9 +4163,6 @@ int run_pipeline_impl(
                     bucket_vec_dir, n_centroids, D, config.bucket_vec_buffer_bytes));
         }
         double t2_bucket_vec_create = std::chrono::duration<double>(Clock::now() - t2_bvc0).count();
-        auto t2_bvs0 = Clock::now();
-        bucket_vecs_ptr->start_iteration();
-        double t2_bucket_vec_start = std::chrono::duration<double>(Clock::now() - t2_bvs0).count();
 
         cudaDeviceSynchronize();
         double iter_step2 = std::chrono::duration<double>(Clock::now() - t2).count();
@@ -4104,7 +4170,6 @@ int run_pipeline_impl(
         std::cout << "  [Step2 outer timing] select_call=" << std::fixed << std::setprecision(3) << t2_select_call
                   << "s idx_map=" << t2_idx_map
                   << "s bucket_vec_create=" << t2_bucket_vec_create
-                  << "s bucket_vec_start=" << t2_bucket_vec_start
                   << "s total=" << iter_step2 << "s\n";
         std::cout << "  Step 2 done [" << std::fixed << std::setprecision(3) << iter_step2 << "s]\n";
 
@@ -4160,15 +4225,6 @@ int run_pipeline_impl(
         CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
         size_t Mbatch_bytes = static_cast<size_t>(free_bytes * 0.9);
 
-        // round 1 (iter==0) 分配完之后马上要做一次性重排，直接把数据写进
-        // data_reordered.<ext>（见本轮 Step4 之后的新增逻辑）；BucketVectorAccumulator
-        // 那份按桶散写的临时文件对 round 1 来说从头到尾都用不上，传 nullptr
-        // 让 batch_assign_with_cagra_anns 跳过这次写，省下这部分 I/O。
-        // bucket_vecs_ptr 本身仍然照常 create/start/finish（下面这些调用不用改），
-        // 只是 round 1 的这几个 bucket 文件全程是空的。
-        BucketVectorAccumulator<DataT>* bucket_vecs_for_step4 =
-            (iter == 0) ? nullptr : bucket_vecs_ptr.get();
-
         assignments.clear();
         if (mem_est.need_pq) {
             // PQ mode: centroids need to be encoded to uint8 on GPU
@@ -4191,7 +4247,7 @@ int run_pipeline_impl(
 
             assignments = batch_assign_with_cagra_anns<DataT, uint8_t>(
                 working_input_path, N, D, n_centroids,
-                centroid_global_indices, bucket_vecs_for_step4,
+                centroid_global_indices,
                 d_centroids_u8, u8_bytes,
                 d_graph, graph_bytes,
                 K, quantizer, Mbatch_bytes, search_max_iters);
@@ -4201,7 +4257,7 @@ int run_pipeline_impl(
             // Non-PQ mode: use float32 centroids directly
             assignments = batch_assign_with_cagra_anns<DataT, float>(
                 working_input_path, N, D, n_centroids,
-                centroid_global_indices, bucket_vecs_for_step4,
+                centroid_global_indices,
                 d_centroids_f32, centroid_gpu_bytes,
                 d_graph, graph_bytes,
                 K, quantizer, Mbatch_bytes, search_max_iters);
@@ -4224,7 +4280,23 @@ int run_pipeline_impl(
         double t4_graph_dl_free = std::chrono::duration<double>(Clock::now() - t4).count()
                                    - t4_centroids_dl - t4_assign_call;
 
-        // flush 掉这一轮所有 bucket 的写缓冲区，Step 6 才能安全地整块读它们。
+        // round 1 (iter==0) 分配完之后马上要做一次性重排，直接把数据写进
+        // data_reordered.<ext>（见本轮 Step4 之后的新增逻辑）；BucketVectorAccumulator
+        // 那份按桶散写的缓存对 round 1 来说从头到尾都用不上，只把它置成"本轮
+        // 全空"状态 (histogram 全 0)，不花时间真的重新读一遍磁盘去写。
+        // round 2..t 才真正调用 write_bucket_vectors_from_assignments 写数据。
+        auto t4_bw0 = Clock::now();
+        if (iter == 0) {
+            bucket_vecs_ptr->start_iteration(std::vector<int64_t>(static_cast<size_t>(n_centroids), 0));
+        } else {
+            write_bucket_vectors_from_assignments<DataT>(
+                working_input_path, N, D, n_centroids,
+                centroid_global_indices, assignments, *bucket_vecs_ptr);
+        }
+        double t4_bucket_write = std::chrono::duration<double>(Clock::now() - t4_bw0).count();
+
+        // flush 掉这一轮所有 bucket 剩余的写缓冲区尾部，Step 6 才能安全地整块
+        // 读它们。
         auto t4_fin0 = Clock::now();
         bucket_vecs_ptr->finish_iteration();
         double t4_finish_iteration = std::chrono::duration<double>(Clock::now() - t4_fin0).count();
@@ -4234,6 +4306,7 @@ int run_pipeline_impl(
         std::cout << "  [Step4 outer timing] centroids_dl=" << std::fixed << std::setprecision(3) << t4_centroids_dl
                   << "s assign_call=" << t4_assign_call
                   << "s graph_dl_free=" << t4_graph_dl_free
+                  << "s bucket_write=" << t4_bucket_write
                   << "s finish_iteration=" << t4_finish_iteration
                   << "s total=" << iter_step4 << "s\n";
         std::cout << "  Step 4 done [" << std::fixed << std::setprecision(3) << iter_step4 << "s]\n";
