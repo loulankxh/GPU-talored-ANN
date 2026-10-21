@@ -1,0 +1,146 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 459a55c..0bfb6ed 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -1197,8 +1197,14 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+     // Nv 分批，显存仍受 Mbatch_bytes 约束，不依赖整份数据集在 GPU 上)。
+     const bool use_bf = !is_pq;
+     std::optional<cuvs::neighbors::brute_force::index<float, float>> bf_idx;
+-    int64_t* d_top2_i64 = nullptr;
++    // brute-force 一次取 BF_K=4 个最近 centroid: 前两个走原来的均衡规则，
++    // 后两个只在 bucket 超过上限时当备选 (见 4d)。
++    constexpr uint32_t BF_K = 4;
++    int64_t* d_top2_i64 = nullptr;     // (Nv, BF_K)
++    float*   d_bf_dist  = nullptr;     // (Nv, BF_K)
+     std::vector<int64_t> h_top2_i64;
++    std::vector<float>   h_bf_dist;
++    std::vector<uint32_t> h_cand;      // (Nv, BF_K) 按 (距离, id) 排好序的 local idx
+     if constexpr (!is_pq) {
+         if (use_bf) {
+             cuvs::neighbors::brute_force::index_params bp;
+@@ -1206,11 +1212,18 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+             bf_idx.emplace(cuvs::neighbors::brute_force::build(res, bp,
+                 raft::make_device_matrix_view<const float, int64_t>(
+                     d_centroids, n_centroids, static_cast<int64_t>(D))));
+-            CUDA_CHECK(cudaMalloc(&d_top2_i64, Nv * TOP_K * sizeof(int64_t)));
+-            h_top2_i64.resize(static_cast<size_t>(Nv) * TOP_K);
++            CUDA_CHECK(cudaMalloc(&d_top2_i64, Nv * BF_K * sizeof(int64_t)));
++            CUDA_CHECK(cudaMalloc(&d_bf_dist,  Nv * BF_K * sizeof(float)));
++            h_top2_i64.resize(static_cast<size_t>(Nv) * BF_K);
++            h_bf_dist.resize(static_cast<size_t>(Nv) * BF_K);
++            h_cand.resize(static_cast<size_t>(Nv) * BF_K);
+         }
+     }
+ 
++    // 上限 = 8x 平均 bucket 大小 (N / n_centroids)
++    const int64_t bucket_cap = 8 * std::max<int64_t>(1, N / std::max<int64_t>(1, n_centroids));
++    int64_t n_capped = 0;
++
+     t_setup = std::chrono::duration<double>(Clock::now() - t_setup0).count();
+ 
+     for (int64_t batch_start = 0; batch_start < N_nc; batch_start += Nv) {
+@@ -1315,8 +1328,9 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+                     raft::make_device_matrix_view<const float, int64_t>(
+                         d_queries, batch_size, static_cast<int64_t>(D)),
+                     raft::make_device_matrix_view<int64_t, int64_t>(
+-                        d_top2_i64, batch_size, static_cast<int64_t>(TOP_K)),
+-                    distances_view);
++                        d_top2_i64, batch_size, static_cast<int64_t>(BF_K)),
++                    raft::make_device_matrix_view<float, int64_t>(
++                        d_bf_dist, batch_size, static_cast<int64_t>(BF_K)));
+                 searched_bf = true;
+             }
+         }
+@@ -1332,18 +1346,29 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+         // ---- 4c: 下载 top-2 local centroid indices ----
+         if (searched_bf) {
+             CUDA_CHECK(cudaMemcpy(h_top2_i64.data(), d_top2_i64,
+-                                  batch_size * TOP_K * sizeof(int64_t),
+-                                  cudaMemcpyDeviceToHost));
+-            // bounds check: brute-force 结果必须是 [0, n_centroids) 内的 local idx
++                                  batch_size * BF_K * sizeof(int64_t), cudaMemcpyDeviceToHost));
++            CUDA_CHECK(cudaMemcpy(h_bf_dist.data(), d_bf_dist,
++                                  batch_size * BF_K * sizeof(float), cudaMemcpyDeviceToHost));
++            // bounds check: brute-force 结果必须是 [0, n_centroids) 内的 local idx。
++            // 每行按 (距离, id) 排序: 距离相等时 select_k 的先后不确定 (SIFT 有
++            // 大量完全重复的向量)，按 id 定序保证同一输入结果可复现。
+             int64_t n_bad = 0;
+             #pragma omp parallel for schedule(static) reduction(+:n_bad)
+-            for (int64_t i = 0; i < batch_size * static_cast<int64_t>(TOP_K); ++i) {
+-                int64_t v = h_top2_i64[static_cast<size_t>(i)];
+-                if (v < 0 || v >= n_centroids) { ++n_bad; v = 0; }
+-                h_top2[static_cast<size_t>(i)] = static_cast<uint32_t>(v);
++            for (int64_t i = 0; i < batch_size; ++i) {
++                std::pair<float, uint32_t> row[BF_K];
++                for (uint32_t k = 0; k < BF_K; ++k) {
++                    int64_t v = h_top2_i64[static_cast<size_t>(i) * BF_K + k];
++                    if (v < 0 || v >= n_centroids) { ++n_bad; v = 0; }
++                    row[k] = {h_bf_dist[static_cast<size_t>(i) * BF_K + k], static_cast<uint32_t>(v)};
++                }
++                std::sort(row, row + BF_K);
++                for (uint32_t k = 0; k < BF_K; ++k)
++                    h_cand[static_cast<size_t>(i) * BF_K + k] = row[k].second;
++                h_top2[static_cast<size_t>(i) * TOP_K]     = row[0].second;
++                h_top2[static_cast<size_t>(i) * TOP_K + 1] = row[1].second;
+             }
+             if (n_bad > 0)
+-                throw std::runtime_error("batch_assign: brute-force top-2 returned " +
++                throw std::runtime_error("batch_assign: brute-force top-k returned " +
+                                          std::to_string(n_bad) + " out-of-range centroid ids");
+         } else {
+             CUDA_CHECK(cudaMemcpy(h_top2.data(), d_top2,
+@@ -1353,8 +1378,10 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+         auto tb4 = Clock::now();
+         t_download += std::chrono::duration<double>(tb4 - tb3).count();
+ 
+-        // ---- 4d: CPU 并行: local idx -> global idx 映射 + 均衡分配 ----
+-        #pragma omp parallel for schedule(static)
++        // ---- 4d: local idx -> global idx 映射 + 均衡分配 (串行) ----
++        // 原来 OpenMP 并行、cluster_sizes relaxed 读写：结果随线程调度变化，
++        // 跟线程调度有关。串行贪心按点序处理，同一组 top-k 每次结果一样；
++        // 99 万点 ~十几 ms。
+         for (int64_t i = 0; i < batch_size; ++i) {
+             uint32_t local_idx1 = h_top2[i * TOP_K];      // 最近
+             uint32_t local_idx2 = h_top2[i * TOP_K + 1];  // 第二近
+@@ -1372,6 +1399,23 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+             } else {
+                 chosen = local_idx1;  // 分配到最近的聚类 1
+             }
++            // bucket 大小上限 (brute-force 路径): 选中的 bucket 已满 cap 时，按距离
++            // 顺序取前 BF_K 个 centroid 里第一个没满的；都满就取最小的。原来密集
++            // 重复向量区域偶尔吸进 ~30x 平均大小的 bucket，Step 6 显存按最大
++            // bucket 分配 (out-of-core 显存预算因此失控)。
++            if (searched_bf && cluster_sizes[chosen].load(std::memory_order_relaxed) >= bucket_cap) {
++                const uint32_t* cand = h_cand.data() + static_cast<size_t>(i) * BF_K;
++                uint32_t best = cand[0];
++                int64_t best_sz = std::numeric_limits<int64_t>::max();
++                bool found = false;
++                for (uint32_t k = 0; k < BF_K && !found; ++k) {
++                    int64_t sz = cluster_sizes[cand[k]].load(std::memory_order_relaxed);
++                    if (sz < bucket_cap) { chosen = cand[k]; found = true; }
++                    else if (sz < best_sz) { best_sz = sz; best = cand[k]; }
++                }
++                if (!found) chosen = best;
++                ++n_capped;
++            }
+ 
+             int64_t gi = non_centroid_indices[batch_start + i];
+             assignments[gi] = chosen;
+@@ -1391,6 +1435,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+     if (d_top2)       CUDA_CHECK(cudaFree(d_top2));
+     if (d_distances)  CUDA_CHECK(cudaFree(d_distances));
+     if (d_top2_i64)   CUDA_CHECK(cudaFree(d_top2_i64));
++    if (d_bf_dist)    CUDA_CHECK(cudaFree(d_bf_dist));
+     if (d_raw_range)  CUDA_CHECK(cudaFree(d_raw_range));
+     if (d_local_rows) CUDA_CHECK(cudaFree(d_local_rows));
+     // NOTE: d_centroids 和 d_graph 由 caller 管理，本函数不释放
+@@ -1405,6 +1450,9 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+         avg_sz += sz;
+     }
+     avg_sz /= n_centroids;
++    if (n_capped > 0)
++        std::cout << "[BatchAssign] bucket cap " << bucket_cap << ": " << n_capped
++                  << " points redirected to a farther centroid\n";
+     std::cout << "[BatchAssign] Done. Cluster size: min=" << min_sz
+               << " max=" << max_sz
+               << " avg=" << std::fixed << std::setprecision(1) << avg_sz << "\n";

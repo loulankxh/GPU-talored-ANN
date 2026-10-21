@@ -76,6 +76,7 @@ Other:
 
 | # | idea | result | reason |
 |---|---|---|---|
+| 14 | **Bounded bucket size** (robustness, not speed): balanced assignment made serial (no relaxed-atomic race), brute-force top-4 with (distance, id) ordering, cap = 8× avg bucket size — when the chosen bucket is full take the nearest of the 4 that is not, else the smallest. Patch kept: `bucketDemo/patches/iter14_bucket_cap.patch` | auto 16.61 s (−2.7%), large 37.19 s (−2.3%); max bucket ≤ 1005 in all 6 reps (was up to 3201), large-path GPU peak a steady 1252 MiB in all reps; search recall unchanged within 0.0006 | judge: no ≥3% speed gain (by design — it fixes the flaky large-path GPU-memory gate, see #9/#13). **Needs a user decision** to apply outside the speed rule. Note: the build is still not bit-reproducible with a fixed seed — Step 3 (centroid graph) / bucket order also vary run to run |
 | 12 | k-means|| (Step 2): update d(x, C) incrementally with only the newly sampled candidates + elementwise min (cuVS 26.12 `cluster/detail/kmeans.cuh::initScalableKMeansPlusPlus`), instead of recomputing against all candidates each round; same sampled candidates (counts identical) | auto 15.42 s (+4.5%) then rerun 15.74 s (+2.5%); large 39.51 s (−1.4%): Step 2 4.67 → 3.43 s but the final background-merge wait grew 2.02 → 2.92 s (Step 2 was hiding the previous round's ChunkedKNN merge) | borderline gain not confirmed on rerun. Retry together with a faster out-of-core merge (`merge_iteration` write_running ~1.1 s/chunk), where the Step 2 saving would show up on the large path too |
 
 ## Iterations
