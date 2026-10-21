@@ -1472,7 +1472,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 **Verdict:** ACCEPT — speedup vs previous best: 10M-auto +14.7% (138.79 → 118.38 s, **0.97× CAGRA native**), 1M-auto +5.3% (7.18 → 6.80 s), 1M-large +1.5%.
 
-### #52 — optimize_chunked method E: GPU phase 2 with staged device memory (fits SIFT10M)  (2026-10-21, commit TBD)
+### #52 — optimize_chunked method E: GPU phase 2 with staged device memory (fits SIFT10M)  (2026-10-21, commit 0e0c2aa)
 **Idea / rationale:** the GPU phase 2 from #39 allocated everything at once (dst/src/rank/64-bit idx/key2 + output, ~14.8 GB at 3.2 × 10⁸ edges) next to the 3.2 GB scatter buffer, so on SIFT10M it fell back to the 8 s CPU phase 2 (fallback added after the SIFT10M OOM). Now: (1) unpack the edges, then free the scatter buffer (single chunk, single drain: never used again); (2) 32-bit sort index instead of 64-bit (E < 2³², checked); (3) after building the (dst, rank) key, free dst / rank / idx before the second radix sort; (4) allocate the output only after freeing key2. Peak ≈ 24 B/edge + forward graph + output. The fit check now tests both phases: unpack with the scatter buffer resident, and sort after releasing it. CPU phase 2 is still the fallback. Same sort / merge rules as before (output byte-identical to the CPU path, verified in #39).
 **Files:** `bucketDemo/buildBucket/src/optimize_chunked.cu`
 **Params changed:** none
