@@ -1305,7 +1305,7 @@ Borderline → large rerun (`runs/iter38/sift1M_large_b`): 13.98 s (+5.6%), reca
 ### Loop rule change (user, 2026-10-21, 2nd)
 SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, third argument of `judge.py`). A >= 3% SIFT10M build-time gain is accepted as long as neither SIFT1M config is > 3% slower and search passes. SIFT10M quality uses the large-path rule (recall@10 >= CAGRA - 5% at every itopk). The CAGRA SIFT10M search reference was measured now on `evalCuvs/baseline/cagra_sift10M_64_32.bin` (0.8672 / 0.9463 / 0.9839 / 0.9959 / 0.9992). The large-path memory guard also covers SIFT10M. The SIFT10M baseline in best.json is the post-#46 run (`runs/sift10M_after46`, 178.47 s). judge.py: the recall tolerance now follows the path the run took (it used the config-name suffix, i.e. the resident 1% for sift10M_auto).
 
-### #47 — incremental KMeans|| d(x, C) (retry of #12/#15, user request)  (2026-10-21, commit TBD)
+### #47 — incremental KMeans|| d(x, C) (retry of #12/#15, user request)  (2026-10-21, commit 140170e)
 **Idea / rationale:** enter each KMeans|| round with the running min distance d(x, C); compute distances only to the round's new candidates (`min_cluster_distance` vs `CpRaw`) and merge them with `thrust::minimum`. This skips the redundant round-0 recompute and the last-round update nothing reads: work per round goes from all candidates (1 → ~5K → ~10K) to the ~5K new ones. Follows cuVS 26.12 `cluster/detail/kmeans.cuh::initScalableKMeansPlusPlus`. Round-1 candidate counts are identical to the old code (5020 / 5017 / 5026). Judged under the new SIFT10M rule on the measurements from the first #47 run (same code).
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
