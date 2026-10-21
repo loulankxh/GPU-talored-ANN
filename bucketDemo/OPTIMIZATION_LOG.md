@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#49 (shared per-row threshold in block top-M + out-of-core submit trims / vectorized gather)**, 2026-10-21:
+After **#50 (Step 4: CAGRA graph search with itopk 32 instead of exact GEMM when centroids > 32K)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **7.20** (0.62x CAGRA) | 0.9293 / 0.9769 / 0.9945 | 2226K / 1191K |
-| SIFT1M large (out-of-core path) | **10.91** (0.95x CAGRA) | 0.9142 / 0.9710 / 0.9920 | 1946K / 1033K |
-| SIFT10M auto (→ large path, 1 run) | **157.00** (1.28x CAGRA) | 0.8403 / 0.9289 / 0.9736 | 1871K / 1012K |
+| SIFT1M auto (GPU-resident) | **7.18** (0.62x CAGRA) | 0.9288 / 0.9770 / 0.9944 | 1948K / 1035K |
+| SIFT1M large (out-of-core path) | **11.11** (0.96x CAGRA; rerun) | see #50 | |
+| SIFT10M auto (→ large path, 1 run) | **138.79** (1.13x CAGRA) | 0.8379 / 0.9283 / 0.9738 | 1870K / 1011K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -1387,6 +1387,49 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8403 / 1871K | 0.9289 / 1012K | 0.9736 / 526K | 0.9920 / 186K | 0.9981 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +6.4% (11.66 → 10.91 s, 0.95× CAGRA native), 10M-auto +4.1% (163.74 → 157.00 s), 1M-auto +2.4% (7.38 → 7.20 s).
+
+### #50 — Step 4 assignment: exact fp16 GEMM only up to 32K centroids, CAGRA graph search (itopk 32) above  (2026-10-21, commit TBD)
+**Idea / rationale:** the exact top-2 assignment (#7/#8/#22: fp16 GEMM vs all centroids + top-2 kernel) costs ∝ N × n_centroids. Each 4096-query tile also writes and re-reads a 4096 × n_centroids fp32 dots matrix, so at SIFT10M (9.9M points × 100K centroids) the round is memory-bound: 11.1 s/round "search", ~7.8 TB of dots traffic. CAGRA single-CTA search on the centroid KNN graph (cuVS `cagra::search`, already the PQ / fallback path; cost ∝ N × log n_centroids) is cheaper once the centroids are many. Since only the top 2 are needed, itopk drops 64 → 32 (smallest 32-aligned value). SIFT10M one-round measurements: exact 11.15 s, CAGRA itopk 64 9.27 s, CAGRA itopk 32 5.19 s; bucket sizes the same (max 850–862, avg 100). SIFT1M (10K centroids) keeps the exact path (0.12 s/round vs ~0.7 s for CAGRA). Env overrides: `BUCKET2_EXACT_ASSIGN_MAX` (default 32768), `BUCKET2_ASSIGN_ITOPK` (default 32).
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+**Noise rerun:** first SIFT1M-large run 11.30 s (−3.6%, Steps 2/4/6 each +0.1 s; that path's code is unchanged, it uses the exact assignment) → rerun `sift1M_large_b` 11.11 s (−1.8%), judged with the rerun.
+**SIFT10M:** Step 4 39.6 → 20.0 s, bucket2 133.2 → 115.1 s, GPU peak 9454 → 7810 MiB.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 7.18 | +0.3% | +67.0% | 0.62x | bucket2 7.18 | 3774 | 1.79 |
+| sift1M_large | large | 11.11 | -1.8% | +85.2% | 0.96x | bucket2 9.12, prune 0.85, optimize_chunked 0.63, translate 0.43 | 2052 | 2.76 |
+| sift10M_auto | large | 138.79 | +11.6% | +22.2% | 1.13x | bucket2 115.06, prune 7.03, optimize_chunked 13.27, translate 3.43 | 7810 | 19.73 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.64 | 0.67 | 0.10 | 0.00 | 0.69 | 0.44 | 0.02 | 3.14 | 0.00 | 0.92 |
+| sift1M_large | 0.57 | 0.99 | 0.22 | 0.00 | 1.18 | 0.41 | 0.04 | 4.39 | 0.52 | 0.00 |
+| sift10M_auto | 5.44 | 34.78 | 1.93 | 0.00 | 20.01 | 2.83 | 0.30 | 43.66 | 4.41 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9740 | 0.9671 | 0.9601 | 0.9541 |
+| sift1M_large | 0.9749 | 0.9667 | 0.9591 | 0.9530 |
+| sift10M_auto | 0.9189 | 0.8990 | 0.8841 | 0.8728 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9288 / 1948K | 0.9770 / 1035K | 0.9944 / 523K | 0.9987 / 188K | 0.9997 / 68K |
+| ours sift1M_large | 0.9150 / 1946K | 0.9708 / 1035K | 0.9923 / 533K | 0.9983 / 189K | 0.9995 / 68K |
+| ours sift10M_auto | 0.8379 / 1870K | 0.9283 / 1011K | 0.9738 / 525K | 0.9921 / 187K | 0.9979 / 68K |
+
+**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +11.6% (157.00 → 138.79 s, 1.13× CAGRA native), 1M-auto +0.3%, 1M-large −1.8% (rerun; within the 3% tolerance).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

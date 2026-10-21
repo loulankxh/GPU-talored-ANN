@@ -1305,7 +1305,13 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     // 用 cagra::search 替代手写 kernel; queries != centroids, 不需 self-exclusion.
     constexpr uint32_t TOP_K = 2;
     // CAGRA itopk_size 至少 TOP_K, 32 对齐, floor 64
-    const uint32_t itopk = std::max<uint32_t>(64, ((TOP_K + 31) / 32) * 32);
+    static const uint32_t itopk_floor = [] {
+        const char* e = std::getenv("BUCKET2_ASSIGN_ITOPK");
+        // 只要 top-2: itopk 32 (cuVS 允许的最小 32 对齐值) 比 64 快一倍
+        // (SIFT10M 100K centroids: 9.3 → 5.2 s/轮)，BUCKET2_ASSIGN_ITOPK 可调
+        return e ? static_cast<uint32_t>(std::atoi(e)) : 32u;
+    }();
+    const uint32_t itopk = std::max<uint32_t>(itopk_floor, ((TOP_K + 31) / 32) * 32);
 
     // Per-point GPU (CAGRA 不再需要 buf_idx/dist/visited):
     //   query:       D * sizeof(CentroidT)
@@ -1389,13 +1395,23 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     constexpr bool kExactF16 = !is_pq &&
         (std::is_same<T, uint8_t>::value || std::is_same<T, int8_t>::value);
     constexpr int64_t kF16Tile = 4096;   // query tile: dots = 4096 × n_centroids × 4 B (10K centroids: 164 MB)
+    // 精确 GEMM 的代价 ∝ N × n_centroids (每个 query tile 还要写回再读一遍
+    // tile × n_centroids 的 dots)，centroid 多了以后 (SIFT10M: 100K) 反而比
+    // CAGRA 图搜索 (代价 ∝ N × log n_centroids) 慢；超过阈值走 CAGRA。
+    static const int64_t exact_max = [] {
+        const char* e = std::getenv("BUCKET2_EXACT_ASSIGN_MAX");
+        // SIFT1M (10K centroids) 精确 0.12 s/轮 vs CAGRA ~0.7 s；SIFT10M (100K)
+        // 精确 11.1 s/轮 vs CAGRA (itopk 32) 5.2 s。BUCKET2_EXACT_ASSIGN_MAX 可调
+        return e ? std::atoll(e) : static_cast<int64_t>(32768);
+    }();
+    const bool exact_f16 = kExactF16 && n_centroids <= exact_max;
     cublasHandle_t f16_cublas = nullptr;
     __half*   d_cent_h  = nullptr;
     float*    d_cnorm   = nullptr;
     __half*   d_q_h     = nullptr;
     float*    d_f16_dots = nullptr;
     uint32_t* d_top2_u32 = nullptr;
-    if constexpr (kExactF16) {
+    if (kExactF16 && exact_f16) {
         if (n_centroids < 2) throw std::runtime_error("batch_assign: need >= 2 centroids");
         if (cublasCreate(&f16_cublas) != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error("batch_assign: cublasCreate failed");
@@ -1532,7 +1548,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
 
         bool searched_bf = false;
         bool searched_f16 = false;
-        if constexpr (kExactF16) {
+        if (kExactF16 && exact_f16) {
             const float alpha = 1.0f, beta = 0.0f;
             const float* d_q_f = reinterpret_cast<const float*>(d_queries);
             for (int64_t t0 = 0; t0 < batch_size; t0 += kF16Tile) {
