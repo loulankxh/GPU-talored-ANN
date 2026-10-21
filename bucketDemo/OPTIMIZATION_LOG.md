@@ -1515,7 +1515,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +6.3% (118.38 → 110.94 s, **0.90× CAGRA native**), 1M-large +2.0%, 1M-auto −1.0% (noise, path untouched).
 
-### #54 — out-of-core: Step 2 train subset gathered from the raw u8 dataset (no N×D float copy)  (2026-10-21, commit TBD)
+### #54 — out-of-core: Step 2 train subset gathered from the raw u8 dataset (no N×D float copy)  (2026-10-21, commit a17e602)
 **Idea / rationale:** Step 1 converted the whole dataset into a float32 `X_sampled` (SIFT10M 5.1 GB: serial zero-fill + conversion, Step 1 5.4 s, and the bulk of bucket2's 19.6 GB peak RSS, above the 16 GB `cpu_limit`). The only reader is Step 2, which since #51 uses a 10% Bernoulli subset. On the out-of-core path the raw u8 dataset is already in host memory in the current coordinate system (#42 swaps in the reordered copy after round 1). So with `kmeans_train_fraction < 1` Step 1 now only reads the raw copy (`x_lazy`), and Step 2 gathers + converts the subset rows straight from `raw_host` each round (no `x_row_of` mapping needed). Paths that don't keep `raw_host` (GPU-resident, over-budget out-of-core) still build `X_sampled` right after the path decision. Round-1 candidate counts identical (same rows / values). Same idea as cuVS 26.12 IVF-PQ build: sample the trainset from the host dataset instead of holding a converted copy (`ivf_pq_build.cuh`).
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
