@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#52 (optimize_chunked GPU phase 2 with staged memory → fits SIFT10M)**, 2026-10-21:
+After **#54 (out-of-core: KMeans|| train subset gathered from the raw u8 dataset, no full float copy)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **6.87** (0.60x CAGRA) | 0.9287 / 0.9776 / 0.9947 | 1948K / 1034K |
-| SIFT1M large (out-of-core path) | **10.72** (0.93x CAGRA) | 0.9135 / 0.9708 / 0.9922 | 2181K / 1189K |
-| SIFT10M auto (→ large path, 1 run) | **110.94** (0.90x CAGRA) | 0.8368 / 0.9288 / 0.9733 | 1864K / 1010K |
+| SIFT1M auto (GPU-resident) | **6.82** (0.59x CAGRA) | 0.9284 / 0.9768 / 0.9943 | 2222K / 1184K |
+| SIFT1M large (out-of-core path) | **10.39** (0.90x CAGRA) | 0.9139 / 0.9709 / 0.9922 | 1950K / 1035K |
+| SIFT10M auto (→ large path, 1 run) | **109.02** (0.89x CAGRA) | 0.8383 / 0.9288 / 0.9739 | 1867K / 1011K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -1514,6 +1514,49 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8368 / 1864K | 0.9288 / 1010K | 0.9733 / 480K | 0.9918 / 184K | 0.9980 / 68K |
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +6.3% (118.38 → 110.94 s, **0.90× CAGRA native**), 1M-large +2.0%, 1M-auto −1.0% (noise, path untouched).
+
+### #54 — out-of-core: Step 2 train subset gathered from the raw u8 dataset (no N×D float copy)  (2026-10-21, commit TBD)
+**Idea / rationale:** Step 1 converted the whole dataset into a float32 `X_sampled` (SIFT10M 5.1 GB: serial zero-fill + conversion, Step 1 5.4 s, and the bulk of bucket2's 19.6 GB peak RSS, above the 16 GB `cpu_limit`). The only reader is Step 2, which since #51 uses a 10% Bernoulli subset. On the out-of-core path the raw u8 dataset is already in host memory in the current coordinate system (#42 swaps in the reordered copy after round 1). So with `kmeans_train_fraction < 1` Step 1 now only reads the raw copy (`x_lazy`), and Step 2 gathers + converts the subset rows straight from `raw_host` each round (no `x_row_of` mapping needed). Paths that don't keep `raw_host` (GPU-resident, over-budget out-of-core) still build `X_sampled` right after the path decision. Round-1 candidate counts identical (same rows / values). Same idea as cuVS 26.12 IVF-PQ build: sample the trainset from the host dataset instead of holding a converted copy (`ivf_pq_build.cuh`).
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+**Borderline confirmation:** SIFT1M-large rerun `sift1M_large_b` 10.34 s (+3.5%) → both runs pass.
+**SIFT10M:** Step 1 5.42 → 1.34 s, bucket2 peak RSS 19.56 → 14.03 GB (back under the 16 GB budget); total +1.7% only (Step 6 47.6 s vs 44.5 s in this run). SIFT1M-large Step 1 0.57 → 0.13 s, peak RSS 2.68 → 2.21 GB.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.82 | +0.7% | +68.6% | 0.59x | bucket2 6.82 | 4070 | 1.71 |
+| sift1M_large | large | 10.39 | +3.1% | +86.2% | 0.90x | bucket2 8.39, prune 0.85, optimize_chunked 0.64, translate 0.51 | 1746 | 2.21 |
+| sift10M_auto | large | 109.02 | +1.7% | +38.9% | 0.89x | bucket2 93.42, prune 7.08, optimize_chunked 4.88, translate 3.64 | 8998 | 14.03 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.64 | 0.35 | 0.10 | 0.00 | 0.67 | 0.47 | 0.02 | 3.13 | 0.00 | 0.92 |
+| sift1M_large | 0.13 | 0.60 | 0.33 | 0.00 | 1.23 | 0.32 | 0.04 | 4.50 | 0.51 | 0.00 |
+| sift10M_auto | 1.34 | 14.61 | 2.01 | 0.00 | 19.17 | 2.79 | 0.34 | 47.62 | 4.04 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9745 | 0.9662 | 0.9594 | 0.9537 |
+| sift1M_large | 0.9724 | 0.9666 | 0.9593 | 0.9531 |
+| sift10M_auto | 0.9206 | 0.8988 | 0.8832 | 0.8716 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9284 / 2222K | 0.9768 / 1184K | 0.9943 / 563K | 0.9987 / 186K | 0.9997 / 68K |
+| ours sift1M_large | 0.9139 / 1950K | 0.9709 / 1035K | 0.9922 / 496K | 0.9983 / 178K | 0.9995 / 66K |
+| ours sift10M_auto | 0.8383 / 1867K | 0.9288 / 1011K | 0.9739 / 525K | 0.9920 / 174K | 0.9978 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +3.1% (10.72 → 10.39 s; rerun +3.5%), 10M-auto +1.7% (110.94 → 109.02 s, 0.89× CAGRA native; −5.5 GB RSS), 1M-auto +0.7%.
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

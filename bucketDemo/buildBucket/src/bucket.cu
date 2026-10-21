@@ -5904,6 +5904,10 @@ int run_pipeline_impl(
         // 非空时: 当前坐标系 id → X_sampled 的行号 (round 1 重排后 X_sampled 仍是
         // 旧坐标系，只在 KMeans|| 抽训练子集时按它 gather，省掉整份重排)
         std::vector<uint32_t> x_row_of;
+        // true: X_sampled 先不建 (out-of-core 且原始 u8 数据集整份留在 raw_host 时，
+        // Step 2 直接从 raw_host 抽 kmeans_train_fraction 的子集转 float——不再
+        // 整份转一份 N*D*4 B 的 float (SIFT10M 5.1 GB，Step 1 单线程清零 + 转换)
+        bool x_lazy = false;
 
         // 采样逻辑抽成 lambda：round 1 重排完之后，如果 iterations > 1，要对着
         // 新坐标系的 data_reordered.<ext> 重新采一遍（否则第 2..t 轮选出来的
@@ -5967,10 +5971,14 @@ int run_pipeline_impl(
                     load::read_bigann_raw_range<DataT>(path, 0, N, raw_host, n_tmp, d_tmp);
                     if (static_cast<int64_t>(raw_host.size()) != static_cast<int64_t>(N) * D)
                         throw std::runtime_error("Step 1: raw dataset size mismatch");
-                    X_sampled.resize(raw_host.size());
-                    #pragma omp parallel for schedule(static)
-                    for (int64_t i = 0; i < static_cast<int64_t>(raw_host.size()); ++i)
-                        X_sampled[static_cast<size_t>(i)] = static_cast<float>(raw_host[static_cast<size_t>(i)]);
+                    if (config.kmeans_train_fraction < 1.0f && !mem_est.need_pq) {
+                        x_lazy = true;   // 等确定走不走 out-of-core host raw 再决定 (见下)
+                    } else {
+                        X_sampled.resize(raw_host.size());
+                        #pragma omp parallel for schedule(static)
+                        for (int64_t i = 0; i < static_cast<int64_t>(raw_host.size()); ++i)
+                            X_sampled[static_cast<size_t>(i)] = static_cast<float>(raw_host[static_cast<size_t>(i)]);
+                    }
                 } else if (ext == ".u8bin" || ext == ".i8bin") {
                     load::read_u8bin_to_f32(path, X_sampled, N, D);
                 } else {
@@ -6014,6 +6022,14 @@ int run_pipeline_impl(
         // 用它，不再每轮读盘 2~3 遍。超预算时 (SIFT10M 以上) 照旧按区间读盘。
         const bool ooc_host_raw = !gres &&
             static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= config.cpu_limit_bytes / 4;
+        if (x_lazy && !ooc_host_raw) {
+            // raw_host 不会跨轮保留 (GPU-resident / 超预算): 照旧整份转 float
+            X_sampled.resize(raw_host.size());
+            #pragma omp parallel for schedule(static)
+            for (int64_t i = 0; i < static_cast<int64_t>(raw_host.size()); ++i)
+                X_sampled[static_cast<size_t>(i)] = static_cast<float>(raw_host[static_cast<size_t>(i)]);
+            x_lazy = false;
+        }
         if (ooc_host_raw) {
             int32_t n_tmp = 0, d_tmp = 0;
             if (!raw_preloaded)
@@ -6135,6 +6151,20 @@ int run_pipeline_impl(
             }
             float* X_train_dst = X_train_pinned.get();
             train_indices.resize(static_cast<size_t>(train_N));
+            if (x_lazy) {
+                // raw_host 是当前坐标系的整份原始数据 (round 1 重排后换成新坐标系那份)，
+                // sampled_indices = iota: 直接按行号取、转 float
+                if (static_cast<int64_t>(raw_host.size()) != static_cast<int64_t>(working_N) * D)
+                    throw std::runtime_error("Step 2: lazy train subset needs the whole raw dataset in host memory");
+                #pragma omp parallel for schedule(static)
+                for (int64_t i = 0; i < train_N; ++i) {
+                    const int64_t r = rows[static_cast<size_t>(i)];   // < working_N (Bernoulli over [0, working_N))
+                    const DataT* srow = raw_host.data() + static_cast<size_t>(r) * D;
+                    float* drow = X_train_dst + static_cast<size_t>(i) * D;
+                    for (int64_t d = 0; d < D; ++d) drow[d] = static_cast<float>(srow[d]);
+                    train_indices[static_cast<size_t>(i)] = sampled_indices[static_cast<size_t>(r)];
+                }
+            } else {
             #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < train_N; ++i) {
                 std::memcpy(X_train_dst + static_cast<size_t>(i) * D,
@@ -6143,6 +6173,7 @@ int run_pipeline_impl(
                                 : x_row_of[static_cast<size_t>(rows[static_cast<size_t>(i)])]) * D,
                             static_cast<size_t>(D) * sizeof(float));
                 train_indices[static_cast<size_t>(i)] = sampled_indices[static_cast<size_t>(rows[static_cast<size_t>(i)])];
+            }
             }
             X_train = X_train_dst;
             std::cout << "  KMeans|| train subset: " << train_N << " / " << working_N << " points\n";
@@ -6617,7 +6648,9 @@ int run_pipeline_impl(
             // fits_in_gpu: X_sampled 是整份数据集、旧坐标系行序 (sampled_indices = iota)
             // —— GPU-resident 和 out-of-core 两条路径都是 (out-of-core 原来要重新
             // 读一遍 data_reordered 并转 float)。
-            if (iterations > 1 && mem_est.fits_in_gpu && config.kmeans_train_fraction < 1.0f && !mem_est.need_pq) {
+            if (iterations > 1 && x_lazy) {
+                // Step 2 直接从 raw_host 取，raw_host 已经换成新坐标系那份 (见上)，不需要映射
+            } else if (iterations > 1 && mem_est.fits_in_gpu && config.kmeans_train_fraction < 1.0f && !mem_est.need_pq) {
                 // Step 2 只会从 X_sampled 抽 kmeans_train_fraction 的子集 (见
                 // Step 2)：不整份重排 (N*D*4 B, SIFT1M ~0.5 s)，只记新 id → 旧行号
                 // 的映射，抽子集时按映射 gather。
