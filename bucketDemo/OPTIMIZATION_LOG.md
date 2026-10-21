@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#42 (out-of-core raw dataset kept in host memory + parallel bucket write)**, 2026-10-21:
+After **#43 (Step 1 single raw read + parallel convert, Step 2 pinned reusable train-subset buffer)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **9.22** (0.80x CAGRA) | 0.9286 / 0.9778 / 0.9947 | 1948K / 1035K |
-| SIFT1M large (out-of-core path) | **11.90** (1.03x CAGRA) | 0.9150 / 0.9711 / 0.9922 | 1948K / 1035K |
+| SIFT1M auto (GPU-resident) | **8.87** (0.77x CAGRA) | 0.9277 / 0.9771 / 0.9947 | 2222K / 1189K |
+| SIFT1M large (out-of-core path) | **11.76** (1.02x CAGRA) | 0.9147 / 0.9716 / 0.9921 | 1946K / 1010K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -60,6 +60,7 @@ Other:
 - SIFT10M Step 2 (centroid selection on the full 10M working set) is far slower than on 1M — sample before kmeans|| (cuVS kmeans uses a sampled init); compare `cpp/src/cluster/detail/kmeans_balanced.cuh` / `kmeans.cuh` init.
 - Step 4.5 inline reorder and Step 6 `pool_build` / `scatter_pending` dominate the SIFT10M out-of-core loop — overlap host gather with GPU work (pinned staging, double buffering).
 - Large path quality gap (prune_windowed vs cuVS optimize): SIFT1M recall@10 at itopk 32 is ~3 points below CAGRA — study `cpp/src/neighbors/detail/cagra/graph_core.cuh` (`optimize`: detour counting / rank-based pruning / reverse-edge merge) and align `prune_windowed_core.hpp` + `optimize_chunked` method E with it.
+- **Process start/exit overhead (found in #43):** ~0.28 s from process start to Step 1 (CUDA/cuVS library load + context) and ~0.22 s after `Total:` (destructors: GPU/pinned frees, RMM pool), per stage binary. Step 1 X_sampled `resize` (512 MB serial zero-fill) is the next Step 1 cost.
 - `optimize` (resident) spends most of its time in file load + sanitize, not in the cuVS call.
 - `prune_windowed` after #18 (1.3 s): compute ~0.96 s, bulk load 0.13 s. Old note — `prune_windowed` after #2 (3.9s): compute 2.6s forks an OMP region per bucket of ~100 rows on 80 threads — process several positions per parallel region, or move the detour count to GPU (cuVS `kern_fused_prune`). Store cached vectors as u8 (4x less cache memory → fewer evictions on SIFT10M); keep the dataset handle open in the loader.
 - Resident `optimize` after #5 (1.3s): ~0.25s is raft/CUDA context start-up + 256 MB graph read; the cuVS call itself is 0.44s. Further gains need fusing optimize into bucket2 (graph already on the GPU) — a structural change, keep the separate-stage fallback for exit code 2.
@@ -1222,6 +1223,43 @@ Borderline → large rerun (`runs/iter38/sift1M_large_b`): 13.98 s (+5.6%), reca
 | ours sift1M_large | 0.9150 / 1948K | 0.9711 / 1035K | 0.9922 / 533K | 0.9982 / 179K | 0.9995 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +6.1% (12.67 → 11.90 s, 1.03× CAGRA native), 1M-auto +0.4% (path untouched). Large GPU peak 2052 MiB in one rep (the known bucket-size outlier, #9), within the gate.
+
+### #43 — Step 1 single raw read + parallel u8→f32; Step 2 pinned, reused KMeans|| train-subset buffer  (2026-10-21, commit TBD)
+**Idea / rationale:** temporary timers showed host-side overheads in both paths. (1) Step 2: before the GPU work, each round built the KMeans|| training subset in a fresh `std::vector<float>`, and the `resize` zero-filled and page-faulted 128 MB on one thread (0.09 s/round, 0.15–0.40 s for the whole subsample). The subset now goes into a pinned `cudaHostAlloc` buffer, allocated once with 5% slack and reused across rounds; the parallel gather writes into it, and the H2D upload is from pinned memory. (2) Step 1: `sample_from` spent 0.56 s in `read_u8bin_to_f32` (single-threaded convert), and the GPU-resident / out-of-core host-raw path then read the whole file again. For u8 data the file is now read once into `raw_host` and converted to float in parallel; `raw_host` is freed if neither user needs it. This follows cuVS 26.12 `ivf_pq_build.cuh` / `cagra_build.cuh`, which stage host batches through pinned buffers that are reused, not reallocated per batch.
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+**Borderline confirmation:** auto rerun `sift1M_auto_b` 8.79 s (+4.7%), ACCEPT, so both runs pass. Step 2 auto 1.14 → 0.81 s, Step 1 auto 0.76 → 0.64 s; large Step 2 1.48 → 1.09 s.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 8.87 | +3.8% | +59.2% | 0.77x | bucket2 7.08, optimize 1.29, translate 0.43 | 4042 | 1.44 |
+| sift1M_large | large | 11.76 | +1.2% | +84.3% | 1.02x | bucket2 9.77, prune 0.86, optimize_chunked 0.64, translate 0.48 | 1674 | 2.75 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.64 | 0.81 | 0.10 | 0.00 | 0.67 | 0.50 | 0.02 | 3.36 | 0.00 | 0.48 |
+| sift1M_large | 0.57 | 1.09 | 0.17 | 0.00 | 1.18 | 0.39 | 0.04 | 5.14 | 0.46 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9754 | 0.9663 | 0.9594 | 0.9534 |
+| sift1M_large | 0.9719 | 0.9666 | 0.9596 | 0.9538 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9277 / 2222K | 0.9771 / 1189K | 0.9947 / 562K | 0.9987 / 183K | 0.9996 / 68K |
+| ours sift1M_large | 0.9147 / 1946K | 0.9716 / 1010K | 0.9921 / 486K | 0.9982 / 188K | 0.9995 / 66K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +3.8% (9.22 → 8.87 s, 0.77× CAGRA native; rerun +4.7%), 1M-large +1.2% (11.90 → 11.76 s).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

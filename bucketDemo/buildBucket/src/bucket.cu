@@ -5693,6 +5693,9 @@ int run_pipeline_impl(
         // centroid 会是旧坐标系的 ID，去新数据集里找点就全错了）——用同一份
         // 逻辑读不同路径，不能各写一份容易漂移。N/D/mem_est 采样前后不变
         // （round 1 重排不改变点数/维度，只改变 ID 的物理排列），可以直接复用。
+        // 原始 (N, D) 数据集的 host 副本 (DataT)：GPU-resident 路径建常驻数据集 /
+        // round 1 重排时用，out-of-core 预算够时跨轮复用 (见下面 ooc_host_raw)。
+        std::vector<DataT> raw_host;
         auto sample_from = [&](const std::string& path) {
             if (!mem_est.fits_in_gpu) {
                 // 只从 disk 读取采样行，不加载完整数据集
@@ -5740,6 +5743,17 @@ int run_pipeline_impl(
 
                 if (ext == ".fbin" || ext == ".bin") {
                     load::read_fbin_f32(path, X_sampled, N, D);
+                } else if (ext == ".u8bin" && std::is_same<DataT, uint8_t>::value && raw_host.empty()) {
+                    // 原始 u8 只读一次进 raw_host (后面 GPU-resident / out-of-core 都要用)，
+                    // 再并行转 float——原来先 read_u8bin_to_f32 (单线程转换) 再整份重读一遍
+                    int32_t n_tmp = 0, d_tmp = 0;
+                    load::read_bigann_raw_range<DataT>(path, 0, N, raw_host, n_tmp, d_tmp);
+                    if (static_cast<int64_t>(raw_host.size()) != static_cast<int64_t>(N) * D)
+                        throw std::runtime_error("Step 1: raw dataset size mismatch");
+                    X_sampled.resize(raw_host.size());
+                    #pragma omp parallel for schedule(static)
+                    for (int64_t i = 0; i < static_cast<int64_t>(raw_host.size()); ++i)
+                        X_sampled[static_cast<size_t>(i)] = static_cast<float>(raw_host[static_cast<size_t>(i)]);
                 } else if (ext == ".u8bin" || ext == ".i8bin") {
                     load::read_u8bin_to_f32(path, X_sampled, N, D);
                 } else {
@@ -5758,14 +5772,15 @@ int run_pipeline_impl(
         // (见 GpuResidentKnn 的说明)：Step 4 的 query、Step 6 的 pool、跨轮合并
         // 都不再经过 CPU/磁盘。raw_host 留到 round 1 重排写 data_reordered 时用。
         std::unique_ptr<GpuResidentKnn<DataT>> gres;
-        std::vector<DataT> raw_host;
+        const bool raw_preloaded = !raw_host.empty();
         if (neighbors_m > 0 && neighbors_m <= 256 && mem_est.fits_in_gpu && !force_out_of_core) {
             size_t need = GpuResidentKnn<DataT>::bytes_needed(N, D, neighbors_m);
             size_t free_b = 0, total_b = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
             if (need <= static_cast<size_t>(free_b * 0.6)) {
                 int32_t n_tmp, d_tmp;
-                load::read_bigann_raw_range<DataT>(input_path, 0, N, raw_host, n_tmp, d_tmp);
+                if (!raw_preloaded)
+                    load::read_bigann_raw_range<DataT>(input_path, 0, N, raw_host, n_tmp, d_tmp);
                 gres = std::make_unique<GpuResidentKnn<DataT>>(raw_host.data(), N, D, neighbors_m);
                 std::cout << "  [GpuResidentKNN] enabled: " << need / 1e9 << " GB resident (free "
                           << free_b / 1e9 << " GB)\n";
@@ -5782,11 +5797,14 @@ int run_pipeline_impl(
             static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= config.cpu_limit_bytes / 4;
         if (ooc_host_raw) {
             int32_t n_tmp = 0, d_tmp = 0;
-            load::read_bigann_raw_range<DataT>(input_path, 0, N, raw_host, n_tmp, d_tmp);
+            if (!raw_preloaded)
+                load::read_bigann_raw_range<DataT>(input_path, 0, N, raw_host, n_tmp, d_tmp);
             if (static_cast<int64_t>(raw_host.size()) != N * static_cast<int64_t>(D))
                 throw std::runtime_error("Step 1: host raw dataset size mismatch");
             std::cout << "  [HostRaw] out-of-core dataset kept in host memory: "
                       << raw_host.size() * sizeof(DataT) / 1e9 << " GB\n";
+        } else if (!gres) {
+            raw_host = std::vector<DataT>();   // 预读了但用不上 (超预算)
         }
 
         elapsed_step1 = std::chrono::duration<double>(Clock::now() - t1).count();
@@ -5841,6 +5859,12 @@ int run_pipeline_impl(
         std::filesystem::create_directories(bucket_vec_dir);
         std::unique_ptr<BucketVectorAccumulator<DataT>> bucket_vecs_ptr;
 
+        // KMeans|| 训练子集的 host 缓冲：pinned、跨轮复用 (只分配/缺页一次，
+        // 不再每轮 resize 时单线程清零 128 MB；pinned 也让 Step 2 的 H2D 更快)。
+        struct PinnedFree { void operator()(float* p) const { if (p) cudaFreeHost(p); } };
+        std::unique_ptr<float, PinnedFree> X_train_pinned;
+        size_t X_train_cap = 0;   // floats
+
         for (int iter = 0; iter < iterations; ++iter) {
             // 每次 iteration 用不同 seed (centroid 选取多样化)
             uint32_t iter_seed = config.seed + static_cast<uint32_t>(iter);
@@ -5866,7 +5890,6 @@ int run_pipeline_impl(
         // KMeans|| 的代价 ∝ 点数 × 候选数，子集越小越快。
         const float* X_train = X_sampled.data();
         int64_t train_N = working_N;
-        std::vector<float> X_train_buf;
         std::vector<int64_t> train_indices;   // train 行 → raw idx
         const bool sub_train = iter_config.kmeans_train_fraction < 1.0f && !mem_est.need_pq;
         if (sub_train) {
@@ -5881,18 +5904,28 @@ int run_pipeline_impl(
                 std::iota(rows.begin(), rows.end(), 0LL);
             }
             train_N = static_cast<int64_t>(rows.size());
-            X_train_buf.resize(static_cast<size_t>(train_N) * D);
+            const size_t need_f = static_cast<size_t>(train_N) * D;
+            if (need_f > X_train_cap) {
+                X_train_pinned.reset();
+                float* p = nullptr;
+                // 余量 5%: 各轮 Bernoulli 抽到的点数略有不同，避免每轮重新分配
+                const size_t cap = need_f + need_f / 20;
+                CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&p), cap * sizeof(float), cudaHostAllocDefault));
+                X_train_pinned.reset(p);
+                X_train_cap = cap;
+            }
+            float* X_train_dst = X_train_pinned.get();
             train_indices.resize(static_cast<size_t>(train_N));
             #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < train_N; ++i) {
-                std::memcpy(X_train_buf.data() + static_cast<size_t>(i) * D,
+                std::memcpy(X_train_dst + static_cast<size_t>(i) * D,
                             X_sampled.data() + static_cast<size_t>(x_row_of.empty()
                                 ? rows[static_cast<size_t>(i)]
                                 : x_row_of[static_cast<size_t>(rows[static_cast<size_t>(i)])]) * D,
                             static_cast<size_t>(D) * sizeof(float));
                 train_indices[static_cast<size_t>(i)] = sampled_indices[static_cast<size_t>(rows[static_cast<size_t>(i)])];
             }
-            X_train = X_train_buf.data();
+            X_train = X_train_dst;
             std::cout << "  KMeans|| train subset: " << train_N << " / " << working_N << " points\n";
         }
         const std::vector<int64_t>& train_map = sub_train ? train_indices : sampled_indices;
