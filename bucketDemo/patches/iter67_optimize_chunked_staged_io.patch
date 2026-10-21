@@ -1,0 +1,184 @@
+diff --git a/bucketDemo/buildBucket/src/optimize_chunked.cu b/bucketDemo/buildBucket/src/optimize_chunked.cu
+index 0956490..35fb418 100644
+--- a/bucketDemo/buildBucket/src/optimize_chunked.cu
++++ b/bucketDemo/buildBucket/src/optimize_chunked.cu
+@@ -41,6 +41,10 @@
+ #include <algorithm>
+ #include <numeric>
+ #include <omp.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <memory>
++#include <cstring>
+ 
+ #include <boost/program_options.hpp>
+ 
+@@ -72,6 +76,86 @@ namespace po = boost::program_options;
+ // reorder.cpp and prune_windowed.cu too); these are thin aliases so the
+ // rest of this file doesn't need to change call sites.
+ // =====================================================================
++// ---- 大块 I/O 小工具 (跟 prune_windowed_gpu.cu 的 Staging 同一做法) ----
++// 多线程 pread 一段文件进 dst (page cache 里的文件单线程 ifstream 读只有 ~1 GB/s)
++static void parallel_pread_file(const std::string& path, off_t off, size_t bytes, void* dst)
++{
++    int fd = ::open(path.c_str(), O_RDONLY);
++    if (fd < 0) throw std::runtime_error("parallel_pread_file: cannot open " + path);
++    constexpr size_t kPiece = size_t(16) << 20;
++    const int64_t pieces = static_cast<int64_t>((bytes + kPiece - 1) / kPiece);
++    int bad = 0;
++    #pragma omp parallel for num_threads(8) schedule(dynamic) reduction(+:bad)
++    for (int64_t i = 0; i < pieces; ++i) {
++        size_t o = static_cast<size_t>(i) * kPiece, n = std::min(kPiece, bytes - o);
++        char* p = static_cast<char*>(dst) + o;
++        while (n > 0) {
++            ssize_t r = ::pread(fd, p, n, off + static_cast<off_t>(o));
++            if (r <= 0) { ++bad; break; }
++            p += r; o += static_cast<size_t>(r); n -= static_cast<size_t>(r);
++        }
++    }
++    ::close(fd);
++    if (bad) throw std::runtime_error("parallel_pread_file: short read on " + path);
++}
++
++// 两块 64 MB pinned 暂存区双缓冲的 H2D / 按行块 D2H (DMA 跟 host 拷贝 / sink 重叠)，
++// 免掉整块 cudaMallocHost (1.28 GB 要 0.7 s) 或 pageable 整块拷贝
++struct PinnedStaging {
++    static constexpr size_t kChunk = size_t(64) << 20;
++    void* pin[2] = {nullptr, nullptr};
++    cudaEvent_t ev[2] = {nullptr, nullptr};
++    bool used[2] = {false, false};
++    cudaStream_t st = nullptr;
++    PinnedStaging() {
++        CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
++        for (int b = 0; b < 2; ++b) {
++            CUDA_CHECK(cudaMallocHost(&pin[b], kChunk));
++            CUDA_CHECK(cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming));
++        }
++    }
++    ~PinnedStaging() {
++        for (int b = 0; b < 2; ++b) { cudaFreeHost(pin[b]); cudaEventDestroy(ev[b]); }
++        cudaStreamDestroy(st);
++    }
++    PinnedStaging(const PinnedStaging&) = delete;
++    PinnedStaging& operator=(const PinnedStaging&) = delete;
++    void h2d(void* d, const void* h, size_t bytes) {
++        for (size_t off = 0, k = 0; off < bytes; off += kChunk, ++k) {
++            const int b = static_cast<int>(k & 1);
++            const size_t n = std::min(kChunk, bytes - off);
++            if (used[b]) CUDA_CHECK(cudaEventSynchronize(ev[b]));
++            const int64_t pieces = static_cast<int64_t>((n + (size_t(1) << 20) - 1) >> 20);
++            #pragma omp parallel for schedule(static)
++            for (int64_t i = 0; i < pieces; ++i) {
++                const size_t o = static_cast<size_t>(i) << 20;
++                std::memcpy(static_cast<char*>(pin[b]) + o, static_cast<const char*>(h) + off + o,
++                            std::min(size_t(1) << 20, n - o));
++            }
++            CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(d) + off, pin[b], n, cudaMemcpyHostToDevice, st));
++            CUDA_CHECK(cudaEventRecord(ev[b], st));
++            used[b] = true;
++        }
++        CUDA_CHECK(cudaStreamSynchronize(st));
++    }
++    template <typename Sink>
++    void d2h_rows(const uint32_t* d, int64_t N, int w, Sink&& sink) {
++        const int64_t rows_per = std::max<int64_t>(1, static_cast<int64_t>(kChunk / (static_cast<size_t>(w) * 4)));
++        auto issue = [&](int64_t r0, int b) {
++            const int64_t n = std::min(rows_per, N - r0);
++            CUDA_CHECK(cudaMemcpyAsync(pin[b], d + r0 * w, static_cast<size_t>(n) * w * 4, cudaMemcpyDeviceToHost, st));
++            CUDA_CHECK(cudaEventRecord(ev[b], st));
++        };
++        if (N > 0) issue(0, 0);
++        for (int64_t r0 = 0, k = 0; r0 < N; r0 += rows_per, ++k) {
++            const int b = static_cast<int>(k & 1);
++            if (r0 + rows_per < N) issue(r0 + rows_per, b ^ 1);
++            CUDA_CHECK(cudaEventSynchronize(ev[b]));
++            sink(static_cast<const uint32_t*>(pin[b]), r0, std::min(rows_per, N - r0));
++        }
++    }
++};
++
+ static void read_forward_graph(const std::string& path,
+                                std::vector<uint32_t>& graph,
+                                int64_t& N, int32_t& K_out)
+@@ -1438,7 +1522,7 @@ static void run_method_E(
+     // 单次 drain 且整张前向图一批就进了显存 (batch_rows >= N) 时，Phase 2 也在 GPU 上做
+     // (到 drain 的时候再按实际空闲显存确认一次，放不下就退回 CPU Phase 2)
+     bool gpu_phase2 = single_drain && static_cast<int64_t>(batch_rows) >= N && K_out <= 64;
+-    std::vector<uint32_t> gpu_merged_rows;
++    uint32_t* d_gpu_out = nullptr;   // GPU phase 2 的结果 (N, K_out)，写盘时按行块经 pinned 区流出
+ 
+     std::cout << "  [Method E] " << plan.label
+               << ", num_chunks=" << num_chunks
+@@ -1478,8 +1562,14 @@ static void run_method_E(
+     double t_alloc_device = std::chrono::duration<double>(Clock::now() - t_alloc0).count();
+ 
+     auto t_alloc1 = Clock::now();
++    // 一批就装下整张前向图 (batch_rows >= N) 时: 多线程 pread 进不清零的 pageable
++    // buffer、经 pinned 暂存区上传，不再整块 cudaMallocHost (SIFT10M 1.28 GB: 0.7 s) +
++    // 单线程 ifstream 读；多批时照旧
++    const bool single_batch = static_cast<int64_t>(batch_rows) >= N;
+     uint32_t* h_fwd_batch = nullptr;
+-    CUDA_CHECK(cudaMallocHost(&h_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t)));
++    std::unique_ptr<uint32_t[]> h_fwd_page;
++    if (single_batch) h_fwd_page.reset(new uint32_t[static_cast<size_t>(N) * K_out]);
++    else CUDA_CHECK(cudaMallocHost(&h_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t)));
+     std::vector<uint32_t> h_chunk_count(static_cast<size_t>(num_chunks));
+     edge_chunk::EdgeRecord* h_overflow_buf = nullptr;
+     CUDA_CHECK(cudaMallocHost(&h_overflow_buf, static_cast<size_t>(overflow_cap) * sizeof(edge_chunk::EdgeRecord)));
+@@ -1522,6 +1612,13 @@ static void run_method_E(
+             uint32_t cur_rows = static_cast<uint32_t>(std::min<int64_t>(batch_rows, N - bs));
+             size_t n_elems = static_cast<size_t>(cur_rows) * K_out;
+ 
++            if (single_batch) {
++                parallel_pread_file(fwd_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
++                                    n_elems * sizeof(uint32_t), h_fwd_page.get());
++                PinnedStaging stg;
++                stg.h2d(d_fwd_batch, h_fwd_page.get(), n_elems * sizeof(uint32_t));
++                h_fwd_page.reset();
++            } else {
+             fwd_in.read(reinterpret_cast<char*>(h_fwd_batch),
+                         static_cast<std::streamsize>(n_elems * sizeof(uint32_t)));
+             if (!fwd_in.good())
+@@ -1529,6 +1626,7 @@ static void run_method_E(
+ 
+             CUDA_CHECK(cudaMemcpy(d_fwd_batch, h_fwd_batch,
+                 n_elems * sizeof(uint32_t), cudaMemcpyHostToDevice));
++            }
+             CUDA_CHECK(cudaMemset(d_overflow_count, 0, sizeof(uint32_t)));
+ 
+             uint64_t total_edges = static_cast<uint64_t>(cur_rows) * K_out;
+@@ -1653,10 +1751,8 @@ static void run_method_E(
+                 int h_err = 0;
+                 CUDA_CHECK(cudaMemcpy(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost));
+                 if (h_err) throw std::runtime_error("Method E (GPU phase 2): edge dst out of range");
+-                gpu_merged_rows.resize(static_cast<size_t>(N) * K_out);
+-                CUDA_CHECK(cudaMemcpy(gpu_merged_rows.data(), d_out, gpu_merged_rows.size() * sizeof(uint32_t),
+-                                      cudaMemcpyDeviceToHost));
+-                cudaFree(d_src); cudaFree(d_cnt); cudaFree(d_out); cudaFree(d_err);
++                d_gpu_out = d_out;   // 留在显存，写盘阶段按行块流出 (不再先拷进一份清零的 host vector)
++                cudaFree(d_src); cudaFree(d_cnt); cudaFree(d_err);
+                 total_in_chunk += take;
+                 continue;
+             }
+@@ -1684,7 +1780,7 @@ static void run_method_E(
+ 
+     auto t_finish0 = Clock::now();
+     if (!edges_in_memory) acc.finish();
+-    else if (gpu_phase2 ? gpu_merged_rows.size() != static_cast<size_t>(N) * static_cast<size_t>(K_out)
++    else if (gpu_phase2 ? d_gpu_out == nullptr
+                         : mem_edges.size() != static_cast<size_t>(N) * static_cast<size_t>(K_out))
+         throw std::runtime_error("Method E: in-memory edge count " + std::to_string(mem_edges.size()) +
+                                  " != N*K_out");
+@@ -1718,7 +1814,11 @@ static void run_method_E(
+ 
+         graph_io::StreamingGraphWriter writer(out_path, N, K_out);
+         if (gpu_phase2) {
+-            writer.write_rows(gpu_merged_rows.data(), 0, N);
++            PinnedStaging stg;
++            stg.d2h_rows(d_gpu_out, N, K_out, [&](const uint32_t* rows, int64_t r0, int64_t n) {
++                writer.write_rows(rows, r0, n);
++            });
++            cudaFree(d_gpu_out); d_gpu_out = nullptr;
+             std::cout << "  [Method E] phase 2 on GPU\n";
+         }
+ 
