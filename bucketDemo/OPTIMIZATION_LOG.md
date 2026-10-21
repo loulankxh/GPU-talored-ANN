@@ -43,6 +43,22 @@ After **#46 (GPU-resident path: prune + reverse edges + id translation folded in
 | SIFT1M large (out-of-core path) | **11.70** (1.01x CAGRA) | 0.9138 / 0.9708 / 0.9923 | 1945K / 893K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
+### SIFT10M check after #46 (2026-10-21, 1 run, `runs/sift10M_after46`)
+
+First run failed: `optimize_chunked` GPU out of memory. The #39 GPU Phase 2 was enabled whenever all edges fit one chunk and needed ~14.8 GB at N=10M (3.2 × 10⁸ edges), with the chunk buffer and forward graph already on the GPU. Fixed: Phase 2 now checks `cudaMemGetInfo` at drain time and falls back to the CPU Phase 2 when the estimate (+10%) doesn't fit (SIFT10M: needs 14.83 GB, 12.12 GB free → CPU). SIFT1M still takes the GPU path.
+
+| stage | time (s) | peak RSS (GB) |
+|---|---|---|
+| bucket2 (out-of-core, auto-selected: resident needs 18.1 GB > 16.3 GB free) | 154.51 | 21.0 |
+| prune_windowed | 7.03 | 10.2 |
+| optimize_chunked -m E (CPU phase 2) | 13.38 | 8.3 |
+| translate_ids | 3.55 | 1.1 |
+| **total** | **178.5** (CAGRA native 122.6 s → 1.46×; target ≤ 360 s met) | |
+
+bucket2 steps: Step 1 5.4 s, Step 2 50.3 s, Step 3 1.9 s, Step 4 39.5 s, Step 4.5 2.9 s, Step 6 48.4 s, final merge wait 4.1 s. GPU peak 9454 MiB.
+Search (cuVS CAGRA searcher, recall@10 / QPS): itopk 32 0.8375 / 1864K, 64 0.9281 / 1001K, 128 0.9739 / 525K, 256 0.9919 / 186K, 512 0.9980 / 66K; 0 bad ids / self loops / dup edges (no CAGRA recall reference recorded for SIFT10M). Pre-prune KNN recall@1/10/32/64 = 0.917 / 0.897 / 0.882 / 0.871.
+Next targets for SIFT10M: Step 2 (KMeans|| on the 10M working set) and Step 4 dominate; bucket2 peak RSS 21 GB is above the 16 GB `cpu_limit` default and should be checked.
+
 ## Ideas backlog
 
 Priority (from the user, 2026-10-21):

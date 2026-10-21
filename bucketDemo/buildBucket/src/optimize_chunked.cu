@@ -1436,7 +1436,8 @@ static void run_method_E(
     const bool single_drain = edges_in_memory && capacity_per_chunk >= total_edges;
     if (single_drain) overflow_cap = 1024;
     // 单次 drain 且整张前向图一批就进了显存 (batch_rows >= N) 时，Phase 2 也在 GPU 上做
-    const bool gpu_phase2 = single_drain && static_cast<int64_t>(batch_rows) >= N && K_out <= 64;
+    // (到 drain 的时候再按实际空闲显存确认一次，放不下就退回 CPU Phase 2)
+    bool gpu_phase2 = single_drain && static_cast<int64_t>(batch_rows) >= N && K_out <= 64;
     std::vector<uint32_t> gpu_merged_rows;
 
     std::cout << "  [Method E] " << plan.label
@@ -1580,6 +1581,22 @@ static void run_method_E(
             uint32_t cnt = h_chunk_count[static_cast<size_t>(c)];
             if (cnt == 0) continue;
             uint32_t take = std::min(cnt, static_cast<uint32_t>(capacity_per_chunk));
+            if (single_drain && gpu_phase2) {
+                // GPU Phase 2 的工作区: dst/src (4+4 B) + rank (2 B) + idx/key2 (8+8 B) 每条边，
+                // 两次 stable_sort_by_key 的临时空间 (按 key+value ≈ 12 B/边 估)，加 cnt (N+1)
+                // 和输出 (N*K_out)，再留 10% 余量。SIFT10M (3.2 亿条边) 要 ~13 GB，在 chunk
+                // buffer + 前向图已经占着显存时放不下 → 走下面的 CPU Phase 2。
+                size_t free_b = 0, total_b = 0;
+                CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+                const double need = (static_cast<double>(take) * (4 + 4 + 2 + 8 + 8 + 12)
+                                     + (static_cast<double>(N) + 1) * 4
+                                     + static_cast<double>(N) * K_out * 4) * 1.10;
+                if (need > static_cast<double>(free_b)) {
+                    std::cout << "  [Method E] GPU phase 2 needs " << need / 1e9 << " GB, only "
+                              << free_b / 1e9 << " GB free -> CPU phase 2\n";
+                    gpu_phase2 = false;
+                }
+            }
             if (single_drain && gpu_phase2) {
                 // Phase 2 直接在 GPU 上做 (边和整张前向图都已经在显存)
                 const uint64_t E = take;
