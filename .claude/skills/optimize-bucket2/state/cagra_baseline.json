@@ -1,13 +1,45 @@
 {
- "note": "cuVS 26.10 CAGRA native build, NN-Descent intermediate_graph_degree=64 -> graph_degree=32, nnd 20 iters, V100 GPU0 (evalCuvs/build/cagra_eval build); search = same cagra_eval search sweep as ours",
+ "note": "cuVS 26.10 CAGRA native build, NN-Descent intermediate_graph_degree=64 -> graph_degree=32, nnd 20 iters, V100 GPU0 (evalCuvs/build/cagra_eval build); search = same cagra_eval search sweep as ours; sift10M search measured 2026-10-21 on evalCuvs/baseline/cagra_sift10M_64_32.bin",
  "sift1M": {
-  "build_s": [11.5363, 11.5396, 11.5894],
+  "build_s": [
+   11.5363,
+   11.5396,
+   11.5894
+  ],
   "build_median_s": 11.54,
-  "search": {"32": 0.93049, "64": 0.97821, "128": 0.99483, "256": 0.99882, "512": 0.99977},
-  "qps": {"32": 1941843.8, "64": 1035691.2, "128": 532692.8, "256": 189005.7, "512": 68163.0}
+  "search": {
+   "32": 0.93049,
+   "64": 0.97821,
+   "128": 0.99483,
+   "256": 0.99882,
+   "512": 0.99977
+  },
+  "qps": {
+   "32": 1941843.8,
+   "64": 1035691.2,
+   "128": 532692.8,
+   "256": 189005.7,
+   "512": 68163.0
+  }
  },
  "sift10M": {
-  "build_s": [122.588],
-  "build_median_s": 122.588
+  "build_s": [
+   122.588
+  ],
+  "build_median_s": 122.588,
+  "search": {
+   "32": 0.86722,
+   "64": 0.94633,
+   "128": 0.98386,
+   "256": 0.99587,
+   "512": 0.99917
+  },
+  "qps": {
+   "32": 1868258.1,
+   "64": 1012578.6,
+   "128": 525111.8,
+   "256": 186762.8,
+   "512": 67934.6
+  }
  }
 }

@@ -35,29 +35,14 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#46 (GPU-resident path: prune + reverse edges + id translation folded into bucket2)**, 2026-10-21:
+After **#47 (incremental KMeans|| d(x, C); accepted on the SIFT10M rule)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **7.54** (0.65x CAGRA) | 0.9282 / 0.9772 / 0.9945 | 1947K / 1036K |
-| SIFT1M large (out-of-core path) | **11.70** (1.01x CAGRA) | 0.9138 / 0.9708 / 0.9923 | 1945K / 893K |
-| CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
-
-### SIFT10M check after #46 (2026-10-21, 1 run, `runs/sift10M_after46`)
-
-First run failed: `optimize_chunked` GPU out of memory. The #39 GPU Phase 2 was enabled whenever all edges fit one chunk and needed ~14.8 GB at N=10M (3.2 × 10⁸ edges), with the chunk buffer and forward graph already on the GPU. Fixed: Phase 2 now checks `cudaMemGetInfo` at drain time and falls back to the CPU Phase 2 when the estimate (+10%) doesn't fit (SIFT10M: needs 14.83 GB, 12.12 GB free → CPU). SIFT1M still takes the GPU path.
-
-| stage | time (s) | peak RSS (GB) |
-|---|---|---|
-| bucket2 (out-of-core, auto-selected: resident needs 18.1 GB > 16.3 GB free) | 154.51 | 21.0 |
-| prune_windowed | 7.03 | 10.2 |
-| optimize_chunked -m E (CPU phase 2) | 13.38 | 8.3 |
-| translate_ids | 3.55 | 1.1 |
-| **total** | **178.5** (CAGRA native 122.6 s → 1.46×; target ≤ 360 s met) | |
-
-bucket2 steps: Step 1 5.4 s, Step 2 50.3 s, Step 3 1.9 s, Step 4 39.5 s, Step 4.5 2.9 s, Step 6 48.4 s, final merge wait 4.1 s. GPU peak 9454 MiB.
-Search (cuVS CAGRA searcher, recall@10 / QPS): itopk 32 0.8375 / 1864K, 64 0.9281 / 1001K, 128 0.9739 / 525K, 256 0.9919 / 186K, 512 0.9980 / 66K; 0 bad ids / self loops / dup edges (no CAGRA recall reference recorded for SIFT10M). Pre-prune KNN recall@1/10/32/64 = 0.917 / 0.897 / 0.882 / 0.871.
-Next targets for SIFT10M: Step 2 (KMeans|| on the 10M working set) and Step 4 dominate; bucket2 peak RSS 21 GB is above the 16 GB `cpu_limit` default and should be checked.
+| SIFT1M auto (GPU-resident) | **7.38** (0.64x CAGRA) | 0.9295 / 0.9774 / 0.9945 | 2219K / 1190K |
+| SIFT1M large (out-of-core path) | **11.66** (1.01x CAGRA) | 0.9137 / 0.9712 / 0.9920 | 1945K / 1035K |
+| SIFT10M auto (→ large path, 1 run) | **163.74** (1.34x CAGRA) | 0.8396 / 0.9280 / 0.9736 | 1870K / 1012K |
+| CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
 
@@ -96,7 +81,6 @@ Other:
 
 | # | idea | result | reason |
 |---|---|---|---|
-| 47 | **Retry of #12/#15 (user request): incremental KMeans|| d(x, C)** — enter each round with the running min distance, compute distances only to the round's new candidates (`min_cluster_distance` vs `CpRaw`) and `thrust::minimum` them in, skip the redundant round-0 recompute and the unused last-round update (cuVS 26.12 `cluster/detail/kmeans.cuh::initScalableKMeansPlusPlus`). Different from #12/#15: the large path's disk-writeback interaction is gone (bucket_vecs / host raw in memory since #36/#42) and SIFT10M was measured too. Identical candidate counts in round 1 (5020 / 5017 / 5026). Patch: `bucketDemo/patches/iter47_kmeans_incremental_dist.patch` | SIFT1M auto 7.38 s (+2.1%: kmeans_parallel 0.245/0.164/0.167 → 0.200/0.114/0.113 s per round), large 11.66 s (+0.3%); recall unchanged (auto 0.9295, large 0.9137 at itopk 32). **SIFT10M (1 run): KMeans|| 15.5 → 10.4 s per round, Step 2 50.3 → 34.7 s, bucket2 154.5 → 139.9 s, total 178.5 → 163.7 s (−8.3%)**, recall@10 itopk 32 0.8396 (vs 0.8375) | judge: SIFT1M gain < 3%. Scales with N (the SIFT1M working set is small). **User decision suggested:** apply for SIFT10M; otherwise bundle with the next SIFT1M Step 2 change |
 | 45 | **Step 6 fused GEMM + top-64 kernel** (user priority, 2026-10-21): `fused_knn.cuh`, sm_70 WMMA fp16; block = 32 query rows × a set of 64-column pool tiles; B tile staged through shared memory with register prefetch; dot tile kept in shared memory; per-row filtered selection (threshold → ballot-compacted shared-memory candidate buffer → raft `util::bitonic` merge into a register top-64); pool split into ≤16 chunks per row with a last-block (atomic ticket) merge; per-row threshold shared across chunks with `atomicMin` on float bits (distances incl. ‖q‖² are exact non-negative integers for 8-bit data); warm-up on tiles 0–1. Exact vs CPU brute force (`patches/iter45_fused_test.cu`: 7 cases, incl. ties, K=32/64, max chunking). Patch: `bucketDemo/patches/iter45_fused_gemm_topk.patch` (resident path only so far) | resident Step 6 loop per round (SIFT1M, 1 run): baseline cuBLAS GEMM + block top-M **0.975 s**; fused v1 (direct global B fragments, serial ballot insert) 2.40 s; v2 (warp_sort_filtered-style queues) 2.2 s; v3 (smem-staged B, 64-col tiles, smem candidate buffer, no spills) 2.1–2.6 s; + shared per-row threshold 1.27 s; + warm-up / cheaper filter 1.34–1.40 s. Same loop with selection compiled out: 0.73–0.76 s | rejected: slower than baseline. ncu (one bucket, real data): 10.5M warp instr, IPC ≈ 0.8/SM, achieved occupancy 12% (124 regs, 42.5 KB smem → 2 blocks/SM); MMA + skeleton alone (0.73 s) already ≈ cuBLAS GEMM + gather, and per-tile selection behind `__syncthreads` adds ~0.6 s/round. The only saving fusion can deliver here is the dots write + read (~8 MB/bucket ≈ 0.1–0.2 s/round); beating cuBLAS + block top-M on V100 would need a warp-specialized (MMA warps ↔ selection warps, double-buffered tiles) pipeline. Idea kept: shared per-row threshold + warm-up could also cut the existing `block_topK_from_dots_kernel` cost |
 | 44 | Out-of-core Step 6 per-bucket API trims (GEMM timing events only with `BUCKET2_GEMM_TIMING`, job table read through UVA-mapped pinned memory instead of a per-bucket H2D) + vectorized `devcache_gather_pool_kernel` (uchar4 loads, half2 stores). Patch: `bucketDemo/patches/iter44_submit_trim_vec_gather.patch` | quick test: gpu_submit 0.80 → 0.62 s/round but stream_sync 0.26 → 0.43 s (loop now GPU-bound, wall ≈ 1.4 s/round unchanged); gather kernel 85 µs/bucket (nsys) before vectorizing; not benchmarked | interrupted by the user (priority changed to #45 / process merge); untested — re-apply together with a GPU-side Step 6 gain |
 | 40 | Out-of-core Step 6 slots: OVERSUB 1.5 → 2.0 (3 → 4 slots on SIFT1M). Sweep: 3 slots 1.59 s/round, 4: 1.43, 6: 1.38 (+0.8 GB GPU). Patch: `bucketDemo/patches/iter40_ooc_4slots.patch` | large 12.87 s (+2.9%), GPU peak 1674–2052 MiB | just under 3%; bundled into accepted #41 |
@@ -1317,6 +1301,51 @@ Borderline → large rerun (`runs/iter38/sift1M_large_b`): 13.98 s (+5.6%), reca
 | ours sift1M_large | 0.9138 / 1945K | 0.9708 / 893K | 0.9923 / 500K | 0.9981 / 187K | 0.9995 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-auto +15.0% (8.87 → 7.54 s, 0.65× CAGRA native), 1M-large +0.5% (path untouched).
+
+### Loop rule change (user, 2026-10-21, 2nd)
+SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, third argument of `judge.py`). A >= 3% SIFT10M build-time gain is accepted as long as neither SIFT1M config is > 3% slower and search passes. SIFT10M quality uses the large-path rule (recall@10 >= CAGRA - 5% at every itopk). The CAGRA SIFT10M search reference was measured now on `evalCuvs/baseline/cagra_sift10M_64_32.bin` (0.8672 / 0.9463 / 0.9839 / 0.9959 / 0.9992). The large-path memory guard also covers SIFT10M. The SIFT10M baseline in best.json is the post-#46 run (`runs/sift10M_after46`, 178.47 s). judge.py: the recall tolerance now follows the path the run took (it used the config-name suffix, i.e. the resident 1% for sift10M_auto).
+
+### #47 — incremental KMeans|| d(x, C) (retry of #12/#15, user request)  (2026-10-21, commit TBD)
+**Idea / rationale:** enter each KMeans|| round with the running min distance d(x, C); compute distances only to the round's new candidates (`min_cluster_distance` vs `CpRaw`) and merge them with `thrust::minimum`. This skips the redundant round-0 recompute and the last-round update nothing reads: work per round goes from all candidates (1 → ~5K → ~10K) to the ~5K new ones. Follows cuVS 26.12 `cluster/detail/kmeans.cuh::initScalableKMeansPlusPlus`. Round-1 candidate counts are identical to the old code (5020 / 5017 / 5026). Judged under the new SIFT10M rule on the measurements from the first #47 run (same code).
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+**SIFT10M:** KMeans|| 15.5 → 10.4 s per round, Step 2 50.3 → 34.7 s, bucket2 154.5 → 139.9 s.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 7.38 | +2.1% | +66.1% | 0.64x | bucket2 7.38 | 3838 | 1.79 |
+| sift1M_large | large | 11.66 | +0.3% | +84.5% | 1.01x | bucket2 9.67, prune 0.84, optimize_chunked 0.65, translate 0.40 | 1674 | 2.76 |
+| sift10M_auto | large | 163.74 | +8.3% | +8.3% | 1.34x | bucket2 139.88, prune 7.05, optimize_chunked 13.33, translate 3.48 | 9454 | 20.07 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.64 | 0.66 | 0.11 | 0.00 | 0.64 | 0.51 | 0.02 | 3.35 | 0.00 | 0.91 |
+| sift1M_large | 0.57 | 0.91 | 0.30 | 0.00 | 1.12 | 0.42 | 0.04 | 5.02 | 0.54 | 0.00 |
+| sift10M_auto | 5.43 | 34.75 | 1.92 | 0.00 | 39.67 | 2.91 | 0.34 | 49.33 | 3.86 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9753 | 0.9666 | 0.9594 | 0.9533 |
+| sift1M_large | 0.9755 | 0.9668 | 0.9590 | 0.9534 |
+| sift10M_auto | 0.9128 | 0.8954 | 0.8810 | 0.8705 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9295 / 2219K | 0.9774 / 1190K | 0.9945 / 562K | 0.9989 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9137 / 1945K | 0.9712 / 1035K | 0.9920 / 480K | 0.9980 / 188K | 0.9995 / 68K |
+| ours sift10M_auto | 0.8396 / 1870K | 0.9280 / 1012K | 0.9736 / 490K | 0.9919 / 180K | 0.9979 / 68K |
+
+**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +8.3% (178.47 → 163.74 s), 1M-auto +2.1% (7.54 → 7.38 s), 1M-large +0.3%.
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

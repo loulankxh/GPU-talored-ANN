@@ -29,10 +29,11 @@ user stops it. Never stop the loop on your own.
 ## Goal
 
 Make both SIFT1M configs faster — `sift1M_auto` (GPU-resident path) and `sift1M_large`
-(large-dataset path forced on SIFT1M) — without hurting search quality. **SIFT10M is not
-tested in the loop for now** (user decision 2026-10-21); the long-term target is still a
-SIFT10M large-path build ≤ 360 s, so prefer large-path ideas that scale with N (and never
-ones that only win because SIFT1M is small). Keep improving until the user stops the loop.
+(large-dataset path forced on SIFT1M) — and `sift10M_auto` (auto-selects the large path;
+1 rep) without hurting search quality. **SIFT10M is tested in every iteration** (user
+decision 2026-10-21, 2nd): a ≥ 3% SIFT10M build-time gain is accepted as long as neither
+SIFT1M config gets > 3% slower and search passes. Prefer large-path ideas that scale with N
+(and never ones that only win because SIFT1M is small). Keep improving until the user stops the loop.
 
 ## Design invariants — never violate
 
@@ -77,19 +78,20 @@ S=/home/lanlu/microBenchmark/.claude/skills/optimize-bucket2/scripts
 R=/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/iter<N>
 bash $S/run_pipeline.sh -d sift1M -m auto  -r 3 -o $R/sift1M_auto     # GPU-resident path: timing median of 3 + quality
 bash $S/run_pipeline.sh -d sift1M -m large -r 3 -o $R/sift1M_large    # large-dataset path (out-of-core + prune_windowed + optimize_chunked -m E): median of 3 + quality + memory
+bash $S/run_pipeline.sh -d sift10M -m auto -r 1 -o $R/sift10M_auto    # SIFT10M (auto → large path), 1 run (~3 min): timing + quality + memory
 ```
 Run them with `run_in_background` and wait for the completion notification. Any non-zero exit / "FAILED" = reject (after checking it isn't an environment issue such as a busy GPU or full disk; `df -h /home/lanlu` must keep > 50 GB free).
 Quality measured per run: (a) `knn_similarity` — pre-prune degree-64 `vector_knn` vs exact KNN (recall@1/10/32/64 on 10K sampled points); (b) `search` — final translated degree-32 graph through the cuVS CAGRA searcher, **recall@10 and QPS** at itopk 32…512 (+ graph defect counts). Always keep both recall and QPS in the log.
 
 ### 4. Judge
 ```bash
-python3 $S/judge.py $R/sift1M_auto $R/sift1M_large --md
+python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto --md
 ```
-Rules are in judge.py's docstring (≥3% faster on SIFT1M-auto or SIFT1M-large, neither >3% slower; search recall@10 at every itopk compared with CAGRA only: GPU-resident path ≥ CAGRA−1%, large-dataset path ≥ CAGRA−5% (pre-prune KNN similarity is logged, not gated); large-path memory ≤ 1.2× best; no graph defects).
+Rules are in judge.py's docstring (≥3% faster on SIFT1M-auto, SIFT1M-large or SIFT10M-auto, no config >3% slower; search recall@10 at every itopk compared with CAGRA only: GPU-resident path ≥ CAGRA−1%, large-dataset path ≥ CAGRA−5% (pre-prune KNN similarity is logged, not gated); large-path memory ≤ 1.2× best; no graph defects).
 - If a gain is borderline (3–5%), rerun that config once more into `<dir>_b` and judge with it too; accept only if both pass.
 
 ### 5a. ACCEPT
-1. `python3 $S/judge.py $R/sift1M_auto $R/sift1M_large --update --md` (writes `state/best.json`).
+1. `python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto --update --md` (writes `state/best.json`).
 2. Append an entry to `OPTIMIZATION_LOG.md` (template in the log), pasting the `--md` tables, and update its **Current best** block.
 3. Commit on `opt/bucket2-loop`: sources, `params.sh`, `state/best.json`, the log. Message: `bucket2 opt #<N>: <idea>` + the attribution line from the system prompt. Don't commit `runs/`.
 
