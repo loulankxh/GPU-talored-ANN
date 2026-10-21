@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#10 (out-of-core Step 6: pool build on a producer thread)**, 2026-10-21:
+After **#11 (NPROBE 250 → 150)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **17.22** | 0.9299 / 0.9780 / 0.9948 | 1946K / 1035K |
-| SIFT1M large (out-of-core path) | **43.39** | 0.8964 / 0.9621 / 0.9886 | 1944K / 1034K |
+| SIFT1M auto (GPU-resident) | **16.15** | 0.9296 / 0.9774 / 0.9942 | 1935K / 1019K |
+| SIFT1M large (out-of-core path) | **38.98** | 0.8973 / 0.9619 / 0.9886 | 1944K / 954K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -68,6 +68,9 @@ Other:
 - bucket2 Step 4 out-of-core (8.8s vs 3.3s resident): per round convert_upload ~0.6s + search 0.7s + bucket_write + finish_iteration; ChunkedKNN merge_iteration write_running ~1.1s/chunk in rounds ≥2.
 
 - **Bucket-size outliers break the GPU-memory bound (found in #9):** the balanced assignment (`batch_assign_with_cagra_anns`, CPU step 4d) reads `cluster_sizes` with relaxed atomics from all threads, so bucket sizes differ run to run despite the fixed seed; occasionally a round produces a bucket ~30x the average (SIFT1M large: max 3201 vs avg 100; resident run in #6: 1980). Out-of-core Step 6 sizes its per-slot `dots` buffers from max_pool (0.72 GB/slot × 3 instead of ~0.2 GB) → GPU peak 2708 MiB instead of ~1450. Fix: cap bucket size (spill to the 2nd-nearest centroid when a bucket exceeds e.g. 4–8× avg), or tile the oversized bucket's GEMM; also makes the build deterministic if done per batch in a fixed order.
+
+- **NPROBE 100** (measured in #11, 1 run each): auto 15.70 s, large 36.79 s (vs 16.79 / 39.32 at 150), search recall@10 itopk 32 auto 0.9269 (CAGRA 0.9305, gate 0.9205), pre-prune KNN recall@64 0.938. Passes the gate but spends 0.3 pt of resident recall headroom — user decision.
+- **Resident Step 6 is GPU-bound, not launch-bound** (#11 probe): launching from 4 host threads changed nothing (launches block on a full queue). Kernel elimination per round (1.19 s loop, NPROBE 250): gather ~0.15 s, GEMM ~0.4 s, block top-M ~0.5 s; without GEMM+top-M 0.23 s. top-M block shape G=4/8/16 all ≈ same. Real fix = never materialize the (bucket × pool) dots matrix: fused GEMM + top-M (cuVS 26.12 `detail/fused_l2_knn.cuh` / `knn_brute_force.cuh`), or shrink the pool (#11).
 
 ## Tried & rejected
 
@@ -488,6 +491,41 @@ Borderline large gain → reruns: `sift1M_large_b` +3.23% but **REJECT on GPU pe
 | ours sift1M_large | 0.8964 / 1944K | 0.9621 / 1034K | 0.9886 / 490K | 0.9973 / 186K | 0.9995 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +7.5% (46.90 → 43.39 s; Step 6 20.65 → 16.76 s), 1M-auto −0.2% (path untouched). GPU peak 1500–1610 MiB.
+
+### #11 — NPROBE 250 → 150  (2026-10-21)
+**Idea / rationale:** Step 6 cost on both paths is proportional to the pool size per bucket (own bucket + `nprobe` nearest buckets ≈ nprobe × avg bucket size candidates per query): the resident loop is GPU-bound on the materialized (bucket × pool) dots matrix (GEMM write + top-M read), the out-of-core loop on pool building and the same GPU work. Parameter sweep (1 run each): NPROBE 150 → auto 16.79 s / large 39.32 s, search recall@10 within 0.001 of NPROBE 250; NPROBE 100 → 15.70 / 36.79 s but −0.3 pt resident recall at itopk 32 (kept in backlog as a user decision). Chose 150. Analogous to cuVS IVF-based kNN-graph builds, which search only `n_probes` lists per query and rely on refinement + the CAGRA prune to recover quality. **Trade-off recorded:** pre-prune degree-64 KNN recall@64 drops 0.984 → 0.963 (not gated); final graph search recall unchanged within 0.001 (resident 0.9296 vs CAGRA 0.9305 at itopk 32).
+**Files:** —  **Params changed:** `NPROBE=150` (was 250)
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 16.15 | +6.2% | +25.7% | 1.40x | bucket2 14.51, optimize 1.32, translate 0.37 | 3710 | 1.60 |
+| sift1M_large | large | 38.98 | +10.2% | +48.1% | 3.38x | bucket2 31.21, prune 3.95, optimize_chunked 3.44, translate 0.48 | 1220 | 4.08 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.74 | 3.18 | 1.37 | 0.00 | 2.17 | 1.09 | 0.02 | 4.58 | 0.00 | 0.75 |
+| sift1M_large | 0.56 | 4.67 | 1.62 | 0.00 | 5.79 | 2.16 | 0.03 | 12.36 | 2.02 | 1.06 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9786 | 0.9746 | 0.9679 | 0.9628 |
+| sift1M_large | 0.9813 | 0.9750 | 0.9686 | 0.9640 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9296 / 1935K | 0.9774 / 1019K | 0.9942 / 518K | 0.9987 / 188K | 0.9997 / 68K |
+| ours sift1M_large | 0.8973 / 1944K | 0.9619 / 954K | 0.9886 / 561K | 0.9972 / 189K | 0.9994 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +6.2% (17.22 → 16.15 s; Step 6 5.65 → 4.58 s), 1M-large +10.2% (43.39 → 38.98 s; Step 6 16.76 → 12.36 s).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
