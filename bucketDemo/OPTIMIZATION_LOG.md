@@ -1149,7 +1149,7 @@ Borderline → large rerun (`runs/iter38/sift1M_large_b`): 13.98 s (+5.6%), reca
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +6.8% (14.22 → 13.26 s, 1.15× CAGRA native), 1M-auto 0.0% (path untouched).
 
-### #41 — out-of-core Step 6: 4 slots + fused ids/dists D2H  (2026-10-21, commit TBD)
+### #41 — out-of-core Step 6: 4 slots + fused ids/dists D2H  (2026-10-21, commit 24d5d1c)
 **Idea / rationale:** bundle the #40 slot change (OVERSUB 1.5 → 2.0, 3 → 4 in-flight slots) with one fused device→host copy per slot: block top-M writes dists right after the ids in `d_out_neighbors[slot]` (buffer sized 2×`bytes_out`), so each slot does one D2H instead of two, and the scatter thread reads dists from `h_out[slot] + n_out`. This follows cuVS 26.12 `detail/cagra/cagra_build.cuh::build_knn_graph`, which batches results into one pinned staging buffer per batch.
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
