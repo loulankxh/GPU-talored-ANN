@@ -131,10 +131,11 @@ set_target_properties(reorder PROPERTIES
 # why this is CPU-only rather than a CUDA kernel. Feeds optimize_chunked's
 # forward-graph input (any method, but paired with --method E and the same
 # --bucket-offsets is the intended large-scale path).
-add_executable(prune_windowed ${BUILD_SRC_PATH}/prune_windowed.cpp)
+add_executable(prune_windowed ${BUILD_SRC_PATH}/prune_windowed.cpp ${BUILD_SRC_PATH}/prune_windowed_gpu.cu)
 
 target_link_libraries(prune_windowed
     PRIVATE
+    CUDA::cudart
     OpenMP::OpenMP_CXX
     Boost::program_options
 )

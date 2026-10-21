@@ -61,6 +61,7 @@
 #include "graph_io.hpp"
 #include "load.hpp"
 #include "prune_windowed_core.hpp"
+#include "prune_windowed_gpu.hpp"
 
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
@@ -299,17 +300,18 @@ int main(int argc, char** argv)
             const size_t n_vec  = static_cast<size_t>(N) * D_all;
             std::unique_ptr<int32_t[]> all_cand_buf(new int32_t[n_cand]);   // 不初始化，pread 直接填
             std::unique_ptr<float[]>   all_vec_buf(new float[n_vec]);
+            std::unique_ptr<uint8_t[]> raw_u8;   // u8 数据集时保留原始字节给 GPU kernel
             // vector_knn.bin: int64 N + int32 M header (12 B)，之后 (N, M) int32
             parallel_pread(vknn_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
                            n_cand * sizeof(int32_t), all_cand_buf.get());
             if (dataset_ext == ".u8bin" || dataset_ext == ".i8bin") {
                 // 跟 load::read_u8bin_chunk_to_f32 同样的转换 (按 uint8 读)，并行做
-                std::unique_ptr<uint8_t[]> raw(new uint8_t[n_vec]);
-                parallel_pread(dataset_path, static_cast<off_t>(2 * sizeof(int32_t)), n_vec, raw.get());
+                raw_u8.reset(new uint8_t[n_vec]);
+                parallel_pread(dataset_path, static_cast<off_t>(2 * sizeof(int32_t)), n_vec, raw_u8.get());
                 float* out = all_vec_buf.get();
                 #pragma omp parallel for schedule(static)
                 for (int64_t i = 0; i < static_cast<int64_t>(n_vec); ++i)
-                    out[i] = static_cast<float>(raw[static_cast<size_t>(i)]);
+                    out[i] = static_cast<float>(raw_u8[static_cast<size_t>(i)]);
             } else {
                 std::vector<float> tmp;
                 int32_t D_tmp = 0;
@@ -330,6 +332,39 @@ int main(int argc, char** argv)
                              all_cand + static_cast<size_t>(lo) * M_in,
                              all_vec + static_cast<size_t>(lo) * D_all};
             };
+            // ---- GPU fast path (u8 数据, M_in ≤ 64, 放得进显存): 同样的窗口语义，
+            // 一个 warp 一个点 (见 prune_windowed_gpu.cu)。窗口 = 处理位置 p 自己
+            // + 它的 centroid-knn 近邻桶所在的位置，按位置排序去重。
+            const int32_t Wmax = static_cast<int32_t>(ck.K) + 1;
+            if (raw_u8 && prune_windowed_gpu::available(N, M_in, D_all, n_buckets, Wmax, output_degree)) {
+                auto tg0 = Clock::now();
+                std::vector<int32_t> win(static_cast<size_t>(n_buckets) * Wmax, std::numeric_limits<int32_t>::max());
+                std::vector<int32_t> win_len(static_cast<size_t>(n_buckets), 0);
+                for (int32_t pos = 0; pos < n_buckets; ++pos) {
+                    int32_t* wp = win.data() + static_cast<size_t>(pos) * Wmax;
+                    int32_t len = 0;
+                    wp[len++] = pos;
+                    for (int32_t nbk : adj[static_cast<size_t>(order[static_cast<size_t>(pos)])]) {
+                        if (nbk < 0 || nbk >= n_buckets) continue;
+                        if (len >= Wmax) throw std::runtime_error("prune_windowed: window larger than K+1");
+                        wp[len++] = pos_of[static_cast<size_t>(nbk)];
+                    }
+                    std::sort(wp, wp + len);
+                    len = static_cast<int32_t>(std::unique(wp, wp + len) - wp);
+                    win_len[static_cast<size_t>(pos)] = len;
+                }
+                std::vector<uint32_t> out_rows(static_cast<size_t>(N) * output_degree);
+                prune_windowed_gpu::run(all_cand, raw_u8.get(), N, M_in, D_all,
+                                        offsets_new.data(), n_buckets, win, win_len, Wmax,
+                                        output_degree, out_rows.data());
+                t_compute += std::chrono::duration<double>(Clock::now() - tg0).count();
+                auto tr0 = Clock::now();
+                writer.write_rows(out_rows.data(), 0, N);
+                t_write += std::chrono::duration<double>(Clock::now() - tr0).count();
+                min_center_count = max_center_count = 0;
+                std::cout << "  mode=batched+GPU\n";
+                goto pruned_done;
+            }
             std::vector<prune_windowed::BucketWindow> windows(
                 static_cast<size_t>(kBatch), prune_windowed::BucketWindow(offsets_new.data(), n_buckets));
             std::vector<Slice> centers(static_cast<size_t>(kBatch));
@@ -401,6 +436,7 @@ int main(int argc, char** argv)
             }
         }
 
+pruned_done:
         for (int32_t pos = 0; !batched && pos < n_buckets; ++pos) {
             int32_t b = order[static_cast<size_t>(pos)];
 

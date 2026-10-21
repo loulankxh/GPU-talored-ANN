@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#36 (out-of-core bucket_vecs kept in memory within cpu_limit/4)**, 2026-10-21 — auto 9.18 s (0.80x), large **14.81 s (1.28x CAGRA)**; table below is from #35:
+After **#38 (prune_windowed batched path on the GPU)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **9.19** (0.80x CAG0.9285 / 0.9768 / 0.9942) | 0.9285 / 0.9768 / 0.9942 | 1948K / 1034K |
-| SIFT1M large (out-of-core path) | **15.89** (1.38x CAG0.9285 / 0.9768 / 0.9942) | 0.8995 / 0.9631 / 0.9892 | 1941K / 1035K |
-| CAG0.9285 / 0.9768 / 0.9942 native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
+| SIFT1M auto (GPU-resident) | **9.23** (0.80x CAG0.9283 / 0.9770 / 0.9944) | 0.9283 / 0.9770 / 0.9944 | 2220K / 1190K |
+| SIFT1M large (out-of-core path) | **14.22** (1.23x CAG0.9283 / 0.9770 / 0.9944) | 0.9145 / 0.9709 / 0.9921 | 2218K / 1189K |
+| CAG0.9283 / 0.9770 / 0.9944 native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
 
@@ -1074,6 +1074,44 @@ Same structure as cuVS 26.12 `detail/cagra/cagra_build.cuh::build_knn_graph` (se
 | ours sift1M_large | 0.8996 / 1945K | 0.9632 / 1031K | 0.9892 / 500K | 0.9972 / 186K | 0.9993 / 68K |
 
 **Verdict:** ACCEPT — 1M-large +6.8% (15.89 → 14.81 s, 1.28× CAGRA native), 1M-auto +0.1% (path untouched).
+
+### #38 — prune_windowed batched path on the GPU  (2026-10-21)
+**Idea / rationale:** after #18 the large path's prune stage spent ~1.0 s in CPU detour counting (memory-latency bound: per point ~64 random 256 B candidate-row reads + window binary searches). New `src/prune_windowed_gpu.cu` (linked into `prune_windowed`, used in batched mode for uint8 data with M_in ≤ 64 when the working set fits free GPU memory; CPU batched/per-position paths unchanged otherwise): one warp per point — candidate distances (exact u8 L2, +inf outside the window), shared-memory bitonic sort by (padding last, dist, original column), id→rank open-addressing table, detour counting over each in-window D's row with a per-rank `atomicExch` stamp ("count each (D, B) once"), selection of the first out_deg by (detour count, rank) — the same rules as `prune_windowed_core.hpp`. Window per position = itself + its centroid-knn neighbour buckets' positions (sorted, binary-searched); out-of-range ids treated as outside the window; too-few-candidates → error. cuVS 26.12 reference: `detail/cagra/graph_core.cuh::kern_fused_prune`. prune 1.37 → 0.85 s.
+**Quality side effect (positive):** the GPU sort breaks distance ties by original column. ~59% of candidates are outside the window (distance +inf) and the CPU's unstable `std::sort` left those in arbitrary order; the column order is bucket2's true-distance order. A Python spec of the prune rules matched the GPU output on 8/8 sampled points (CPU: 2/8). Large-path search recall@10 itopk 32 / 64: 0.8995 / 0.9631 → 0.9145 / 0.9709 (rerun 0.9135 / 0.9699). Worth porting the same tie-break to the CPU path (`sort_row_by_l2`: `std::stable_sort`, or compare by (dist, k)).
+**Files:** `src/prune_windowed_gpu.cu` (new), `src/prune_windowed_gpu.hpp` (new), `src/prune_windowed.cpp`, `CMakeLists.txt`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 9.23 | -0.5% | +57.6% | 0.80x | bucket2 7.50, optimize 1.29, translate 0.43 | 3838 | 1.38 |
+| sift1M_large | large | 14.22 | +4.0% | +81.1% | 1.23x | bucket2 11.30, prune 0.86, optimize_chunked 1.59, translate 0.38 | 1398 | 2.78 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.75 | 1.10 | 0.10 | 0.00 | 0.70 | 0.43 | 0.02 | 3.36 | 0.00 | 0.47 |
+| sift1M_large | 0.57 | 1.47 | 0.15 | 0.00 | 2.16 | 0.45 | 0.03 | 5.27 | 0.44 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9761 | 0.9669 | 0.9596 | 0.9537 |
+| sift1M_large | 0.9744 | 0.9666 | 0.9595 | 0.9534 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9283 / 2220K | 0.9770 / 1190K | 0.9944 / 562K | 0.9987 / 189K | 0.9996 / 68K |
+| ours sift1M_large | 0.9145 / 2218K | 0.9709 / 1189K | 0.9921 / 562K | 0.9982 / 189K | 0.9995 / 68K |
+
+Borderline → large rerun (`runs/iter38/sift1M_large_b`): 13.98 s (+5.6%), recall 0.9135 → ACCEPT.
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +4.0% / +5.6% on rerun (14.81 → 14.22 s, 1.23× CAGRA native) and +1.5 pt large-path recall at itopk 32; 1M-auto −0.5% (path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
