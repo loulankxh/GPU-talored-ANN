@@ -839,7 +839,9 @@ struct BucketVectorAccumulator {
     int64_t D = 0;
 
     struct BucketBuf {
-        std::vector<char> data;
+        // 不初始化 (原来 vector<char>::resize 把 ~1 GB 写缓冲整份清零，SIFT1M
+        // 第一轮 bucket_vec_create ≈ 0.75 s)；只按 capacity_records 读写
+        std::unique_ptr<char[]> data;
         size_t capacity_records = 0;
         size_t count = 0;           // 当前缓冲区里还没 flush 的记录数
         int64_t total_count = 0;    // histogram 给出的、这个 bucket 本轮最终的记录数
@@ -877,7 +879,7 @@ struct BucketVectorAccumulator {
         acc.bufs.resize(static_cast<size_t>(n_centroids));
         for (auto& b : acc.bufs) {
             b.capacity_records = cap_records;
-            b.data.resize(cap_records * rec_bytes);
+            b.data.reset(new char[cap_records * rec_bytes]);
         }
 
         std::cout << "[BucketVecCache] n_centroids=" << n_centroids << " D=" << D
@@ -922,7 +924,7 @@ struct BucketVectorAccumulator {
         size_t rec_bytes = record_bytes(D);
         size_t nbytes = b.count * rec_bytes;
         merged_out.seekp(static_cast<std::streamoff>(b.write_cursor));
-        merged_out.write(b.data.data(), static_cast<std::streamsize>(nbytes));
+        merged_out.write(b.data.get(), static_cast<std::streamsize>(nbytes));
         if (!merged_out.good())
             throw std::runtime_error("BucketVectorAccumulator: flush failed for bucket " + std::to_string(c));
         b.write_cursor += static_cast<int64_t>(nbytes);
@@ -944,8 +946,8 @@ struct BucketVectorAccumulator {
 
         size_t rec_bytes = record_bytes(D);
         size_t off = b.count * rec_bytes;
-        std::memcpy(b.data.data() + off, &gid, sizeof(int64_t));
-        std::memcpy(b.data.data() + off + sizeof(int64_t), vec, static_cast<size_t>(D) * sizeof(DataT));
+        std::memcpy(b.data.get() + off, &gid, sizeof(int64_t));
+        std::memcpy(b.data.get() + off + sizeof(int64_t), vec, static_cast<size_t>(D) * sizeof(DataT));
         ++b.count;
         if (b.count == b.capacity_records) flush_bucket(bucket_id);
     }
@@ -4153,19 +4155,35 @@ struct DevPoolJob {
     int32_t dest;         // 在 pool 里的起始行
 };
 
+// 一个 block 一个桶 (job)，一个 warp 一行：写 fp16 行 + gid，顺手算 ‖row‖²
+// (8-bit 值在 fp16/fp32 里都精确，跟 compute_row_norms_kernel 从 d_B 读回来
+// 算的结果完全一样)，省掉单独的 norms kernel。
 template <typename DataT>
 __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
                                             __half* __restrict__ B, int32_t* __restrict__ ids_pool,
-                                            int D)
+                                            float* __restrict__ norms_pool, int D)
 {
     const DevPoolJob jb = jobs[blockIdx.x];
     const DataT* v = static_cast<const DataT*>(jb.vecs);
-    for (int r = threadIdx.x; r < jb.count; r += blockDim.x)
-        ids_pool[jb.dest + r] = jb.ids[r];
-    const int64_t n = static_cast<int64_t>(jb.count) * D;
-    __half* out = B + static_cast<int64_t>(jb.dest) * D;
-    for (int64_t e = threadIdx.x; e < n; e += blockDim.x)
-        out[e] = __float2half_rn(static_cast<float>(v[e]));
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+    for (int r = warp; r < jb.count; r += nwarps) {
+        const DataT* src = v + static_cast<int64_t>(r) * D;
+        __half* dst = B + static_cast<int64_t>(jb.dest + r) * D;
+        float acc = 0.f;
+        for (int e = lane; e < D; e += 32) {
+            float x = static_cast<float>(src[e]);
+            __half h = __float2half_rn(x);
+            dst[e] = h;
+            float xh = __half2float(h);
+            acc += xh * xh;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) {
+            norms_pool[jb.dest + r] = acc;
+            ids_pool[jb.dest + r] = jb.ids[r];
+        }
+    }
 }
 
 // 释放前必须等到最后一次读它的 gather 已经完成 (由 ctx 提供: 等主线程提交到
@@ -4968,14 +4986,16 @@ void build_vector_knn_with_tensorcore(
             // ---- 3c/3d (dev 缓存): 等这个位置的桶加载完，按 job 表 gather pool ----
             const int nj = n_jobs_staged[slot];
             CUDA_CHECK(cudaStreamWaitEvent(streams[slot], ev_load[slot], 0));
-            CUDA_CHECK(cudaMemcpyAsync(d_ids_bucket[slot], h_ids_bucket[slot],
-                                       bucket_size * sizeof(int32_t),
-                                       cudaMemcpyHostToDevice, streams[slot]));
+            if (actual_M > 256)   // 只有 raft select_k 回退路径读 d_ids_bucket
+                CUDA_CHECK(cudaMemcpyAsync(d_ids_bucket[slot], h_ids_bucket[slot],
+                                           bucket_size * sizeof(int32_t),
+                                           cudaMemcpyHostToDevice, streams[slot]));
             CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
                                        cudaMemcpyHostToDevice, streams[slot]));
             CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));
             devcache_gather_pool_kernel<DataT><<<nj, 256, 0, streams[slot]>>>(
-                d_jobs[slot], reinterpret_cast<__half*>(d_B[slot]), d_ids_pool[slot], static_cast<int>(D));
+                d_jobs[slot], reinterpret_cast<__half*>(d_B[slot]), d_ids_pool[slot],
+                d_norms_pool[slot], static_cast<int>(D));
             CUDA_CHECK(cudaGetLastError());
             {
                 // gather 完成事件 (淘汰等待用)；环形表覆盖前先确认旧位置已完成
@@ -4989,13 +5009,7 @@ void build_vector_knn_with_tensorcore(
                 submitted_pos = pos;
             }
             stage_cv.notify_all();
-            {
-                const int threads = 256;
-                int64_t blocks_n = (pool_size + threads - 1) / threads;
-                compute_row_norms_kernel<GemmInT><<<blocks_n, threads, 0, streams[slot]>>>(
-                    d_B[slot], d_norms_pool[slot], pool_size, D);
-                CUDA_CHECK(cudaGetLastError());
-            }
+            // (norms 已在 gather kernel 里算好)
         } else {
         // ---- 3c: 上传 id 列表 + 原始向量 (async on slot stream) ----
         CUDA_CHECK(cudaMemcpyAsync(d_ids_bucket[slot], h_ids_bucket[slot],

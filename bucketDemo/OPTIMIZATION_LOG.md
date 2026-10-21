@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#33 (out-of-core Step 6: GPU-side Belady bucket cache, pools gathered on the GPU)**, 2026-10-21:
+After **#34 (large-path per-bucket overheads: fused norms, skipped H2D, uninitialised write buffers)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **9.35** (0.81x CAG0.9296 / 0.9778 / 0.9945) | 0.9296 / 0.9778 / 0.9945 | 1943K / 1034K |
-| SIFT1M large (out-of-core path) | **18.63** (1.61x CAG0.9296 / 0.9778 / 0.9945) | 0.8993 / 0.9627 / 0.9893 | 1938K / 1032K |
-| CAG0.9296 / 0.9778 / 0.9945 native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
+| SIFT1M auto (GPU-resident) | **9.39** (0.81x CAG0.9290 / 0.9774 / 0.9944) | 0.9290 / 0.9774 / 0.9944 | 2152K / 1186K |
+| SIFT1M large (out-of-core path) | **16.81** (1.46x CAG0.9290 / 0.9774 / 0.9944) | 0.8998 / 0.9637 / 0.9893 | 2219K / 1190K |
+| CAG0.9290 / 0.9774 / 0.9944 native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
 
@@ -968,6 +968,41 @@ Same structure as cuVS 26.12 `detail/cagra/cagra_build.cuh::build_knn_graph` (se
 | ours sift1M_large | 0.8993 / 1938K | 0.9627 / 1032K | 0.9893 / 533K | 0.9972 / 188K | 0.9994 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +11.7% (21.11 → 18.63 s, 1.61× CAGRA native), 1M-auto +1.4% (path untouched). GPU peak 1386–1620 MiB (gate 1919).
+
+### #34 — large-path per-bucket overheads: fused norms, skipped H2D, uninitialised write buffers  (2026-10-21)
+**Idea / rationale:** after #33 the out-of-core bucket loop was bound by `gpu_submit` (~1.0 s/round, ~10 CUDA API calls per bucket). (1) `devcache_gather_pool_kernel` now works one warp per row and also writes ‖row‖² (exact for 8-bit data — identical to `compute_row_norms_kernel` reading the fp16 rows back), so the separate norms kernel launch per bucket is gone. (2) The `d_ids_bucket` H2D is skipped when the block top-M kernel is used (only the raft fallback for M > 256 reads it). (3) `BucketVectorAccumulator`'s ~1 GB of per-bucket write buffers were `vector<char>::resize`d (zero-filled) every create → uninitialised `unique_ptr<char[]>` (only ever written before read): round-1 `bucket_vec_create` 0.75 → 0.03 s and bucket2 peak RSS 3.6 → 2.8 GB (pages touched lazily). cuVS 26.12 reference: `detail/cagra/graph_core.cuh` fuses norm/prune work into the gather kernels instead of separate launches. Loop 1.95 → 1.6 s/round.
+**Files:** `src/bucket.cu`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 9.39 | -0.4% | +56.8% | 0.81x | bucket2 7.69, optimize 1.29, translate 0.38 | 3990 | 1.38 |
+| sift1M_large | large | 16.81 | +9.8% | +77.6% | 1.46x | bucket2 13.40, prune 1.40, optimize_chunked 1.63, translate 0.47 | 1566 | 2.82 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.76 | 1.10 | 0.09 | 0.00 | 0.65 | 0.67 | 0.02 | 3.35 | 0.00 | 0.48 |
+| sift1M_large | 0.57 | 1.50 | 0.16 | 0.00 | 3.13 | 0.78 | 0.03 | 5.92 | 0.45 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9748 | 0.9674 | 0.9595 | 0.9535 |
+| sift1M_large | 0.9725 | 0.9669 | 0.9600 | 0.9539 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9290 / 2152K | 0.9774 / 1186K | 0.9944 / 562K | 0.9988 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.8998 / 2219K | 0.9637 / 1190K | 0.9893 / 563K | 0.9973 / 189K | 0.9992 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +9.8% (18.63 → 16.81 s, 1.46× CAGRA native), 1M-auto −0.4% (path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
