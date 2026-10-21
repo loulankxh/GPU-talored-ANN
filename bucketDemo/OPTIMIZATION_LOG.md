@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#61 (resident block top-M seeded with the running K-th distance in rounds 2..t)**, 2026-10-21:
+After **#64 (out-of-core Step 6: whole-round bucket blob on the GPU + non-blocking running-k-th seed)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **6.31** (0.55x CAGRA) | 0.9272 / 0.9769 / 0.9942 | 2222K / 1192K |
-| SIFT1M large (out-of-core path) | **10.12** (0.88x CAGRA) | 0.9135 / 0.9708 / 0.9921 | 1950K / 1036K |
-| SIFT10M auto (→ large path, 1 run) | **95.94** (0.78x CAGRA) | 0.8400 / 0.9291 / 0.9737 | 1868K / 974K |
+| SIFT1M auto (GPU-resident) | **6.31** (0.55x CAGRA; #61) | 0.9272 / 0.9769 / 0.9942 | 2222K / 1192K |
+| SIFT1M large (out-of-core path) | **9.80** (0.85x CAGRA) | 0.9143 / 0.9706 / 0.9920 | 2219K / 1188K |
+| SIFT10M auto (→ large path, 1 run) | **87.75** (0.72x CAGRA) | 0.8381 / 0.9284 / 0.9732 | 1870K / 1001K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -81,7 +81,6 @@ Other:
 
 | # | idea | result | reason |
 |---|---|---|---|
-| 63 | #62 without the extra wait: the merge thread fills `kth_work` and publishes it as `kth_done` under a mutex when the round's merge finishes; Step 6 seeds from the last *completed* merge (never waits; round 3 falls back to round 1's k-th if round 2's merge is still running — still a valid upper bound since running k-th only shrinks). Patch: `bucketDemo/patches/iter63_ooc_kth_seed_nowait.patch` | 1M-large 9.65 s (+4.6%) then rerun 9.91 s (+2.1%); 10M 95.13 s (+0.8%: round-2 loop 13.4 → 12.1 s, round 3 seeded with round 1's k-th: 13.4 s, no gain); 1M-auto −0.8% | borderline gain not confirmed on rerun. Real but small (~1.2 s on 10M, ~0.2 s on 1M-large) — bundle with the next out-of-core Step 6 host-side gain |
 | 62 | Out-of-core version of #61: `ChunkedKnnAccumulator::merge_iteration` records each point's running M-th distance (`kth`, N floats) in non-final rounds; Step 6 of rounds 2..t waits for that merge, uploads `kth` and the block top-M seeds its shared row threshold by gid. Patch: `bucketDemo/patches/iter62_ooc_kth_seed.patch` | one-off SIFT10M (t=2): round-2 loop 13.3 → 12.1 s (stream_sync 4.4 → 2.6 s). Benchmark: 1M-large 10.58 s (−4.5%, Step 6 4.46 → 5.16 s), 10M 101.52 s (−5.8%, Step 6 44.5 → 51.2 s), 1M-auto −1.3% | judge: two configs > 3% slower. Waiting for the previous merge before Step 6 (instead of after it) puts the merge on the critical path / makes it compete with Step 6 for CPU and disk; the out-of-core loop is host-bound after the seed. Would need the seed without the extra synchronisation (e.g. seed from round t−2's kth, already complete) |
 | 60 | Block top-M kernel: per-warp batched filtered queue (raft `warp_sort_filtered` style on public `raft::util::bitonic`, 4-slot per-lane buffer, bitonic merge when full) instead of serial `warp_topk_insert`; shared row threshold kept. Motivation: nsys after #49 — top-M 49% of out-of-core Step 6 GPU time (127 µs/bucket), gather 26%, GEMMs ~22%; ncu: one 182-row launch = 22.4M warp instructions (~120K/row, mostly the per-candidate inserts) | quick test (1 run): resident loop 0.907 → 1.14 s/round, out-of-core 1.25 → 1.39 s/round | rejected without the full benchmark: the bitonic merges (sort 128 / merge 64 per flush) cost more than the serial inserts at this K/pool size — same finding as #45. Remaining idea: fewer passing candidates (tighter threshold seeded from the running KNN's K-th distance in rounds 2..t) rather than a cheaper insert |
 | 59 | Out-of-core Step 6 slots after #49: OVERSUB 2.0 / 3.0 / 4.0 (4 / 5 / 7 streams), SIFT1M large quick sweep (1 run each) | loop/round 1.25 1.19 1.10 / 1.17 1.13 1.17 / 1.11 1.16 1.07 s; Step 6 4.33 / 4.32 / 4.15 s | not benchmarked: differences within run-to-run noise — the loop is GPU-throughput-bound since #49, more concurrent small kernels don't help |
@@ -1690,6 +1689,48 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8400 / 1868K | 0.9291 / 974K | 0.9737 / 535K | 0.9919 / 186K | 0.9979 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-auto +7.5% (6.82 → 6.31 s, 0.55× CAGRA native), 1M-large +1.1%, 10M-auto +0.2% (both paths untouched).
+
+### #64 — out-of-core Step 6: whole-round bucket blob uploaded to the GPU once + non-blocking running-k-th seed (#63)  (2026-10-21, commit TBD)
+**Idea / rationale:** (1) Each GPU bucket-cache load on the producer thread cost ~58 µs (host Belady `get` that repacks the bucket's interleaved records into a `VecBucket`, int32 id conversion, `cudaMallocAsync`, two small pageable H2D copies), ×100K buckets per round on SIFT10M. The main thread waited ~2 s/round for the producer. But a round's bucket data is already one contiguous host blob: round 1 = the reordered raw dataset (`raw_host`, #42; bucket = row range, gid = row index), rounds 2..t = `BucketVectorAccumulator`'s in-memory record buffer (#36; int64 gid + D bytes per record). When it fits the GPU bucket-cache budget (`--gpu-bucket-cache-mb`, 2 GB; SIFT10M 1.28 / 1.36 GB) it is uploaded once per round through pinned double-buffered staging (`h2d_staged`, ~0.3 s). The device cache's loader then hands out `DevBucket`s that point into the blob (no allocation / copy / host repack; eviction is a no-op), and gather jobs carry the layout (`DevPoolJob.mode`: 1 = records, 2 = rows with implicit gid) so `devcache_gather_pool_kernel` reads either directly. The center bucket's gids for the scatter also come from the host blob. A blob over budget keeps the per-bucket Belady path (the large path still doesn't depend on the data fitting on the GPU); `BUCKET2_BLOB=0` disables it. Readers: `BucketVectorAccumulator::blob_layout/blob_locate`, `ReorderedDatasetBucketReader::set_host_data/blob_layout/blob_locate`. (2) Bundled #63 patch: the background ChunkedKNN merge publishes each point's running M-th distance (`kth_done`, swapped in under a mutex at the end of a non-final merge); Step 6 of rounds 2..t seeds the block top-M's shared row threshold by gid from the last *completed* merge, never waiting (an older round's k-th is still a valid upper bound). Same filtering idea as #61 / raft `warp_sort_filtered`; pinned staging as in cuVS 26.12 `cagra_build.cuh::build_knn_graph`.
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`, `reordered_dataset_io.hpp`
+**Params changed:** none
+**SIFT10M Step 6:** 44.5 → 37.1 s (producer wait 2.0 → 0.05–0.09 s/round; seeded loops 13.2 → 10.5–10.8 s); bucket2 peak RSS 13.7 → 12.8 GB.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.36 | -0.8% | +70.8% | 0.55x | bucket2 6.36 | 4060 | 1.71 |
+| sift1M_large | large | 9.80 | +3.2% | +87.0% | 0.85x | bucket2 7.98, prune 0.72, optimize_chunked 0.66, translate 0.42 | 1872 | 2.07 |
+| sift10M_auto | large | 87.75 | +8.5% | +50.8% | 0.72x | bucket2 75.52, prune 3.99, optimize_chunked 4.93, translate 3.31 | 8998 | 12.83 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.62 | 0.26 | 0.17 | 0.00 | 0.64 | 0.50 | 0.02 | 2.76 | 0.00 | 0.90 |
+| sift1M_large | 0.13 | 0.59 | 0.34 | 0.00 | 1.04 | 0.36 | 0.03 | 4.37 | 0.49 | 0.00 |
+| sift10M_auto | 1.35 | 7.44 | 1.91 | 0.00 | 18.83 | 2.86 | 0.32 | 37.12 | 4.64 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9749 | 0.9661 | 0.9590 | 0.9533 |
+| sift1M_large | 0.9733 | 0.9662 | 0.9592 | 0.9531 |
+| sift10M_auto | 0.9194 | 0.8980 | 0.8833 | 0.8718 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9281 / 1943K | 0.9774 / 1034K | 0.9943 / 511K | 0.9987 / 188K | 0.9997 / 68K |
+| ours sift1M_large | 0.9143 / 2219K | 0.9706 / 1188K | 0.9920 / 561K | 0.9981 / 189K | 0.9994 / 68K |
+| ours sift10M_auto | 0.8381 / 1870K | 0.9284 / 1001K | 0.9732 / 536K | 0.9916 / 173K | 0.9979 / 68K |
+
+**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +8.5% (95.94 → 87.75 s, **0.72× CAGRA native**), 1M-large +3.2% (10.12 → 9.80 s), 1M-auto −0.8% (noise; path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

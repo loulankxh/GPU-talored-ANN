@@ -1091,6 +1091,17 @@ struct BucketVectorAccumulator {
         return raw.data();
     }
 
+    // 内存模式下整份记录缓冲区就是一块连续 host blob (每条 = int64 gid + D 个 DataT)，
+    // Step 6 可以整块上传 GPU、gather 直接按偏移取 (见 build_vector_knn 的 blob 模式)
+    bool blob_layout(const char*& base, size_t& bytes, int& mode, int& stride) const {
+        if (!in_memory) return false;
+        base = mem.get(); bytes = mem_cap; mode = 1; stride = static_cast<int>(record_bytes(D));
+        return true;
+    }
+    void blob_locate(int64_t c, size_t& byte_off, int64_t& gid0) const {
+        byte_off = static_cast<size_t>(merged_offset[static_cast<size_t>(c)]); gid0 = 0;
+    }
+
     // 顺序整块读出 bucket c 的全部 (gid, vector) 记录 (从合并文件里按已知偏移 seek)。
     void read_bucket(int64_t c, std::vector<int64_t>& ids_out, std::vector<DataT>& vecs_out) {
         int64_t cnt = count(c);
@@ -3177,7 +3188,9 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
     // 非空 (GPU-resident round 2..t): 跨轮 running top-M (行宽 out_ld，升序)。
     // 本轮候选的真实距离 ≥ 该点 running 第 M 个就进不了合并后的 top-M
     // (resident_merge_kernel 取两者并集去重后的前 M)，拿它当行阈值初值
-    const float* __restrict__ seed_d = nullptr)
+    const float* __restrict__ seed_d = nullptr,
+    // 非空 (out-of-core round 2..t): 按 gid 索引的 running 第 M 个距离 (ChunkedKnnAccumulator::kth)
+    const float* __restrict__ seed_gid = nullptr, int64_t seed_n = 0)
 {
     constexpr int LANES = 32;
     constexpr int K_PER_LANE = K_OUT / LANES;
@@ -3207,11 +3220,15 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
     };
     if (threadIdx.x == 0) {
         s_th = 0xFFFFFFFFu;
+        float sk = INFINITY;
         if (seed_d) {
             const int64_t srow = static_cast<int64_t>(kRowByQuery ? q : ids_pool[q]);
-            const float sk = seed_d[srow * out_ld + out_ld - 1];
-            if (sk < INFINITY) s_th = f2key(sk - norms_pool[q]);   // kernel 内距离不含 ‖q‖²
+            sk = seed_d[srow * out_ld + out_ld - 1];
+        } else if (seed_gid) {
+            const int64_t g = ids_pool[q];
+            if (g >= 0 && g < seed_n) sk = seed_gid[g];   // bounds check
         }
+        if (sk < INFINITY) s_th = f2key(sk - norms_pool[q]);   // kernel 内距离不含 ‖q‖²
     }
     __syncthreads();
 
@@ -3353,11 +3370,13 @@ template <typename DotT>
 static inline bool launch_block_topM_bucket(
     cudaStream_t stream, const DotT* d_dots, const float* d_norms_pool, const int32_t* d_ids_pool,
     int32_t* d_out_neighbors, float* d_out_dists,
-    int bucket_size, int pool_size, int ldd, int actual_M, int out_ld)
+    int bucket_size, int pool_size, int ldd, int actual_M, int out_ld,
+    const float* d_seed_gid = nullptr, int64_t seed_n = 0)
 {
     constexpr int G = 8;
 #define LAUNCH_BUCKET_KOUT(KV) block_topK_from_dots_kernel<(KV), G, DotT, true><<<bucket_size, G * 32, 0, stream>>>( \
-        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld)
+        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld, \
+        nullptr, d_seed_gid, seed_n)
     if      (actual_M <= 32)  LAUNCH_BUCKET_KOUT(32);
     else if (actual_M <= 64)  LAUNCH_BUCKET_KOUT(64);
     else if (actual_M <= 128) LAUNCH_BUCKET_KOUT(128);
@@ -3898,6 +3917,21 @@ struct ChunkedKnnAccumulator {
     std::string final_knn_path, final_dist_path;
     int final_iter = -1;
     bool final_written = false;
+    // 非最终轮 merge 完之后每个点 running 第 M 个距离 (真实 L2²，不足 M 个为 inf)，
+    // 下一轮 Step 6 拿来当 block top-M 的行阈值初值 (见 #61/#62)
+    // merge 线程写 kth_work，整轮写完后在 kth_mtx 下换成 kth_done (最近一次完成的
+    // 那份)。Step 6 只读 kth_done、不等 merge: 本轮还没完成就用更早一轮的——
+    // running 第 M 个距离只会越来越小，旧的仍是合法上界 (只是松一些)。
+    std::vector<float> kth_work, kth_done;
+    std::unique_ptr<std::mutex> kth_mtx = std::make_unique<std::mutex>();   // unique_ptr: 对象要能 move
+    bool kth_valid = false;   // kth_done 里有数据 (guarded by kth_mtx)
+    // 拷一份最近完成的 kth (没有则返回 false)
+    bool snapshot_kth(std::vector<float>& out) {
+        std::lock_guard<std::mutex> lk(*kth_mtx);
+        if (!kth_valid) return false;
+        out = kth_done;
+        return true;
+    }
     void set_final_output(const std::string& knn_path, const std::string& dist_path, int iter) {
         final_knn_path = knn_path; final_dist_path = dist_path; final_iter = iter;
     }
@@ -4150,6 +4184,7 @@ struct ChunkedKnnAccumulator {
             return true;
         };
 
+        if (!is_final && kth_work.size() != static_cast<size_t>(N)) kth_work.resize(static_cast<size_t>(N));
         #pragma omp parallel num_threads(merge_parallelism)
         {
             #pragma omp single
@@ -4245,6 +4280,11 @@ struct ChunkedKnnAccumulator {
                         scratch, id_sort_buf);
                 }
                 if (n_records > 0) std::filesystem::remove(ip);
+                if (!is_final) {
+                    for (int64_t pos = 0; pos < chunk_c_size; ++pos)
+                        kth_work[static_cast<size_t>(chunk_start + pos)] =
+                            run_dists[static_cast<size_t>(pos) * M + static_cast<size_t>(M - 1)];
+                }
                 auto t4 = now();
                 tm.merge_cpu = secs_between(t3, t4);
 
@@ -4273,6 +4313,11 @@ struct ChunkedKnnAccumulator {
             }
         }
 
+        if (!is_final) {
+            std::lock_guard<std::mutex> lk(*kth_mtx);
+            kth_done.swap(kth_work);
+            kth_valid = true;
+        }
         if (is_final) {
             if (::close(fd_knn) != 0 || (fd_dist >= 0 && ::close(fd_dist) != 0))
                 throw std::runtime_error("ChunkedKnnAccumulator: close failed for final outputs");
@@ -4467,10 +4512,13 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
 // 在 GPU 缓存里只传一次 (预算内，Belady 淘汰，跟 host 缓存用同一份未来访问
 // 表)，pool 由 GPU gather kernel 按 job 表从缓存里拼出来 (顺便 u8→fp16)。
 struct DevPoolJob {
-    const int32_t* ids;   // 桶的 gid (device)
-    const void*    vecs;  // 桶的原始向量 (device, DataT)
+    const int32_t* ids;   // 桶的 gid (device)；mode 1/2 不用
+    const void*    vecs;  // mode 0/2: 桶的原始向量 (device, DataT)；mode 1: 第一条记录
     int32_t count;
     int32_t dest;         // 在 pool 里的起始行
+    int64_t gid0;         // mode 2: 第 r 行的 gid = gid0 + r
+    int32_t stride;       // mode 1: 记录字节数 (int64 gid + D 个 DataT)
+    int32_t mode;         // 0 = ids 数组 + 向量行; 1 = 交错记录; 2 = 连续行 (gid 隐式)
 };
 
 // 一个 block 一个桶 (job)，一个 warp 一行：写 fp16 行 + gid，顺手算 ‖row‖²
@@ -4485,7 +4533,9 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
     const DataT* v = static_cast<const DataT*>(jb.vecs);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
     for (int r = warp; r < jb.count; r += nwarps) {
-        const DataT* src = v + static_cast<int64_t>(r) * D;
+        const char* rec = static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride;
+        const DataT* src = (jb.mode == 1) ? reinterpret_cast<const DataT*>(rec + sizeof(int64_t))
+                                          : v + static_cast<int64_t>(r) * D;
         __half* dst = B + static_cast<int64_t>(jb.dest + r) * D;
         float acc = 0.f;
         if (sizeof(DataT) == 1 && (D & 3) == 0) {
@@ -4518,7 +4568,9 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
         if (lane == 0) {
             norms_pool[jb.dest + r] = acc;
-            ids_pool[jb.dest + r] = jb.ids[r];
+            ids_pool[jb.dest + r] = (jb.mode == 0) ? jb.ids[r]
+                                  : (jb.mode == 1) ? static_cast<int32_t>(*reinterpret_cast<const int64_t*>(rec))
+                                  : static_cast<int32_t>(jb.gid0 + r);
         }
     }
 }
@@ -4536,6 +4588,9 @@ struct DevBucket {
     const void*    d_vecs = nullptr;
     int64_t count = 0;
     size_t  bytes = 0;
+    int64_t gid0 = 0;     // 指向整块上传的 blob 时 (d_buf 为空、不拥有显存) 的布局，见 DevPoolJob
+    int32_t stride = 0;
+    int32_t mode = 0;
     mutable int32_t last_pos = -1;   // 最近一次被拼进 pool 的处理位置
     DevCacheCtx* ctx = nullptr;
 
@@ -4551,6 +4606,7 @@ struct DevBucket {
 private:
     void take(DevBucket& o) {
         d_buf = o.d_buf; d_ids = o.d_ids; d_vecs = o.d_vecs; count = o.count; bytes = o.bytes;
+        gid0 = o.gid0; stride = o.stride; mode = o.mode;
         last_pos = o.last_pos; ctx = o.ctx;
         o.d_buf = nullptr; o.d_ids = nullptr; o.d_vecs = nullptr; o.count = 0; o.bytes = 0; o.last_pos = -1;
     }
@@ -4561,6 +4617,40 @@ private:
         d_buf = nullptr; d_ids = nullptr; d_vecs = nullptr; count = 0; bytes = 0;
     }
 };
+
+// 大块 H2D: 两块 64 MB pinned 暂存区双缓冲 (多线程拷进暂存区的同时上一块在 DMA)，
+// 跟 prune_windowed_gpu.cu 的 Staging 同一做法 (cuVS 26.12 cagra_build.cuh 处理 host batch)
+static void h2d_staged(void* d, const void* h, size_t bytes)
+{
+    constexpr size_t kChunk = size_t(64) << 20;
+    void* pin[2] = {nullptr, nullptr};
+    cudaEvent_t ev[2] = {nullptr, nullptr};
+    cudaStream_t st = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+    for (int b = 0; b < 2; ++b) {
+        CUDA_CHECK(cudaMallocHost(&pin[b], kChunk));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming));
+    }
+    bool used[2] = {false, false};
+    for (size_t off = 0, k = 0; off < bytes; off += kChunk, ++k) {
+        const int b = static_cast<int>(k & 1);
+        const size_t n = std::min(kChunk, bytes - off);
+        if (used[b]) CUDA_CHECK(cudaEventSynchronize(ev[b]));
+        const int64_t pieces = static_cast<int64_t>((n + (size_t(1) << 20) - 1) >> 20);
+        #pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < pieces; ++i) {
+            const size_t o = static_cast<size_t>(i) << 20;
+            std::memcpy(static_cast<char*>(pin[b]) + o, static_cast<const char*>(h) + off + o,
+                        std::min(size_t(1) << 20, n - o));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(d) + off, pin[b], n, cudaMemcpyHostToDevice, st));
+        CUDA_CHECK(cudaEventRecord(ev[b], st));
+        used[b] = true;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st));
+    for (int b = 0; b < 2; ++b) { cudaFreeHost(pin[b]); cudaEventDestroy(ev[b]); }
+    cudaStreamDestroy(st);
+}
 
 template <typename DataT, typename BucketReaderT>
 void build_vector_knn_with_tensorcore(
@@ -4577,7 +4667,8 @@ void build_vector_knn_with_tensorcore(
     int32_t order_window_arg,
     size_t cache_bytes,
     const std::vector<int32_t>* precomputed_order = nullptr,
-    size_t gpu_cache_bytes = 0)
+    size_t gpu_cache_bytes = 0,
+    const float* seed_kth = nullptr)   // (N,) 上一轮 merge 后每点 running 第 M 个距离 (#62)
 {
     auto func_t0 = std::chrono::high_resolution_clock::now();
     constexpr bool want_distances = true;  // 合并去重总是需要距离
@@ -4665,6 +4756,26 @@ void build_vector_knn_with_tensorcore(
     };
     // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (只在 8-bit 数据、预算 > 0 时用)
     const bool use_dev_cache = kIsInt8Path && gpu_cache_bytes > 0;
+    // blob 模式: 这一轮的桶数据整块就在 host 内存里 (round 1: 重排后的 raw_host；
+    // round 2..t: BucketVectorAccumulator 内存模式的记录缓冲区)，而且放得进 GPU bucket
+    // 缓存预算 → 整块上传一次 (pinned 双缓冲)，dev 缓存的 loader 只发出指向 blob
+    // 的 DevBucket (不再逐桶 host 缓存 get + 拆记录 + cudaMallocAsync + 两次 pageable
+    // H2D: SIFT10M 每桶 ~58 µs、每轮 10 万桶，都在 producer 线程上)。放不下就照旧逐桶
+    // 加载 (Belady)，大路径不依赖数据集放进显存。BUCKET2_BLOB=0 关掉。
+    const char* h_blob = nullptr; size_t blob_bytes = 0; int blob_mode = 0, blob_stride = 0;
+    char* d_blob = nullptr;
+    if (use_dev_cache && bucket_vecs.blob_layout(h_blob, blob_bytes, blob_mode, blob_stride) &&
+        blob_bytes > 0 && blob_bytes <= gpu_cache_bytes) {
+        const char* e = std::getenv("BUCKET2_BLOB");
+        if (!(e && e[0] == '0')) {
+            auto tb0 = std::chrono::high_resolution_clock::now();
+            CUDA_CHECK(cudaMalloc(&d_blob, blob_bytes));
+            h2d_staged(d_blob, h_blob, blob_bytes);
+            std::cout << "  [VectorKNN] bucket data uploaded as one blob: " << blob_bytes / 1e6 << " MB (mode "
+                      << blob_mode << ") in " << std::chrono::duration<double>(
+                             std::chrono::high_resolution_clock::now() - tb0).count() << "s\n";
+        }
+    }
     std::vector<std::vector<int32_t>> future_access_dev;
     if (use_dev_cache) future_access_dev = future_access;
     bucket_order::BeladyBucketCache<VecBucket<DataT>> bucket_cache(
@@ -4820,6 +4931,13 @@ void build_vector_knn_with_tensorcore(
     // ----
     int32_t* d_identity_idx = nullptr;
     CUDA_CHECK(cudaMalloc(&d_identity_idx, bytes_identity_idx));
+    // round 2..t: 每点 running 第 M 个距离 (N floats，SIFT10M 40 MB) 上传一次，
+    // block top-M 按 gid 取行阈值初值
+    float* d_seed_kth = nullptr;
+    if (seed_kth) {
+        CUDA_CHECK(cudaMalloc(&d_seed_kth, static_cast<size_t>(N) * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(d_seed_kth, seed_kth, static_cast<size_t>(N) * sizeof(float), cudaMemcpyHostToDevice));
+    }
     {
         std::vector<int32_t> h_identity(max_pool_size_ub);
         std::iota(h_identity.begin(), h_identity.end(), 0);
@@ -5154,6 +5272,22 @@ void build_vector_knn_with_tensorcore(
                     int nj = 0;
                     auto dev_loader = [&](int32_t bid) {
                         auto tu0 = diag_now();
+                        if (d_blob) {
+                            DevBucket db;
+                            db.ctx = &dev_ctx;
+                            db.count = bucket_count[bid];
+                            size_t off = 0; int64_t gid0 = 0;
+                            bucket_vecs.blob_locate(bid, off, gid0);
+                            const size_t row_bytes = (blob_mode == 1) ? static_cast<size_t>(blob_stride)
+                                                                      : static_cast<size_t>(D) * sizeof(DataT);
+                            if (off + static_cast<size_t>(db.count) * row_bytes > blob_bytes)   // bounds check
+                                throw std::runtime_error("VectorKNN: bucket " + std::to_string(bid) + " outside the blob");
+                            db.d_vecs = d_blob + off;
+                            db.gid0 = gid0; db.stride = blob_stride; db.mode = blob_mode;
+                            ++n_dev_loads;
+                            t_dev_upload += diag_secs(tu0, diag_now());
+                            return db;   // d_buf 为空: 不拥有显存，淘汰时什么都不做
+                        }
                         const VecBucket<DataT>& hb = bucket_cache.get(pos, bid, bucket_loader);
                         DevBucket db;
                         db.ctx = &dev_ctx;
@@ -5186,7 +5320,7 @@ void build_vector_knn_with_tensorcore(
                         if (dofs + static_cast<size_t>(db.count) > max_pool_size_ub)   // bounds check
                             throw std::runtime_error("VectorKNN: pool overflow at pos " + std::to_string(pos));
                         h_jobs[slot][nj++] = DevPoolJob{db.d_ids, db.d_vecs, static_cast<int32_t>(db.count),
-                                                        static_cast<int32_t>(dofs)};
+                                                        static_cast<int32_t>(dofs), db.gid0, db.stride, db.mode};
                         dofs += static_cast<size_t>(db.count);
                     };
                     add_dev(c);
@@ -5201,12 +5335,24 @@ void build_vector_knn_with_tensorcore(
                     st.bucket_size = static_cast<int>(bucket_count[c]);
                     st.actual_M    = std::min(M, st.pool_size - 1);
                     if (st.actual_M > 0) {
-                        // 自己桶的 gid (host 缓存里的那份)，给 scatter 用
+                        // 自己桶的 gid，给 scatter 用 (blob 模式直接从 host blob 取)
+                        if (d_blob) {
+                            size_t off = 0; int64_t gid0 = 0;
+                            bucket_vecs.blob_locate(c, off, gid0);
+                            for (int i = 0; i < st.bucket_size; ++i) {
+                                int64_t g = gid0 + i;
+                                if (blob_mode == 1)
+                                    std::memcpy(&g, h_blob + off + static_cast<size_t>(i) * blob_stride, sizeof(int64_t));
+                                if (g < 0 || g >= N) throw std::runtime_error("VectorKNN: blob gid out of range");   // bounds check
+                                staged_ids_bucket[slot][static_cast<size_t>(i)] = static_cast<int32_t>(g);
+                            }
+                        } else {
                         const VecBucket<DataT>& hc = bucket_cache.get(pos, static_cast<int32_t>(c), bucket_loader);
                         if (static_cast<int>(hc.ids.size()) != st.bucket_size)
                             throw std::runtime_error("VectorKNN: center bucket size mismatch");
                         for (int i = 0; i < st.bucket_size; ++i)
                             staged_ids_bucket[slot][static_cast<size_t>(i)] = static_cast<int32_t>(hc.ids[static_cast<size_t>(i)]);
+                        }
                     }
                     t_poolbuild += diag_secs(pb0, diag_now());
                     {
@@ -5484,7 +5630,8 @@ void build_vector_knn_with_tensorcore(
                     streams[slot], d_dots[slot], d_norms_pool[slot], d_ids_pool[slot],
                     d_out_neighbors[slot],
                     reinterpret_cast<float*>(d_out_neighbors[slot] + static_cast<size_t>(bucket_size) * actual_M),
-                    bucket_size, pool_size, ldd_c, actual_M, /*out_ld=*/actual_M);
+                    bucket_size, pool_size, ldd_c, actual_M, /*out_ld=*/actual_M,
+                    d_seed_kth, d_seed_kth ? N : 0);
             if (!fused_out)
             // d_dots 被 dots_to_dist_inplace_kernel 原地改写为 float dist,
             // RAFT 输出落 d_select_idx/dist scratch, 最后 gather 到 d_out_neighbors
@@ -5588,8 +5735,10 @@ void build_vector_knn_with_tensorcore(
         for (auto& pe : pos_ring) cudaEventDestroy(pe.ev);
         for (int sl = 0; sl < num_slots; ++sl) {
             cudaFreeHost(h_jobs[sl]); cudaFree(d_jobs[sl]); cudaEventDestroy(ev_load[sl]);
+            if (sl == 0 && d_blob) { cudaFree(d_blob); d_blob = nullptr; }
         }
     }
+    cudaFree(d_seed_kth);
     cudaFree(d_identity_idx);
     for (int s = 0; s < num_slots; ++s) {
         cudaFree(d_B_raw[s]);
@@ -6878,6 +7027,9 @@ int run_pipeline_impl(
             if (iter == 0) {
                 reordered_io::ReorderedDatasetBucketReader<DataT> reader(
                     working_input_path, D, reorder_offsets_new, reorder_pos_of);
+                // raw_host 这时是重排后的整份数据集 (ooc_host_raw 且多轮时) → blob 模式
+                if (ooc_host_raw && static_cast<int64_t>(raw_host.size()) == N * static_cast<int64_t>(D))
+                    reader.set_host_data(raw_host.data(), N);
                 build_vector_knn_with_tensorcore<DataT>(
                     N, D, reader, graph_ptr,
                     n_centroids, graph_K, neighbors_m,
@@ -6889,13 +7041,20 @@ int run_pipeline_impl(
                 // bucket 处理顺序在 Step 3 之后已经在后台算好
                 std::vector<int32_t> order_rk = order_future.valid() ? order_future.get()
                                                                      : std::vector<int32_t>();
+                // 每点 running 第 M 个距离当 block top-M 的行阈值初值: 用最近一次
+                // 已经完成的 merge 的结果，不等正在后台跑的那次 (等它会把 merge
+                // 放上关键路径: #62 round 3 等了 7.9 s)
+                std::vector<float> kth_seed;
+                const bool have_seed = knn_acc->snapshot_kth(kth_seed);
+                std::cout << "  [Step6] k-th seed: " << (have_seed ? "from the last completed merge" : "none yet") << "\n";
                 build_vector_knn_with_tensorcore<DataT>(
                     N, D, *bucket_vecs_ptr, graph_ptr,
                     n_centroids, graph_K, neighbors_m,
                     *knn_acc,
                     centroid_knn_graph_host.data(), K,
                     order_window_arg, step6_cache_bytes,
-                    order_rk.empty() ? nullptr : &order_rk, config.gpu_bucket_cache_mb << 20);
+                    order_rk.empty() ? nullptr : &order_rk, config.gpu_bucket_cache_mb << 20,
+                    have_seed ? kth_seed.data() : nullptr);
             }
             double t6_after_build = std::chrono::duration<double>(Clock::now() - t6).count();
             double t6_build_vector_knn = t6_after_build - t6_topk_expand;

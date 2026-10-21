@@ -213,6 +213,22 @@ public:
                static_cast<int64_t>(offsets_new_[static_cast<size_t>(pos)]);
     }
 
+    // 重排后的原始数据集整份在 host 内存里时 (bucket2 out-of-core 的 raw_host)，
+    // Step 6 可以整块上传 GPU，gather 按行偏移直接取 (gid = 行号，隐式)
+    void set_host_data(const DataT* p, int64_t rows) { host_ = p; host_rows_ = rows; }
+    bool blob_layout(const char*& base, size_t& bytes, int& mode, int& stride) const {
+        if (!host_) return false;
+        base = reinterpret_cast<const char*>(host_);
+        bytes = static_cast<size_t>(host_rows_) * static_cast<size_t>(D_) * sizeof(DataT);
+        mode = 2; stride = 0;
+        return true;
+    }
+    void blob_locate(int64_t bucket_id, size_t& byte_off, int64_t& gid0) const {
+        int32_t pos = pos_of_[static_cast<size_t>(bucket_id)];
+        gid0 = static_cast<int64_t>(offsets_new_[static_cast<size_t>(pos)]);
+        byte_off = static_cast<size_t>(gid0) * static_cast<size_t>(D_) * sizeof(DataT);
+    }
+
     void read_bucket(int64_t bucket_id, std::vector<int64_t>& ids_out, std::vector<DataT>& vecs_out) {
         int32_t pos = pos_of_[static_cast<size_t>(bucket_id)];
         int64_t lo = static_cast<int64_t>(offsets_new_[static_cast<size_t>(pos)]);
@@ -232,6 +248,8 @@ public:
     }
 
 private:
+    const DataT* host_ = nullptr;
+    int64_t host_rows_ = 0;
     std::ifstream in_;
     int64_t D_;
     std::streamoff header_bytes_ = 0;
