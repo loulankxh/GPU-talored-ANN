@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#20 (exact brute-force centroid self-kNN replaces CAGRA build + self-search)**, 2026-10-21:
+After **#21 (KMeans|| trained on a 25% random subset)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **14.70** | 0.9286 / 0.9777 / 0.9946 | 1946K / 1033K |
-| SIFT1M large (out-of-core path) | **30.78** | 0.9011 / 0.9633 / 0.9891 | 2216K / 1190K |
+| SIFT1M auto (GPU-resident) | **13.01** | 0.9293 / 0.9774 / 0.9947 | 1948K / 1035K |
+| SIFT1M large (out-of-core path) | **31.41** | 0.9004 / 0.9631 / 0.9894 | 1941K / 928K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -69,6 +69,7 @@ Other:
 
 - **Bucket-size outliers break the GPU-memory bound (found in #9, hit again in #13 — the memory gate is flaky until fixed; NEXT):** the balanced assignment (`batch_assign_with_cagra_anns`, CPU step 4d) reads `cluster_sizes` with relaxed atomics from all threads, so bucket sizes differ run to run despite the fixed seed; occasionally a round produces a bucket ~30x the average (SIFT1M large: max 3201 vs avg 100; resident run in #6: 1980). Out-of-core Step 6 sizes its per-slot `dots` buffers from max_pool (0.72 GB/slot × 3 instead of ~0.2 GB) → GPU peak 2708 MiB instead of ~1450. Fix: cap bucket size (spill to the 2nd-nearest centroid when a bucket exceeds e.g. 4–8× avg), or tile the oversized bucket's GEMM; also makes the build deterministic if done per batch in a fixed order.
 
+- **Large path is disk-write-bound per round (found in #21):** the previous round's background ChunkedKNN merge writes overlap Steps 2–4 of the next round; shortening an early step (Step 2 in #12/#15/#21) moves those writes onto Step 4's bucket_vecs flush (`finish_iteration`), which then slows by about as much (#21: Step 2 −2.2 s, Step 4 +2.4–3.2 s). Large-path wins now need fewer bytes written per round (bucket_vecs as u8 is already minimal; arrival records 520 B/point → e.g. skip `vector_dists` in arrival when merge can recompute, or merge on the GPU-resident side when the running state fits), not shorter compute.
 - **NPROBE 100** (measured in #11, 1 run each): auto 15.70 s, large 36.79 s (vs 16.79 / 39.32 at 150), search recall@10 itopk 32 auto 0.9269 (CAGRA 0.9305, gate 0.9205), pre-prune KNN recall@64 0.938. Passes the gate but spends 0.3 pt of resident recall headroom — user decision.
 - **Resident Step 6 is GPU-bound, not launch-bound** (#11 probe): launching from 4 host threads changed nothing (launches block on a full queue). Kernel elimination per round (1.19 s loop, NPROBE 250): gather ~0.15 s, GEMM ~0.4 s, block top-M ~0.5 s; without GEMM+top-M 0.23 s. top-M block shape G=4/8/16 all ≈ same. Real fix = never materialize the (bucket × pool) dots matrix: fused GEMM + top-M (cuVS 26.12 `detail/fused_l2_knn.cuh` / `knn_brute_force.cuh`), or shrink the pool (#11).
 
@@ -676,6 +677,43 @@ Borderline → large rerun (`runs/iter19/sift1M_large_b`): 32.52 s, +4.7% → AC
 | ours sift1M_large | 0.9011 / 2216K | 0.9633 / 1190K | 0.9891 / 561K | 0.9974 / 189K | 0.9995 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-auto +8.7% (16.10 → 14.70 s), 1M-large +6.8% (33.01 → 30.78 s).
+
+### #21 — KMeans|| trained on a 25% random subset  (2026-10-21)
+**Idea / rationale:** with the dataset fitting on the GPU (SIFT1M on both paths), Step 2 ran KMeans|| D² oversampling over all N points every round (cost ∝ points × candidates; 0.66–0.71 s/round, 3.2 s total). New `bucket2 --kmeans-train-fraction F` (default 1.0 = unchanged): KMeans|| runs on a deterministic Bernoulli(F) subset of the points (seeded per round, no duplicates — the existing `sample_without_replacement` samples *with* replacement, so not used; falls back to all points if the subset would have < 4× centroids); centroids are still real data points and their number stays N·centroid_ratio; centroid row → raw id mapping bounds-checked. Same as cuVS 26.12 IVF build training balanced k-means on `kmeans_trainset_fraction` of the data (`ivf_pq/ivf_pq_build.cuh`). Sweep (1 run, auto): F=0.25 → 12.95 s, Step 2 1.42 s; F=0.5 → 14.15 s; search recall unchanged within 0.001 for both. `params.sh`: `BUCKET2_EXTRA="--skip-npy --kmeans-train-fraction 0.25"`.
+**Files:** `src/bucket.cu`  **Params changed:** `BUCKET2_EXTRA` adds `--kmeans-train-fraction 0.25`
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 13.01 | +11.5% | +40.2% | 1.13x | bucket2 11.26, optimize 1.31, translate 0.44 | 3574 | 1.59 |
+| sift1M_large | large | 31.41 | -2.0% | +58.2% | 2.72x | bucket2 27.84, prune 1.40, optimize_chunked 1.63, translate 0.46 | 1220 | 3.98 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.75 | 1.41 | 0.11 | 0.00 | 2.12 | 1.16 | 0.02 | 4.37 | 0.00 | 0.75 |
+| sift1M_large | 0.57 | 2.74 | 0.19 | 0.00 | 8.48 | 2.18 | 0.03 | 12.05 | 0.99 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9791 | 0.9749 | 0.9690 | 0.9638 |
+| sift1M_large | 0.9815 | 0.9747 | 0.9689 | 0.9637 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9293 / 1948K | 0.9774 / 1035K | 0.9947 / 529K | 0.9989 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9004 / 1941K | 0.9631 / 928K | 0.9894 / 558K | 0.9974 / 181K | 0.9993 / 68K |
+
+First large run (`runs/iter21/sift1M_large`): 31.80 s (−3.3%, just over the 3% tolerance → REJECT): Step 2 4.76 → 2.59 s but Step 4 6.05 → 9.29 s (write-throttled flush now overlapping the previous round's background merge — see backlog). Rerun `sift1M_large_b`: 31.41 s (−2.0%) → ACCEPT, recorded as best.
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +11.5% (14.70 → 13.01 s; Step 2 3.20 → ~1.4 s), 1M-large −2.0% (30.78 → 31.41 s, within tolerance; the Step 2 saving is absorbed by disk-write contention).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

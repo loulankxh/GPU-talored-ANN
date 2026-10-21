@@ -124,6 +124,10 @@ struct LoadConfig {
     // KNN graph parameters
     uint32_t knn_k;                // KNN graph degree for centroids, range [1, 1000], default 32
 
+    // Step 2 (全量放得进 GPU 时) KMeans|| 只在这么大比例的随机子集上训练
+    // (centroid 数仍按 N*centroid_ratio)，default 1.0 = 用全部点
+    float kmeans_train_fraction;
+
     // Output
     bool save_npy;                 // 额外写 neighbors.npy (int64, 给 Python 端评测用), default true;
                                    // 构建流水线本身不读它
@@ -146,6 +150,7 @@ struct LoadConfig {
         seed(42),
         gpu_safety_margin(0.1f),
         knn_k(32),
+        kmeans_train_fraction(1.0f),
         save_npy(true)
     {}
 };
@@ -556,6 +561,11 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
     }
     if (vm.count("use-pq")) {
         config.use_pq = vm["use-pq"].as<bool>();
+    }
+    if (vm.count("kmeans-train-fraction")) {
+        config.kmeans_train_fraction = vm["kmeans-train-fraction"].as<float>();
+        if (!(config.kmeans_train_fraction > 0.0f && config.kmeans_train_fraction <= 1.0f))
+            throw std::runtime_error("--kmeans-train-fraction must be in (0, 1]");
     }
     if (vm.count("skip-npy")) {
         config.save_npy = !vm["skip-npy"].as<bool>();
@@ -5153,16 +5163,54 @@ int run_pipeline_impl(
         float* d_centroids_f32 = nullptr;
         SimpleQuantizer quantizer{};
 
-        // 返回 centroid 的 sample_idx
+        // KMeans|| 训练子集 (跟 cuVS IVF 的 kmeans_trainset_fraction 一样):
+        // 按固定 seed 对每个点做 Bernoulli(frac) 抽样 (不重复、确定性)，只在
+        // 子集上做 D² 过采样；centroid 仍是真实数据点、数量仍是 N*ratio。
+        // KMeans|| 的代价 ∝ 点数 × 候选数，子集越小越快。
+        const float* X_train = X_sampled.data();
+        int64_t train_N = working_N;
+        std::vector<float> X_train_buf;
+        std::vector<int64_t> train_indices;   // train 行 → raw idx
+        const bool sub_train = iter_config.kmeans_train_fraction < 1.0f && !mem_est.need_pq;
+        if (sub_train) {
+            std::mt19937_64 rng(static_cast<uint64_t>(iter_config.seed) * 0x9E3779B97F4A7C15ULL + 1);
+            std::bernoulli_distribution keep(iter_config.kmeans_train_fraction);
+            std::vector<int64_t> rows;
+            rows.reserve(static_cast<size_t>(working_N * iter_config.kmeans_train_fraction * 1.1) + 16);
+            for (int64_t i = 0; i < working_N; ++i) if (keep(rng)) rows.push_back(i);
+            // KMeans|| 需要的候选数 ~1.5x centroids，留足余量
+            if (static_cast<int64_t>(rows.size()) < 4 * mem_est.centroid_rows) {
+                rows.resize(static_cast<size_t>(working_N));
+                std::iota(rows.begin(), rows.end(), 0LL);
+            }
+            train_N = static_cast<int64_t>(rows.size());
+            X_train_buf.resize(static_cast<size_t>(train_N) * D);
+            train_indices.resize(static_cast<size_t>(train_N));
+            #pragma omp parallel for schedule(static)
+            for (int64_t i = 0; i < train_N; ++i) {
+                std::memcpy(X_train_buf.data() + static_cast<size_t>(i) * D,
+                            X_sampled.data() + static_cast<size_t>(rows[static_cast<size_t>(i)]) * D,
+                            static_cast<size_t>(D) * sizeof(float));
+                train_indices[static_cast<size_t>(i)] = sampled_indices[static_cast<size_t>(rows[static_cast<size_t>(i)])];
+            }
+            X_train = X_train_buf.data();
+            std::cout << "  KMeans|| train subset: " << train_N << " / " << working_N << " points\n";
+        }
+        const std::vector<int64_t>& train_map = sub_train ? train_indices : sampled_indices;
+
+        // 返回 centroid 在训练集里的行号
         std::vector<int64_t> centroid_sample_indices = select_centroids_on_gpu_kmeans_parallel(
-            X_sampled.data(), sampled_indices,
-            working_N, D, iter_config, mem_est, &quantizer, &d_centroids_f32);
+            X_train, train_map,
+            train_N, D, iter_config, mem_est, &quantizer, &d_centroids_f32);
         double t2_select_call = std::chrono::duration<double>(Clock::now() - t2).count();
 
-        // sample_idx → raw_idx
+        // 训练行号 → raw_idx (bounds check)
         centroid_global_indices.assign(centroid_sample_indices.size(), 0);
         for (size_t k = 0; k < centroid_sample_indices.size(); ++k) {
-            centroid_global_indices[k] = sampled_indices[centroid_sample_indices[k]];
+            int64_t r = centroid_sample_indices[k];
+            if (r < 0 || r >= train_N)
+                throw std::runtime_error("Step 2: centroid row " + std::to_string(r) + " out of range");
+            centroid_global_indices[k] = train_map[static_cast<size_t>(r)];
         }
 
         n_centroids = static_cast<int64_t>(centroid_global_indices.size());
@@ -5896,6 +5944,9 @@ int main(int argc, char** argv) {
             ("sample-rate",   po::value<float>(),      "Sampling ratio (default 0.1)")
             ("centroid-ratio", po::value<float>(),     "Centroid ratio (default 0.01)")
             ("use-pq",        po::value<bool>(),       "Force PQ quantization")
+            ("kmeans-train-fraction", po::value<float>(),
+                "Step 2 (dataset fits on GPU): train KMeans|| on this random fraction of the points "
+                "(centroid count stays N*centroid-ratio; default 1.0 = all points)")
             ("skip-npy",      po::bool_switch()->default_value(false),
                 "Don't write neighbors.npy (vector_knn.bin as int64 NumPy, only for Python-side eval; "
                 "the build pipeline never reads it)")
