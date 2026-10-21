@@ -5,9 +5,9 @@
 // 流程：
 //   1) 读取原始数据集 (.fbin/.u8bin/.i8bin/.ibin) → host float32
 //   2) 读取 vector_knn.bin → host uint32 (N, M_in)
-//   3) raft::neighbors::cagra::detail::graph::sort_knn_graph
-//        按 L2 升序排序每行邻居（GPU）
-//   4) raft::neighbors::cagra::detail::graph::optimize
+//   3) sort_knn_graph_host: 按 L2 升序排序每行邻居（CPU/OpenMP；bucket2 的
+//        vector_knn.bin 已经按距离升序，pipeline 传 --skip-sort 跳过）
+//   4) cuvs::neighbors::cagra::helpers::optimize (cuVS 26.10 public API)
 //        剪枝到目标度数 K_out （CAGRA 反向边平衡 + 距离剪枝）
 //   5) 写出结果到磁盘
 //
@@ -43,7 +43,7 @@
 #include <raft/core/resources.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/host_mdspan.hpp>
-#include <raft/neighbors/detail/cagra/graph_core.cuh>
+#include <cuvs/neighbors/cagra.hpp>
 
 #include "load.hpp"
 
@@ -167,6 +167,30 @@ static size_t estimate_required_gpu_bytes(int64_t N, int32_t D, int32_t M_in,
 //   int64_t  N
 //   int32_t  output_degree
 //   uint32_t graph[N * output_degree]
+// Per-row L2 sort of the candidate list (replaces raft's internal GPU
+// sort_knn_graph, which cuVS 26.10 no longer exposes).
+static void sort_knn_graph_host(const float* data, int64_t N, int64_t D,
+                                uint32_t* graph, int64_t M)
+{
+    #pragma omp parallel
+    {
+        std::vector<std::pair<float, uint32_t>> row(M);
+        #pragma omp for schedule(dynamic, 1024)
+        for (int64_t i = 0; i < N; ++i) {
+            const float* xi = data + i * D;
+            for (int64_t j = 0; j < M; ++j) {
+                const float* xj = data + static_cast<int64_t>(graph[i * M + j]) * D;
+                float d = 0.f;
+                for (int64_t t = 0; t < D; ++t) { float e = xi[t] - xj[t]; d += e * e; }
+                row[j] = {d, graph[i * M + j]};
+            }
+            std::stable_sort(row.begin(), row.end(),
+                             [](auto& a, auto& b) { return a.first < b.first; });
+            for (int64_t j = 0; j < M; ++j) graph[i * M + j] = row[j].second;
+        }
+    }
+}
+
 static void write_cagra_graph_bin(const std::string& path,
                                   const uint32_t* graph,
                                   int64_t N, int32_t K_out)
@@ -341,17 +365,13 @@ int main(int argc, char** argv)
         // ---------------------------------------------------------------
         raft::resources res;
 
-        auto dataset_view = raft::make_host_matrix_view<const float, int64_t>(
-            dataset_host.data(), N, D);
         auto knn_graph_view = raft::make_host_matrix_view<uint32_t, int64_t>(
             knn_u32.data(), N, M_in);
 
         if (!skip_sort) {
             std::cout << "=== Step 3: CAGRA sort_knn_graph ===\n";
             auto t3 = Clock::now();
-            raft::neighbors::cagra::detail::graph::sort_knn_graph(
-                res, dataset_view, knn_graph_view);
-            CUDA_CHECK(cudaDeviceSynchronize());
+            sort_knn_graph_host(dataset_host.data(), N, D, knn_u32.data(), M_in);
             std::cout << "  Sort done ["
                       << std::chrono::duration<double>(Clock::now() - t3).count()
                       << "s]\n";
@@ -366,7 +386,7 @@ int main(int argc, char** argv)
         auto t4 = Clock::now();
 
         auto cagra_graph = raft::make_host_matrix<uint32_t, int64_t>(N, K_out);
-        raft::neighbors::cagra::detail::graph::optimize(
+        cuvs::neighbors::cagra::helpers::optimize(
             res, knn_graph_view, cagra_graph.view());
         CUDA_CHECK(cudaDeviceSynchronize());
         std::cout << "  Optimize done ["

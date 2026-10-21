@@ -30,25 +30,22 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 
-// RAFT
+// RAFT / cuVS 26.10 (public API only)
 #include <raft/core/resources.hpp>
+#include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/host_mdspan.hpp>
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/device_mdspan.hpp>
-#include <raft/cluster/kmeans.cuh>
-#include <raft/distance/distance.cuh>
-#include <raft/neighbors/brute_force.cuh>
-#include <raft/neighbors/nn_descent_types.hpp>
-#include <raft/neighbors/detail/nn_descent.cuh>
-#include <raft/neighbors/detail/cagra/graph_core.cuh>
-#include <raft/neighbors/cagra.cuh>
 #include <raft/random/rng.cuh>
 #include <raft/matrix/select_k.cuh>
+#include <cuvs/neighbors/brute_force.hpp>
+#include <cuvs/neighbors/cagra.hpp>
+#include <rmm/device_scalar.hpp>
 #include <rmm/device_uvector.hpp>
-#include <rmm/mr/device/cuda_memory_resource.hpp>
-#include <rmm/mr/device/pool_memory_resource.hpp>
-#include <rmm/mr/device/per_device_resource.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
 #include <thrust/copy.h>
 #include <thrust/reduce.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -65,6 +62,25 @@
 
 namespace po = boost::program_options;
 using namespace bucket;
+
+/**
+ * cuVS 26.10 CAGRA wants a padded (16B-aligned rows) dataset: zero-copy view when the
+ * rows already satisfy it (e.g. D=128), otherwise an owning padded copy kept in `owner`.
+ */
+template <typename T>
+cuvs::neighbors::cagra::device_padded_index<T, uint32_t> make_padded_cagra_index(
+    raft::resources const& res,
+    raft::device_matrix_view<const T, int64_t> dataset,
+    raft::device_matrix_view<const uint32_t, int64_t> graph,
+    std::unique_ptr<cuvs::neighbors::device_padded_dataset<T, int64_t>>& owner)
+{
+    constexpr auto L2 = cuvs::distance::DistanceType::L2Expanded;
+    if ((dataset.extent(1) * sizeof(T)) % 16 == 0)
+        return {res, L2, cuvs::neighbors::make_device_padded_dataset_view(res, dataset), graph};
+    owner = cuvs::neighbors::make_device_padded_dataset(res, dataset);
+    return {res, L2, owner->as_dataset_view(), graph};
+}
+
 
 // ============== Phase 1: LoadConfig & Memory Management ==============
 
@@ -1120,15 +1136,14 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         d_centroids, n_centroids, static_cast<int64_t>(D));
     auto graph_view = raft::make_device_matrix_view<const uint32_t, int64_t>(
         d_graph, n_centroids, static_cast<int64_t>(K));
-    raft::neighbors::cagra::index<CentroidT, uint32_t> cagra_idx(
-        res, raft::distance::DistanceType::L2Expanded,
-        dataset_view, graph_view);
+    std::unique_ptr<cuvs::neighbors::device_padded_dataset<CentroidT, int64_t>> padded_owner;
+    auto cagra_idx = make_padded_cagra_index<CentroidT>(res, dataset_view, graph_view, padded_owner);
 
-    raft::neighbors::cagra::search_params sp;
+    cuvs::neighbors::cagra::search_params sp;
     sp.itopk_size     = itopk;
     sp.search_width   = 1;
     sp.max_iterations = 0;
-    sp.algo           = raft::neighbors::cagra::search_algo::SINGLE_CTA;
+    sp.algo           = cuvs::neighbors::cagra::search_algo::SINGLE_CTA;
     (void)search_max_iters;  // CAGRA 自己决定 iter, 参数保留为接口兼容
 
     // ================================================================
@@ -1213,7 +1228,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         auto distances_view = raft::make_device_matrix_view<float, int64_t>(
             d_distances, batch_size, static_cast<int64_t>(TOP_K));
 
-        raft::neighbors::cagra::search(res, sp, cagra_idx,
+        cuvs::neighbors::cagra::search(res, sp, cagra_idx,
             queries_view, neighbors_view, distances_view);
 
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -1430,6 +1445,49 @@ __global__ void gather_rows_by_index(
     dst[tid] = src[idx[row] * D + col];
 }
 
+/**
+ * KMeans|| D² sampling (replaces raft::cluster::detail::SamplingOp/sampleCentroids):
+ *   select i if !flag[i] && rand[i] < l * k * d²(i) / psi; marks flag[i] = 1, sel[i] = 1.
+ */
+__global__ void kmeans_par_sample_kernel(
+    const float* __restrict__ min_dist,
+    const float* __restrict__ rands,
+    uint8_t* __restrict__ flags,
+    uint8_t* __restrict__ sel,
+    float psi, float l_times_k, int64_t N)
+{
+    int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    bool take = !flags[i] && rands[i] < l_times_k * min_dist[i] / psi;
+    sel[i] = take ? 1 : 0;
+    if (take) flags[i] = 1;
+}
+
+/**
+ * min_dist[i] = min_c ||X[i] - C[c]||² (replaces raft::cluster::detail::minClusterDistanceCompute),
+ * via cuvs brute_force k=1, row-batched to bound the distance tile.
+ */
+static void min_cluster_distance(
+    raft::resources const& res,
+    raft::device_matrix_view<const float, int64_t> X,
+    raft::device_matrix_view<const float, int64_t> C,
+    float* d_min_dist)
+{
+    auto bf = cuvs::neighbors::brute_force::build(
+        res, cuvs::neighbors::brute_force::index_params{}, C);
+    constexpr int64_t BATCH = 1 << 16;
+    auto nb = raft::make_device_matrix<int64_t, int64_t>(res, std::min(BATCH, X.extent(0)), 1);
+    for (int64_t off = 0; off < X.extent(0); off += BATCH) {
+        int64_t n = std::min(BATCH, X.extent(0) - off);
+        cuvs::neighbors::brute_force::search(
+            res, cuvs::neighbors::brute_force::search_params{}, bf,
+            raft::make_device_matrix_view<const float, int64_t>(
+                X.data_handle() + off * X.extent(1), n, X.extent(1)),
+            raft::make_device_matrix_view<int64_t, int64_t>(nb.data_handle(), n, 1),
+            raft::make_device_matrix_view<float, int64_t>(d_min_dist + off, n, 1));
+    }
+}
+
 // ============== Phase 9b: KMeans|| (Scalable KMeans++) Centroid Selection ==============
 
 /**
@@ -1492,22 +1550,24 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
         // Stage 3: Upload working data to GPU & precompute L2 norms
         //          CPU 侧只有一个指针 upload_data，无额外副本
         raft::resources res;
-        cudaStream_t stream = raft::resource::get_cuda_stream(res);
+        cudaStream_t stream = raft::resource::get_cuda_stream(res).get();
 
-        auto dataset_gpu = raft::make_device_matrix<float, int64_t>(res, working_N, D);
+        // 裸 cudaMalloc (不走 RMM 池): working set 可达数 GB (SIFT10M 全量 5.1GB)，
+        // 远超 2GB 的池上限；池只留给 RAFT/cuVS 内部的小块 scratch。
+        struct CudaFree { void operator()(float* p) const { cudaFree(p); } };
+        std::unique_ptr<float, CudaFree> dataset_gpu_buf([&] {
+            float* p = nullptr;
+            CUDA_CHECK(cudaMalloc(&p, static_cast<size_t>(working_N) * D * sizeof(float)));
+            return p;
+        }());
+        auto dataset_gpu = raft::make_device_matrix_view<float, int64_t>(
+            dataset_gpu_buf.get(), working_N, static_cast<int64_t>(D));
         raft::copy(dataset_gpu.data_handle(), upload_data,
                    working_N * D, stream);
         raft::resource::sync_stream(res);
 
         auto X_view = raft::make_device_matrix_view<const float, int64_t>(
             dataset_gpu.data_handle(), working_N, static_cast<int64_t>(D));
-
-        // L2 norms required by minClusterDistanceCompute (fused L2 path)
-        auto L2NormX = raft::make_device_vector<float, int64_t>(res, working_N);
-        raft::linalg::rowNorm(L2NormX.data_handle(),
-                              dataset_gpu.data_handle(),
-                              static_cast<int64_t>(D), working_N,
-                              raft::linalg::L2Norm, true, stream);
 
         raft::resource::sync_stream(res, stream);
         t_upload = step2_elapsed();
@@ -1562,26 +1622,18 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
             cudaMemcpyHostToDevice, stream));
         auto d_diff_flags = raft::make_device_vector<uint8_t, int64_t>(res, working_N);
 
-        // Buffers for RAFT distance computation
-        rmm::device_uvector<float> L2NormBuf_OR_DistBuf(0, stream);
-        rmm::device_uvector<char> workspace(0, stream);
         auto minClusterDistVec = raft::make_device_vector<float, int64_t>(res, working_N);
         auto uniformRands = raft::make_device_vector<float, int64_t>(res, working_N);
-        rmm::device_scalar<float> clusterCost(stream);
+        auto d_sel_flags = raft::make_device_vector<uint8_t, int64_t>(res, working_N);
 
         // Step 2: Compute initial cost psi = phi_X(C)
-        raft::cluster::detail::minClusterDistanceCompute<float, int64_t>(
-            res, X_view, potentialCentroids, minClusterDistVec.view(),
-            L2NormX.view(), L2NormBuf_OR_DistBuf,
-            raft::distance::DistanceType::L2Expanded,
-            1 << 15, 0, workspace);
-
-        raft::cluster::detail::computeClusterCost(
-            res, minClusterDistVec.view(), workspace,
-            raft::make_device_scalar_view(clusterCost.data()),
-            raft::identity_op{}, raft::add_op{});
-
-        float psi = clusterCost.value(stream);
+        min_cluster_distance(res, X_view, raft::make_const_mdspan(potentialCentroids),
+                             minClusterDistVec.data_handle());
+        float psi = thrust::reduce(
+            thrust::cuda::par.on(stream),
+            thrust::device_pointer_cast(minClusterDistVec.data_handle()),
+            thrust::device_pointer_cast(minClusterDistVec.data_handle()) + working_N,
+            0.0f, thrust::plus<float>());
         raft::resource::sync_stream(res, stream);
 
         // 写死 niter (而非 log(psi)), 避免对 ~1% centroid_ratio 的过度迭代
@@ -1599,11 +1651,8 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
         // Step 3-6: Oversampling rounds
         for (int iter = 0; iter < niter; ++iter) {
             // Recompute min distances to ALL accumulated candidates (batched GEMM)
-            raft::cluster::detail::minClusterDistanceCompute<float, int64_t>(
-                res, X_view, potentialCentroids, minClusterDistVec.view(),
-                L2NormX.view(), L2NormBuf_OR_DistBuf,
-                raft::distance::DistanceType::L2Expanded,
-                1 << 15, 0, workspace);
+            min_cluster_distance(res, X_view, raft::make_const_mdspan(potentialCentroids),
+                                 minClusterDistVec.data_handle());
 
             // 子采样估计 psi: 仅对 ~1% 的点求和，再放大回估计值
             // strided iterator 访问 min_dist[0], min_dist[stride], min_dist[2*stride], ...
@@ -1620,16 +1669,33 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
             raft::random::uniform(
                 res, rng, uniformRands.data_handle(), working_N, 0.0f, 1.0f);
 
-            raft::cluster::detail::SamplingOp<float, int64_t> select_op(
-                psi, oversampling_factor, n_centroids,
-                uniformRands.data_handle(),
-                isSampleCentroid.data_handle());
-
-            // CUB DeviceSelect::If — parallel filtering, one kernel, no per-point sync
+            // flag + ordered compact + row gather (one kernel each, no per-point sync)
             rmm::device_uvector<float> CpRaw(0, stream);
-            raft::cluster::detail::sampleCentroids<float, int64_t>(
-                res, X_view, minClusterDistVec.view(),
-                isSampleCentroid.view(), select_op, CpRaw, workspace);
+            {
+                int st = 256;
+                int sb = static_cast<int>((working_N + st - 1) / st);
+                kmeans_par_sample_kernel<<<sb, st, 0, stream>>>(
+                    minClusterDistVec.data_handle(), uniformRands.data_handle(),
+                    isSampleCentroid.data_handle(), d_sel_flags.data_handle(),
+                    psi, static_cast<float>(oversampling_factor * n_centroids), working_N);
+                CUDA_CHECK(cudaGetLastError());
+                rmm::device_uvector<int64_t> d_sel_idx(working_N, stream);
+                auto cnt0 = thrust::make_counting_iterator<int64_t>(0);
+                auto sel_end = thrust::copy_if(
+                    thrust::cuda::par.on(stream), cnt0, cnt0 + working_N,
+                    thrust::device_pointer_cast(d_sel_flags.data_handle()),
+                    thrust::device_pointer_cast(d_sel_idx.data()),
+                    [] __device__ (uint8_t f) { return f > 0; });
+                int64_t n_sel = sel_end - thrust::device_pointer_cast(d_sel_idx.data());
+                CpRaw.resize(static_cast<size_t>(n_sel) * D, stream);
+                if (n_sel > 0) {
+                    int64_t tot_el = n_sel * static_cast<int64_t>(D);
+                    gather_rows_by_index<<<static_cast<int>((tot_el + 255) / 256), 256, 0, stream>>>(
+                        dataset_gpu.data_handle(), d_sel_idx.data(), CpRaw.data(),
+                        n_sel, static_cast<int64_t>(D));
+                    CUDA_CHECK(cudaGetLastError());
+                }
+            }
 
             int64_t n_new = CpRaw.size() / D;
             if (n_new == 0) {
@@ -1741,7 +1807,7 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
         }
 
         // Release working data — only caller-managed centroids remain
-        { auto _drop = std::move(dataset_gpu); }
+        dataset_gpu_buf.reset();
 
         // Stage 6: centroid_idx → candidate_idx → sample_idx
         //   sub_indices[k]                        : centroid k 在 candidate 集中的行号
@@ -1817,29 +1883,27 @@ void build_centroid_knn_on_gpu(
     CUDA_CHECK(cudaMemcpy(centroids_host.data(), d_centroids_f32,
                           n_centroids * D * sizeof(float), cudaMemcpyDeviceToHost));
 
-    raft::neighbors::experimental::nn_descent::index_params params;
-    params.graph_degree              = intermediate_graph_degree;
-    params.intermediate_graph_degree = static_cast<size_t>(1.5 * intermediate_graph_degree);
-    params.max_iterations            = max_iterations;
-    params.termination_threshold     = termination_threshold;
-    params.return_distances          = false;
+    cuvs::neighbors::cagra::index_params ip;
+    ip.graph_degree              = K;
+    ip.intermediate_graph_degree = intermediate_graph_degree;
+    auto nnd = cuvs::neighbors::cagra::graph_build_params::nn_descent_params(intermediate_graph_degree);
+    nnd.graph_degree              = intermediate_graph_degree;
+    nnd.intermediate_graph_degree = static_cast<size_t>(1.5 * intermediate_graph_degree);
+    nnd.max_iterations            = max_iterations;
+    nnd.termination_threshold     = termination_threshold;
+    ip.graph_build_params         = nnd;
 
-    auto dataset = raft::make_host_matrix_view<const float, int64_t>(
-        centroids_host.data(), n_centroids, D);
+    auto dataset = cuvs::neighbors::make_host_standard_dataset_view(
+        raft::make_host_matrix_view<const float, int64_t>(centroids_host.data(), n_centroids, D));
 
     raft::resources res;
 
-    std::cout << "  Step 1/3: NN Descent...\n";
-    auto idx = raft::neighbors::experimental::nn_descent::detail::build<float, uint32_t>(
-        res, params, dataset);
-
-    std::cout << "  Step 2/3: Sort by L2...\n";
-    raft::neighbors::cagra::detail::graph::sort_knn_graph(res, dataset, idx.graph());
-
-    std::cout << "  Step 3/3: CAGRA prune to K=" << K << "...\n";
+    std::cout << "  cagra::build (NN Descent + sort + prune to K=" << K << ")...\n";
+    auto idx = cuvs::neighbors::cagra::build(res, ip, dataset);
     auto cagra_graph = raft::make_host_matrix<uint32_t, int64_t>(n_centroids, K);
-    raft::neighbors::cagra::detail::graph::optimize(
-        res, idx.graph(), cagra_graph.view());
+    raft::copy(cagra_graph.data_handle(), idx.graph().data_handle(), cagra_graph.size(),
+               raft::resource::get_cuda_stream(res));
+    raft::resource::sync_stream(res);
 
     // Upload pruned graph to GPU
     size_t graph_bytes = static_cast<size_t>(n_centroids) * K * sizeof(uint32_t);
@@ -2019,16 +2083,15 @@ std::vector<uint32_t> expand_centroid_neighbors_gpu(
         d_dataset, n_centroids, static_cast<int64_t>(D));
     auto graph_view   = raft::make_device_matrix_view<const uint32_t, int64_t>(
         d_graph, n_centroids, static_cast<int64_t>(K));
-    raft::neighbors::cagra::index<float, uint32_t> idx(
-        res, raft::distance::DistanceType::L2Expanded,
-        dataset_view, graph_view);
+    std::unique_ptr<cuvs::neighbors::device_padded_dataset<float, int64_t>> padded_owner;
+    auto idx = make_padded_cagra_index<float>(res, dataset_view, graph_view, padded_owner);
 
     // 3) cagra::search (queries == dataset, k = nprobe+1)
-    raft::neighbors::cagra::search_params sp;
+    cuvs::neighbors::cagra::search_params sp;
     sp.itopk_size     = itopk;
     sp.search_width   = 1;
     sp.max_iterations = 0;  // 0 = auto
-    sp.algo           = raft::neighbors::cagra::search_algo::SINGLE_CTA;
+    sp.algo           = cuvs::neighbors::cagra::search_algo::SINGLE_CTA;
 
     auto queries_view = raft::make_device_matrix_view<const float, int64_t>(
         d_dataset, n_centroids, static_cast<int64_t>(D));
@@ -2037,7 +2100,7 @@ std::vector<uint32_t> expand_centroid_neighbors_gpu(
     auto distances_view = raft::make_device_matrix_view<float, int64_t>(
         d_distances, n_centroids, static_cast<int64_t>(k_search));
 
-    raft::neighbors::cagra::search(res, sp, idx,
+    cuvs::neighbors::cagra::search(res, sp, idx,
         queries_view, neighbors_view, distances_view);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -2521,12 +2584,12 @@ __device__ __forceinline__ void warp_topk_insert(
 
 template <int K_OUT, int G>
 __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
-    const float*   __restrict__ dots,        // (bucket_size, pool_size)
+    const float*   __restrict__ dots,        // (bucket_size, ldd)，ldd 是 4 的倍数 (float4 对齐)
     const float*   __restrict__ norms_pool,  // (pool_size,)  前 bucket_size 个即 ‖q‖²
     const int32_t* __restrict__ ids_pool,    // (pool_size,)  前 bucket_size 个即 query gid
     int32_t* __restrict__ out_neighbors,     // 第 gid 行、行宽 out_ld
     float*   __restrict__ out_dists,         // 同上，真实 L2²
-    int pool_size, int K, int out_ld)
+    int pool_size, int ldd, int K, int out_ld)
 {
     constexpr int LANES = 32;
     constexpr int K_PER_LANE = K_OUT / LANES;
@@ -2541,18 +2604,34 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
     for (int p = 0; p < K_PER_LANE; ++p) { reg_dist[p] = INFINITY; reg_id[p] = -1; }
     float threshold = INFINITY;
 
-    const float* row = dots + static_cast<int64_t>(q) * pool_size;
-    for (int jb = warp * LANES; jb < pool_size; jb += G * LANES) {
-        int j = jb + lane;
-        float my_dist = (j < pool_size && j != q) ? norms_pool[j] - 2.0f * row[j] : INFINITY;
-        unsigned mask = __ballot_sync(ALL, my_dist < threshold);
-        while (mask) {
-            int src = __ffs(mask) - 1;
-            mask &= mask - 1;
-            float c_dist = __shfl_sync(ALL, my_dist, src);
-            if (c_dist >= threshold) continue;
-            warp_topk_insert<K_PER_LANE>(reg_dist, reg_id, c_dist, jb + src, lane);
-            threshold = __shfl_sync(ALL, reg_dist[K_PER_LANE - 1], LANES - 1);
+    // 每 lane 每次读 4 个候选 (float4)，提高在途访存量——一个 bucket 只有
+    // bucket_size 个 block，占用率天然不高，标量读时这个 kernel 是延迟瓶颈。
+    const float* row = dots + static_cast<int64_t>(q) * ldd;
+    for (int jb = warp * LANES * 4; jb < pool_size; jb += G * LANES * 4) {
+        int j0 = jb + lane * 4;
+        float dd[4];
+        if (j0 + 3 < pool_size) {
+            float4 dv = *reinterpret_cast<const float4*>(row + j0);
+            float4 nv = *reinterpret_cast<const float4*>(norms_pool + j0);
+            dd[0] = nv.x - 2.0f * dv.x; dd[1] = nv.y - 2.0f * dv.y;
+            dd[2] = nv.z - 2.0f * dv.z; dd[3] = nv.w - 2.0f * dv.w;
+        } else {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e)
+                dd[e] = (j0 + e < pool_size) ? norms_pool[j0 + e] - 2.0f * row[j0 + e] : INFINITY;
+        }
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            if (j0 + e == q) dd[e] = INFINITY;
+            unsigned mask = __ballot_sync(ALL, dd[e] < threshold);
+            while (mask) {
+                int src = __ffs(mask) - 1;
+                mask &= mask - 1;
+                float c_dist = __shfl_sync(ALL, dd[e], src);
+                if (c_dist >= threshold) continue;
+                warp_topk_insert<K_PER_LANE>(reg_dist, reg_id, c_dist, jb + src * 4 + e, lane);
+                threshold = __shfl_sync(ALL, reg_dist[K_PER_LANE - 1], LANES - 1);
+            }
         }
     }
 
@@ -2601,19 +2680,18 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
 static inline void launch_block_topM_resident(
     cudaStream_t stream, const float* d_dots, const float* d_norms_pool, const int32_t* d_ids_pool,
     int32_t* d_out_neighbors, float* d_out_dists,
-    int bucket_size, int pool_size, int actual_M, int out_ld)
+    int bucket_size, int pool_size, int ldd, int actual_M, int out_ld)
 {
     constexpr int G = 8;
 #define LAUNCH_BLOCK_KOUT(KV) block_topK_from_dots_kernel<(KV), G><<<bucket_size, G * 32, 0, stream>>>( \
-        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, actual_M, out_ld)
+        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld)
     if      (actual_M <= 32)  LAUNCH_BLOCK_KOUT(32);
     else if (actual_M <= 64)  LAUNCH_BLOCK_KOUT(64);
     else if (actual_M <= 128) LAUNCH_BLOCK_KOUT(128);
     else if (actual_M <= 256) LAUNCH_BLOCK_KOUT(256);
     else
-        launch_extract_topM<float>(stream, d_dots, d_norms_pool, d_ids_pool, d_ids_pool,
-                                   d_out_neighbors, d_out_dists, bucket_size, pool_size, actual_M,
-                                   out_ld, d_norms_pool);
+        throw std::runtime_error("GPU-resident path supports neighbors-m <= 256 (got "
+                                 + std::to_string(actual_M) + "); use --out-of-core");
 #undef LAUNCH_BLOCK_KOUT
 }
 
@@ -2957,7 +3035,7 @@ struct GpuResidentKnn {
             ensure_device(s.pool, s.pool_cap, static_cast<size_t>(max_pool) * D);
             ensure_device(s.pool_norms, s.norms_cap, static_cast<size_t>(max_pool));
             ensure_device(s.pool_ids, s.ids_cap, static_cast<size_t>(max_pool));
-            ensure_device(s.dots, s.dots_cap, static_cast<size_t>(max_bucket) * max_pool);
+            ensure_device(s.dots, s.dots_cap, static_cast<size_t>(max_bucket) * ((max_pool + 3) / 4 * 4));
         }
 
         size_t nm = static_cast<size_t>(N) * M;
@@ -2972,6 +3050,7 @@ struct GpuResidentKnn {
         for (int64_t c = 0; c < n_centroids; ++c) {
             int bucket_size = static_cast<int>(offsets[c + 1] - offsets[c]);
             int ps = static_cast<int>(pool_size[c]);
+            int ldd = (ps + 3) / 4 * 4;   // dots 行宽对齐到 float4
             int actual_M = std::min(M, ps - 1);
             if (bucket_size == 0 || actual_M <= 0) continue;
             Slot& s = slots[launched % kStreams];
@@ -2991,19 +3070,19 @@ struct GpuResidentKnn {
                                     ps, bucket_size, D, &alpha,
                                     s.pool, CUDA_R_16F, D,
                                     s.pool, CUDA_R_16F, D, &beta,
-                                    s.dots, CUDA_R_32F, ps,
+                                    s.dots, CUDA_R_32F, ldd,
                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             } else {
                 stat = cublasSgemm(s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                                    ps, bucket_size, D, &alpha,
-                                   s.pool, D, s.pool, D, &beta, s.dots, ps);
+                                   s.pool, D, s.pool, D, &beta, s.dots, ldd);
             }
             if (stat != CUBLAS_STATUS_SUCCESS)
                 throw std::runtime_error("GpuResidentKnn: GEMM failed, status=" + std::to_string(stat));
 
             // pool 前 bucket_size 行就是 query 自己: ids / ‖q‖² 都直接取 pool 的前缀
             launch_block_topM_resident(s.stream, s.dots, s.pool_norms, s.pool_ids,
-                                       d_cur_n, d_cur_d, bucket_size, ps, actual_M, /*out_ld=*/M);
+                                       d_cur_n, d_cur_d, bucket_size, ps, ldd, actual_M, /*out_ld=*/M);
             CUDA_CHECK(cudaGetLastError());
         }
         double t_launch = std::chrono::duration<double>(Clock::now() - t1).count();
@@ -4671,7 +4750,7 @@ int run_pipeline_impl(
         // 都不再经过 CPU/磁盘。raw_host 留到 round 1 重排写 data_reordered 时用。
         std::unique_ptr<GpuResidentKnn<DataT>> gres;
         std::vector<DataT> raw_host;
-        if (neighbors_m > 0 && mem_est.fits_in_gpu && !force_out_of_core) {
+        if (neighbors_m > 0 && neighbors_m <= 256 && mem_est.fits_in_gpu && !force_out_of_core) {
             size_t need = GpuResidentKnn<DataT>::bytes_needed(N, D, neighbors_m);
             size_t free_b = 0, total_b = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
@@ -5449,13 +5528,10 @@ int main(int argc, char** argv) {
         // 的开销，怀疑就是这里。池子选比较保守的初始/上限大小，避免跟
         // build_vector_knn_with_tensorcore 里基于 cudaMemGetInfo 做的显存
         // 预算打架 (那部分是裸 cudaMalloc，不走 RMM，不受这个池影响)。
-        static auto cuda_mr = std::make_shared<rmm::mr::cuda_memory_resource>();
-        static auto pool_mr = std::make_shared<
-            rmm::mr::pool_memory_resource<rmm::mr::cuda_memory_resource>>(
-                cuda_mr.get(),
-                256UL * 1024 * 1024,        // initial pool size: 256MB
-                2UL * 1024 * 1024 * 1024);  // max pool size: 2GB, grows on demand
-        rmm::mr::set_current_device_resource(pool_mr.get());
+        rmm::mr::set_current_device_resource(rmm::mr::pool_memory_resource(
+            rmm::mr::cuda_memory_resource{},
+            256UL * 1024 * 1024,         // initial pool size: 256MB
+            2UL * 1024 * 1024 * 1024));  // max pool size: 2GB, grows on demand
 
         // ---- CLI parsing ----
         po::options_description desc("Bucket Builder Options");
