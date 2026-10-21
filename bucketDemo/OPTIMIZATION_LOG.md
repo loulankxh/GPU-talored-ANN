@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#22 (Step 4 exact top-2 via fp16 tensor-core GEMM for 8-bit data)**, 2026-10-21:
+After **#23 (rounds 2..t: gather the KMeans|| subset through inverse_perm instead of re-materialising X)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **11.62** | 0.9294 / 0.9775 / 0.9943 | 1945K / 956K |
-| SIFT1M large (out-of-core path) | **30.53** | 0.9002 / 0.9628 / 0.9890 | 1934K / 1035K |
+| SIFT1M auto (GPU-resident) | **11.19** (0.97x CAGRA) | 0.9294 / 0.9776 / 0.9947 | 1946K / 1035K |
+| SIFT1M large (out-of-core path) | **28.91** | 0.9000 / 0.9640 / 0.9894 | 1947K / 1033K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -749,6 +749,41 @@ First large run (`runs/iter21/sift1M_large`): 31.80 s (−3.3%, just over the 3%
 | ours sift1M_large | 0.9002 / 1934K | 0.9628 / 1035K | 0.9890 / 533K | 0.9973 / 189K | 0.9994 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-auto +10.7% (13.01 → 11.62 s, now 1.01× CAGRA native), 1M-large +2.8% (31.41 → 30.53 s).
+
+### #23 — rounds 2..t: gather the KMeans|| subset through inverse_perm instead of re-materialising X  (2026-10-21)
+**Idea / rationale:** after round 1's inline reorder, rounds 2..t need Step 2's training data in the new coordinate system, so Step 4.5 rebuilt the whole N×D float working set: the GPU-resident path permuted it in memory (0.50 s), the out-of-core path re-read `data_reordered.u8bin` from disk and converted it (0.79 s). Since #21 Step 2 only reads a 25% subset of it. When the full working set is loaded (`fits_in_gpu`), the subset fraction is < 1 and no PQ, `X_sampled` now stays in the original order and Step 4.5 only records `x_row_of` = inverse_perm (new id → old row; size-checked); Step 2's subset gather reads row `x_row_of[new_id]`. Fraction 1.0 / sampled / PQ runs keep the old path. Same "don't materialise, index through the permutation" as cuVS 26.12 `detail/cagra/cagra_build.cuh` working on index views. resample 0.50 → 0.001 s (auto), 0.79 → 0.001 s (large).
+**Files:** `src/bucket.cu`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 11.19 | +3.7% | +48.6% | 0.97x | bucket2 9.47, optimize 1.28, translate 0.39 | 3658 | 1.56 |
+| sift1M_large | large | 28.91 | +5.3% | +61.5% | 2.51x | bucket2 25.48, prune 1.40, optimize_chunked 1.64, translate 0.38 | 1438 | 3.95 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.76 | 1.41 | 0.11 | 0.00 | 0.89 | 0.66 | 0.02 | 4.34 | 0.00 | 0.75 |
+| sift1M_large | 0.57 | 2.75 | 0.19 | 0.00 | 6.73 | 1.40 | 0.03 | 12.00 | 0.96 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9833 | 0.9759 | 0.9691 | 0.9638 |
+| sift1M_large | 0.9810 | 0.9750 | 0.9688 | 0.9633 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9294 / 1946K | 0.9776 / 1035K | 0.9947 / 532K | 0.9988 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9000 / 1947K | 0.9640 / 1033K | 0.9894 / 492K | 0.9971 / 186K | 0.9992 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +5.3% (30.53 → 28.91 s), 1M-auto +3.7% (11.62 → 11.19 s; now below CAGRA native 11.54 s).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

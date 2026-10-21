@@ -5135,6 +5135,9 @@ int run_pipeline_impl(
         std::vector<int64_t> sampled_indices;
         std::vector<float> X_sampled;
         int64_t working_N = 0;  // X_sampled 的行数；Step 2 等 lambda 外的代码要用
+        // 非空时: 当前坐标系 id → X_sampled 的行号 (round 1 重排后 X_sampled 仍是
+        // 旧坐标系，只在 KMeans|| 抽训练子集时按它 gather，省掉整份重排)
+        std::vector<uint32_t> x_row_of;
 
         // 采样逻辑抽成 lambda：round 1 重排完之后，如果 iterations > 1，要对着
         // 新坐标系的 data_reordered.<ext> 重新采一遍（否则第 2..t 轮选出来的
@@ -5320,7 +5323,9 @@ int run_pipeline_impl(
             #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < train_N; ++i) {
                 std::memcpy(X_train_buf.data() + static_cast<size_t>(i) * D,
-                            X_sampled.data() + static_cast<size_t>(rows[static_cast<size_t>(i)]) * D,
+                            X_sampled.data() + static_cast<size_t>(x_row_of.empty()
+                                ? rows[static_cast<size_t>(i)]
+                                : x_row_of[static_cast<size_t>(rows[static_cast<size_t>(i)])]) * D,
                             static_cast<size_t>(D) * sizeof(float));
                 train_indices[static_cast<size_t>(i)] = sampled_indices[static_cast<size_t>(rows[static_cast<size_t>(i)])];
             }
@@ -5742,7 +5747,19 @@ int run_pipeline_impl(
             // 采的样；数据集坐标系已经变了，round 2..t 要用的话必须重新采一遍
             // (见 sample_from 定义处的注释)，否则第 2..t 轮选出来的
             // centroid_global_indices 会是错坐标系下的 ID。
-            if (iterations > 1 && gres) {
+            // fits_in_gpu: X_sampled 是整份数据集、旧坐标系行序 (sampled_indices = iota)
+            // —— GPU-resident 和 out-of-core 两条路径都是 (out-of-core 原来要重新
+            // 读一遍 data_reordered 并转 float)。
+            if (iterations > 1 && mem_est.fits_in_gpu && config.kmeans_train_fraction < 1.0f && !mem_est.need_pq) {
+                // Step 2 只会从 X_sampled 抽 kmeans_train_fraction 的子集 (见
+                // Step 2)：不整份重排 (N*D*4 B, SIFT1M ~0.5 s)，只记新 id → 旧行号
+                // 的映射，抽子集时按映射 gather。
+                auto tresample0 = Clock::now();
+                if (static_cast<int64_t>(reorder_info.inverse_perm.size()) != N)
+                    throw std::runtime_error("Step 4.5: inverse_perm size != N");
+                x_row_of.assign(reorder_info.inverse_perm.begin(), reorder_info.inverse_perm.end());
+                t45_resample = std::chrono::duration<double>(Clock::now() - tresample0).count();
+            } else if (iterations > 1 && gres) {
                 // fits_in_gpu 时 X_sampled 就是整份数据集 (sampled_indices = iota)，
                 // 直接在内存里按 inverse_perm 重排，不用重新读盘。
                 auto tresample0 = Clock::now();
