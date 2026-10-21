@@ -19,8 +19,8 @@
 // graph itself whenever K>1) -- a row's destination depends on it, and any
 // value in any row could reference any other point, so there's no way to
 // stream around needing random access to the whole table. The graph itself
-// is read/written in a streaming fashion (row batches via pwrite to each
-// row's known destination), never fully resident.
+// is never fully resident beyond the bounded output window (see
+// translate_graph_to_original_order).
 //
 // translate_npy_to_original_order() below does the same translation for a
 // .npy [N, K] int64 graph (e.g. neighbors.npy) instead of the raw
@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -65,11 +66,18 @@ inline std::vector<uint32_t> read_inverse_perm(const std::string& path, int64_t 
     return inv;
 }
 
+// Output is assembled in an in-memory window of destination rows
+// [win_lo, win_hi) (at most out_buffer_bytes), filled by streaming the input
+// graph once per window, then written with one sequential write. Replaces
+// one pwrite syscall per row (~2s for 1M rows of 128 B) with ~nothing; for
+// N*K*4 > out_buffer_bytes it takes ceil(N*K*4 / out_buffer_bytes) passes
+// over the (sequentially read) input, so host memory stays bounded.
 inline void translate_graph_to_original_order(
     const std::string& graph_path,
     const std::string& inverse_perm_path,
     const std::string& output_path,
-    int64_t batch_rows = 1 << 14)
+    int64_t batch_rows = 1 << 14,
+    size_t out_buffer_bytes = size_t(1) << 30)
 {
     int64_t N = 0; int32_t K_out = 0;
     graph_io::read_forward_graph_header(graph_path, N, K_out);
@@ -80,65 +88,74 @@ inline void translate_graph_to_original_order(
     if (!in.is_open())
         throw std::runtime_error("translate_ids: cannot open " + graph_path);
     const std::streamoff header_bytes = sizeof(int64_t) + sizeof(int32_t);
-    in.seekg(header_bytes);
 
     int fd = ::open(output_path.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
     if (fd < 0)
         throw std::runtime_error("translate_ids: cannot open " + output_path + " for writing");
+    auto fail = [&](const std::string& msg) {
+        ::close(fd);
+        throw std::runtime_error("translate_ids: " + msg);
+    };
+    auto pwrite_all = [&](const char* p, size_t n, off_t off) {
+        while (n > 0) {
+            ssize_t w = ::pwrite(fd, p, n, off);
+            if (w <= 0) fail("pwrite failed at offset " + std::to_string(off));
+            p += w; n -= static_cast<size_t>(w); off += w;
+        }
+    };
 
     const int64_t row_bytes = static_cast<int64_t>(K_out) * sizeof(uint32_t);
     {
         char hdr[12];
         std::memcpy(hdr, &N, sizeof(int64_t));
         std::memcpy(hdr + sizeof(int64_t), &K_out, sizeof(int32_t));
-        if (::pwrite(fd, hdr, sizeof(hdr), 0) != static_cast<ssize_t>(sizeof(hdr))) {
-            ::close(fd);
-            throw std::runtime_error("translate_ids: header write failed");
-        }
-    }
-    if (::ftruncate(fd, static_cast<off_t>(header_bytes) + N * row_bytes) != 0) {
-        ::close(fd);
-        throw std::runtime_error("translate_ids: ftruncate failed");
+        pwrite_all(hdr, sizeof(hdr), 0);
     }
 
+    const int64_t win_rows = std::max<int64_t>(1, std::min<int64_t>(
+        N, static_cast<int64_t>(out_buffer_bytes / static_cast<size_t>(row_bytes))));
+    std::vector<uint32_t> window(static_cast<size_t>(win_rows) * K_out);
     std::vector<uint32_t> batch(static_cast<size_t>(batch_rows) * K_out);
-    std::atomic<bool> failed{false};
-    std::atomic<int64_t> failed_new_id{-1};
+    std::atomic<int64_t> bad_new_id{-1};
 
-    for (int64_t lo = 0; lo < N; lo += batch_rows) {
-        int64_t rows = std::min<int64_t>(batch_rows, N - lo);
-        in.read(reinterpret_cast<char*>(batch.data()),
-                static_cast<std::streamsize>(static_cast<size_t>(rows) * K_out * sizeof(uint32_t)));
-        if (!in.good()) {
-            ::close(fd);
-            throw std::runtime_error("translate_ids: failed reading graph batch at row " + std::to_string(lo));
-        }
+    for (int64_t win_lo = 0; win_lo < N; win_lo += win_rows) {
+        const int64_t win_hi = std::min<int64_t>(N, win_lo + win_rows);
+        int64_t filled = 0;
+        in.clear();
+        in.seekg(header_bytes);
+        for (int64_t lo = 0; lo < N; lo += batch_rows) {
+            int64_t rows = std::min<int64_t>(batch_rows, N - lo);
+            in.read(reinterpret_cast<char*>(batch.data()),
+                    static_cast<std::streamsize>(static_cast<size_t>(rows) * K_out * sizeof(uint32_t)));
+            if (!in.good()) fail("failed reading graph batch at row " + std::to_string(lo));
 
-        // pwrite is thread-safe (doesn't share a file position), so this can
-        // translate + write each row independently in parallel. Exceptions
-        // can't safely cross an OpenMP region boundary, so failures are
-        // recorded in a shared flag and thrown after the loop instead.
-        #pragma omp parallel for schedule(static)
-        for (int64_t r = 0; r < rows; ++r) {
-            if (failed.load(std::memory_order_relaxed)) continue;
-            int64_t new_id = lo + r;
-            uint32_t* row = batch.data() + static_cast<size_t>(r) * K_out;
-            for (int32_t k = 0; k < K_out; ++k)
-                row[k] = inverse_perm[row[k]];
-
-            uint32_t old_id = inverse_perm[static_cast<size_t>(new_id)];
-            off_t off = static_cast<off_t>(header_bytes) + static_cast<off_t>(old_id) * row_bytes;
-            ssize_t written = ::pwrite(fd, row, static_cast<size_t>(row_bytes), off);
-            if (written != static_cast<ssize_t>(row_bytes)) {
-                failed.store(true, std::memory_order_relaxed);
-                failed_new_id.store(new_id, std::memory_order_relaxed);
+            #pragma omp parallel for schedule(static) reduction(+:filled)
+            for (int64_t r = 0; r < rows; ++r) {
+                int64_t new_id = lo + r;
+                uint32_t old_id = inverse_perm[static_cast<size_t>(new_id)];
+                if (old_id < win_lo || old_id >= win_hi) continue;   // also rejects old_id >= N
+                const uint32_t* src = batch.data() + static_cast<size_t>(r) * K_out;
+                uint32_t* dst = window.data() + static_cast<size_t>(old_id - win_lo) * K_out;
+                for (int32_t k = 0; k < K_out; ++k) {
+                    uint32_t v = src[k];
+                    if (v >= static_cast<uint64_t>(N)) {   // bounds check: neighbor id out of range
+                        bad_new_id.store(new_id, std::memory_order_relaxed);
+                        v = 0;
+                    }
+                    dst[k] = inverse_perm[v];
+                }
+                ++filled;
             }
+            if (bad_new_id.load() >= 0)
+                fail("neighbor id >= N in row (new id) " + std::to_string(bad_new_id.load()));
         }
-        if (failed.load()) {
-            ::close(fd);
-            throw std::runtime_error("translate_ids: pwrite failed for new_id " +
-                                     std::to_string(failed_new_id.load()));
-        }
+        // inverse_perm is a permutation iff every destination row is hit once
+        if (filled != win_hi - win_lo)
+            fail("inverse_perm is not a permutation: window [" + std::to_string(win_lo) + ", " +
+                 std::to_string(win_hi) + ") got " + std::to_string(filled) + " rows");
+        pwrite_all(reinterpret_cast<const char*>(window.data()),
+                   static_cast<size_t>(win_hi - win_lo) * static_cast<size_t>(row_bytes),
+                   static_cast<off_t>(header_bytes) + static_cast<off_t>(win_lo) * row_bytes);
     }
 
     if (::close(fd) != 0)

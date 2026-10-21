@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#2 (prune_windowed: optimistic pointer handoff from the Belady cache)**, 2026-10-21:
+After **#3 (translate_ids: bounded in-memory output window instead of per-row pwrite)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **21.30** | 0.9298 / 0.9785 / 0.9947 | 1946K / 1036K |
-| SIFT1M large (out-of-core path) | **57.14** | 0.8984 / 0.9628 / 0.9893 | 1995K / 1066K |
+| SIFT1M auto (GPU-resident) | **20.01** | 0.9300 / 0.9779 / 0.9947 | 1948K / 1035K |
+| SIFT1M large (out-of-core path) | **56.36** | 0.8988 / 0.9620 / 0.9885 | 2000K / 1033K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -63,7 +63,7 @@ Other:
 - Large path quality gap (prune_windowed vs cuVS optimize): SIFT1M recall@10 at itopk 32 is ~3 points below CAGRA — study `cpp/src/neighbors/detail/cagra/graph_core.cuh` (`optimize`: detour counting / rank-based pruning / reverse-edge merge) and align `prune_windowed_core.hpp` + `optimize_chunked` method E with it.
 - `optimize` (resident) spends most of its time in file load + sanitize, not in the cuVS call.
 - `prune_windowed` after #2 (3.9s): compute 2.6s forks an OMP region per bucket of ~100 rows on 80 threads — process several positions per parallel region, or move the detour count to GPU (cuVS `kern_fused_prune`). Store cached vectors as u8 (4x less cache memory → fewer evictions on SIFT10M); keep the dataset handle open in the loader.
-- `translate_ids` (2.1s for 1M) and resident `optimize` (2.1s) are now ~20% of the auto path outside bucket2 — check for plain I/O inefficiency.
+- Resident `optimize` (2.1s) — check load + sanitize vs the cuVS call; bucket2 "Write (close + .npy convert)" (1.4–2.2s) writes `neighbors.npy` that nothing reads.
 - bucket2 Step 6 (large path, 22–26s) is the largest single step of the large path.
 
 ## Tried & rejected
@@ -185,6 +185,43 @@ prune_windowed breakdown (rep1): fetch 3.74s, window_build 0.04s (was 4.36), com
 prune_windowed breakdown: fetch 0.98s (was 3.74), compute 2.60s, wall 3.88s (was 6.27). Borderline gain → large config rerun (`runs/iter2/sift1M_large_b`): 56.79 s, +5.1% → also ACCEPT.
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-auto +0.3% (untouched path), 1M-large +4.5% / +5.1% on rerun (59.83 → 57.14 s).
+
+### #3 — translate_ids: bounded in-memory output window instead of per-row pwrite  (2026-10-21)
+**Idea / rationale:** `translate_ids` took 2.1s on 1M × 32 because every row was one random 128-byte `pwrite` syscall (1M syscalls). Now destination rows [lo, hi) are scattered into an in-memory window (`--out-buffer-mb`, default 1024) while streaming the input graph, then written with one sequential write; graphs larger than the budget take ceil(bytes / budget) sequential passes over the input, so host memory stays bounded for the large path. Added bounds checks: neighbor id ≥ N → error (previously unchecked `inverse_perm[row[k]]`), and every window must receive exactly its row count (inverse_perm is a permutation). Same staging pattern as cuVS 26.12 `detail/cagra/cagra_build.cuh::build_knn_graph` (results gathered into a host buffer, flushed in large contiguous copies). Verified byte-identical to the previous output on SIFT1M at 1024 MB (1 pass, 0.47s, 138 MB RSS) and 7 MB (19 passes, 1.34s, 20 MB RSS); unit test `test_translate_graph_ids` passes.
+**Files:** `src/translate_graph_ids.hpp`, `src/translate_ids.cpp`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 20.01 | +6.1% | +8.0% | 1.73x | bucket2 17.51, optimize 2.09, translate 0.41 | 3912 | 2.06 |
+| sift1M_large | large | 56.36 | +1.4% | +25.0% | 4.88x | bucket2 46.37, prune 3.89, optimize_chunked 5.30, translate 0.44 | 1506 | 4.19 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.74 | 3.40 | 1.45 | 0.00 | 3.30 | 1.08 | 0.02 | 5.64 | 0.00 | 1.41 |
+| sift1M_large | 0.56 | 4.56 | 1.86 | 0.00 | 8.66 | 2.15 | 0.03 | 23.20 | 2.04 | 2.22 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9924 | 0.9898 | 0.9865 | 0.9836 |
+| sift1M_large | 0.9934 | 0.9889 | 0.9868 | 0.9842 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9300 / 1948K | 0.9779 / 1035K | 0.9947 / 524K | 0.9988 / 188K | 0.9998 / 68K |
+| ours sift1M_large | 0.8988 / 2000K | 0.9620 / 1033K | 0.9885 / 512K | 0.9972 / 188K | 0.9994 / 68K |
+
+[exited with code 0]
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +6.1% (21.30 → 20.01 s), 1M-large +1.4% (57.14 → 56.36 s; translate 2.16 → 0.44 s, offset by bucket2 noise).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

@@ -45,7 +45,10 @@ int main(int argc, char** argv)
             ("inverse-perm,p", po::value<std::string>()->required(),
                 "inverse_perm.bin (from bucket2's inline reorder, inverse_perm[new_id]=old_id)")
             ("output,o", po::value<std::string>()->required(),
-                "Output graph, same format, rows and neighbor ids translated to original order");
+                "Output graph, same format, rows and neighbor ids translated to original order")
+            ("out-buffer-mb", po::value<size_t>()->default_value(1024),
+                "Host memory budget (MB) for the output row window (.bin path); "
+                "graphs larger than this take several passes over the input");
 
         po::variables_map vm;
         po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -63,7 +66,9 @@ int main(int argc, char** argv)
         if (is_npy) {
             translate_ids::translate_npy_to_original_order(graph_path, inv_perm_path, output_path);
         } else {
-            translate_ids::translate_graph_to_original_order(graph_path, inv_perm_path, output_path);
+            translate_ids::translate_graph_to_original_order(
+                graph_path, inv_perm_path, output_path, 1 << 14,
+                vm["out-buffer-mb"].as<size_t>() << 20);
         }
 
         double elapsed = std::chrono::duration<double>(Clock::now() - t0).count();
