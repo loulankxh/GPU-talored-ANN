@@ -89,16 +89,19 @@ static void read_vector_knn_bin(const std::string& path,
 // 把 int32 邻居（含 -1 padding）转为 uint32，并修复 padding 与越界。
 // CAGRA 的 sort/optimize 要求每个邻居是 [0, N) 范围内的合法 id；
 // -1 (padding) 会被替换为该行内已有的合法邻居，找不到时回退到 (row+1)%N。
-static std::vector<uint32_t> sanitize_to_uint32(
-    const std::vector<int32_t>& src, int64_t N, int32_t M)
+// 原地转换 (int32 / uint32 同宽，每个元素只在自己的位置读一次写一次；
+// signed/unsigned 同类型允许互相 alias)，之后调用方把 buffer 当 uint32 用，
+// 不再额外分配一份 N*M 的输出 (SIFT1M: 256 MB alloc + page faults)。
+static void sanitize_to_uint32_inplace(
+    std::vector<int32_t>& src, int64_t N, int32_t M)
 {
-    std::vector<uint32_t> dst(static_cast<size_t>(N) * M);
+    static_assert(sizeof(int32_t) == sizeof(uint32_t), "in-place sanitize needs same width");
     int64_t total_padding = 0;
 
     #pragma omp parallel for reduction(+:total_padding) schedule(static)
     for (int64_t i = 0; i < N; ++i) {
         const int32_t* row_in = src.data() + i * M;
-        uint32_t* row_out     = dst.data() + i * M;
+        uint32_t* row_out     = reinterpret_cast<uint32_t*>(src.data() + i * M);
 
         // 第一遍：找该行任意一个合法邻居作为 fallback
         uint32_t fallback = static_cast<uint32_t>((i + 1) % N);
@@ -128,7 +131,6 @@ static std::vector<uint32_t> sanitize_to_uint32(
         std::cout << "[Sanitize] Replaced " << total_padding
                   << " padding (-1) entries with fallback neighbors\n";
     }
-    return dst;
 }
 
 // Lightweight header-only peek at vector_knn.bin (int64 N, int32 M) -- no
@@ -313,10 +315,15 @@ int main(int argc, char** argv)
         std::cout << "=== Step 1: Loading dataset ===\n";
         auto t1 = Clock::now();
 
+        // --skip-sort: cuVS optimize 只用 graph，不用 dataset —— 只读 header
+        // 拿 N/D，不再整份读入并转 float32 (SIFT1M: 0.5 GB, ~0.55s)。
         std::vector<float> dataset_host;
         int32_t N32 = 0, D = 0;
         std::string ext = std::filesystem::path(input_path).extension().string();
-        if (ext == ".fbin" || ext == ".bin") {
+        if (skip_sort) {
+            auto [n_hdr, d_hdr] = load::read_fbin_header(input_path);
+            N32 = n_hdr; D = d_hdr;
+        } else if (ext == ".fbin" || ext == ".bin") {
             load::read_fbin_f32(input_path, dataset_host, N32, D);
         } else if (ext == ".u8bin" || ext == ".i8bin") {
             load::read_u8bin_to_f32(input_path, dataset_host, N32, D);
@@ -354,8 +361,8 @@ int main(int argc, char** argv)
         std::cout << "  Input graph: N=" << N << " M_in=" << M_in
                   << " (" << knn_i32.size() * sizeof(int32_t) / 1e6 << " MB)\n";
 
-        auto knn_u32 = sanitize_to_uint32(knn_i32, N, M_in);
-        { auto _drop = std::move(knn_i32); }
+        sanitize_to_uint32_inplace(knn_i32, N, M_in);
+        uint32_t* knn_u32 = reinterpret_cast<uint32_t*>(knn_i32.data());
         std::cout << "  Sanitize done ["
                   << std::chrono::duration<double>(Clock::now() - t2).count()
                   << "s]\n";
@@ -366,12 +373,12 @@ int main(int argc, char** argv)
         raft::resources res;
 
         auto knn_graph_view = raft::make_host_matrix_view<uint32_t, int64_t>(
-            knn_u32.data(), N, M_in);
+            knn_u32, N, M_in);
 
         if (!skip_sort) {
             std::cout << "=== Step 3: CAGRA sort_knn_graph ===\n";
             auto t3 = Clock::now();
-            sort_knn_graph_host(dataset_host.data(), N, D, knn_u32.data(), M_in);
+            sort_knn_graph_host(dataset_host.data(), N, D, knn_u32, M_in);
             std::cout << "  Sort done ["
                       << std::chrono::duration<double>(Clock::now() - t3).count()
                       << "s]\n";
@@ -394,7 +401,7 @@ int main(int argc, char** argv)
                   << "s]\n";
 
         // 中间图已经不需要了
-        { auto _drop = std::move(knn_u32); }
+        { auto _drop = std::move(knn_i32); }
         { auto _drop = std::move(dataset_host); }
 
         // ---------------------------------------------------------------
