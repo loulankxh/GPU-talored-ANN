@@ -17,9 +17,7 @@ Rules (agreed with the user):
                >= 3% faster than best, and no config is > 3% slower than best.
   quality      CAGRA-search recall@10 at every itopk, sift1M auto + large:
                  resident path: >= best - 0.01  and  >= CAGRA - 0.01
-                 large path   : >= best - 0.01  and  >= min(CAGRA - 0.01, initial large baseline)
-                                (the large path starts below CAGRA-1%; it may not get worse
-                                 than where it started, and closing the gap is a valid goal)
+                 large path   : >= best - 0.01  and  >= CAGRA - 0.05   (user decision 2026-10-21)
                pre-prune KNN recall@64 (sampled exact KNN) >= best - 0.01 on every run.
   memory       large path (sift1M large): host peak RSS per stage and GPU peak <= 1.2x best
                (scalability guard: nothing may start growing with N).
@@ -32,6 +30,7 @@ BEST = os.path.join(STATE, "best.json")
 CAGRA = json.load(open(os.path.join(STATE, "cagra_baseline.json")))
 KEYS = ["sift1M_auto", "sift1M_large"]
 SPEED_GAIN, SPEED_TOL, RECALL_TOL, MEM_TOL = 0.03, 0.03, 0.01, 1.2
+CAGRA_TOL = {"auto": 0.01, "large": 0.05}  # allowed recall@10 gap to CAGRA per path
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 flags = {a for a in sys.argv[1:] if a.startswith("--")}
@@ -87,7 +86,6 @@ if best:
     for k in KEYS:
         cr, br = recalls(cand[k]), recalls(best["runs"][k])
         cag_tab = CAGRA[k.split("_")[0]].get("search")
-        floor_init = initial_floor(best, k) if k.endswith("_large") else None
         for it in (cag_tab or CAGRA["sift1M"]["search"]):
             if it not in cr:
                 fail.append(f"{k}: missing itopk {it}"); continue
@@ -95,9 +93,7 @@ if best:
                 fail.append(f"{k} itopk {it}: recall {cr[it]:.4f} < best {br[it]:.4f} - 0.01")
             if cag_tab is None:
                 continue
-            cag_floor = cag_tab[it] - RECALL_TOL
-            if floor_init and it in floor_init:
-                cag_floor = min(cag_floor, floor_init[it])
+            cag_floor = cag_tab[it] - CAGRA_TOL[k.split("_")[1]]
             if cr[it] < cag_floor:
                 fail.append(f"{k} itopk {it}: recall {cr[it]:.4f} < floor {cag_floor:.4f}")
     for k in KEYS:

@@ -18,6 +18,10 @@ Measured per iteration:
   CAGRA search (same searcher as for CAGRA's own graph), recall@10 + QPS at itopk 32…512,
   10K queries, SIFT1M.
 
+Quality gate (user, 2026-10-21): recall@10 at every itopk within **1%** of CAGRA for the
+GPU-resident path and within **5%** of CAGRA for the large-dataset path; plus never more
+than 1% below the current best.
+
 CAGRA reference (cuVS 26.10, NN-Descent, intermediate degree 64 → graph degree 32):
 
 | dataset | build (s) | recall@10 itopk 32 / 64 / 128 / 256 / 512 |
@@ -99,7 +103,7 @@ Other:
 | ours sift1M_auto | 0.9293 / 1945K | 0.9780 / 1036K | 0.9946 / 507K | 0.9987 / 187K | 0.9998 / 68K |
 | ours sift1M_large | 0.8970 / 1996K | 0.9622 / 1064K | 0.9888 / 529K | 0.9973 / 188K | 0.9994 / 67K |
 
-**Verdict:** baseline. Large path search quality is ~3.3 / 1.6 points below CAGRA at itopk 32 / 64 (pre-prune KNN quality is the same as the resident path, so the gap comes from `prune_windowed` + `optimize_chunked`).
+**Verdict:** baseline. Both paths pass the quality gate (resident within 1% of CAGRA, large within 5%). Large path search quality is ~3.3 / 1.6 points below CAGRA at itopk 32 / 64 (pre-prune KNN quality is the same as the resident path, so the gap comes from `prune_windowed` + `optimize_chunked`).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
