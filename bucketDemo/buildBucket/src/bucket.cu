@@ -5818,6 +5818,28 @@ int run_pipeline_impl(
         size_t centroid_gpu_bytes = static_cast<size_t>(n_centroids) * D * sizeof(float);
         size_t graph_bytes = static_cast<size_t>(n_centroids) * K * sizeof(uint32_t);
         cudaDeviceSynchronize();
+
+        // bucket 处理顺序 (DiskJoin 贪心) 只依赖 centroid KNN 图：图一出来就在
+        // 后台线程算，跟 Step 4 的分配重叠 (原来 round 1 在 Step 4.5、round ≥2
+        // 在 Step 6 setup 里串行算，各 ~0.3 s)。图先下载到 host (原来在 Step 4
+        // 之后下载)；输入、order_window 跟两个原调用点完全一样 → 结果逐位相同。
+        std::future<std::vector<int32_t>> order_future;
+        const bool need_order = (iter == 0) || (neighbors_m > 0 && !gres);
+        if (neighbors_m > 0 || iter == 0) {
+            centroid_knn_graph_host.resize(static_cast<size_t>(n_centroids) * K);
+            CUDA_CHECK(cudaMemcpy(centroid_knn_graph_host.data(), d_graph,
+                                  graph_bytes, cudaMemcpyDeviceToHost));
+        }
+        if (need_order) {
+            const int32_t ow = (order_window_arg > 0)
+                ? order_window_arg
+                : std::max<int32_t>(4 * static_cast<int32_t>(K), 16);
+            order_future = std::async(std::launch::async,
+                [graph = centroid_knn_graph_host, nc = n_centroids, k = static_cast<int32_t>(K), ow]() {
+                    return bucket_order::compute_bucket_processing_order(
+                        bucket_order::adjacency_from_flat_graph(graph.data(), nc, k), ow);
+                });
+        }
         double iter_step3 = std::chrono::duration<double>(Clock::now() - t3).count();
         elapsed_step3 += iter_step3;
         std::cout << "  Step 3 done [" << std::fixed << std::setprecision(3) << iter_step3 << "s]\n";
@@ -5905,11 +5927,7 @@ int run_pipeline_impl(
 
         // Download centroid KNN graph to CPU before freeing (needed for Step 6,
         // and for round 1's inline reorder just below, which always runs).
-        if (neighbors_m > 0 || iter == 0) {
-            centroid_knn_graph_host.resize(static_cast<size_t>(n_centroids) * K);
-            CUDA_CHECK(cudaMemcpy(centroid_knn_graph_host.data(), d_graph,
-                                  graph_bytes, cudaMemcpyDeviceToHost));
-        }
+        // (centroid KNN 图已在 Step 3 之后下载到 centroid_knn_graph_host)
 
         // Free KNN graph from GPU
         CUDA_CHECK(cudaFree(d_graph));
@@ -5976,13 +5994,8 @@ int run_pipeline_impl(
 
             // Pass 2：复用现成的 compute_bucket_reorder，只是这里喂的是 round 1
             // 的 assignments（不是"最后一轮"的）。
-            int32_t order_window = (order_window_arg > 0)
-                ? order_window_arg
-                : std::max<int32_t>(4 * static_cast<int32_t>(K), 16);
-            bucket_process_order_round1 = bucket_order::compute_bucket_processing_order(
-                bucket_order::adjacency_from_flat_graph(
-                    centroid_knn_graph_host.data(), n_centroids, static_cast<int32_t>(K)),
-                order_window);
+            // Step 3 之后已经在后台算好 (见 order_future)
+            bucket_process_order_round1 = order_future.get();
             const auto& bucket_process_order = bucket_process_order_round1;
             {
                 auto tnow = Clock::now();
@@ -6317,12 +6330,16 @@ int run_pipeline_impl(
                     order_window_arg, step6_cache_bytes,
                     &bucket_process_order_round1, config.gpu_bucket_cache_mb << 20);
             } else {
+                // bucket 处理顺序在 Step 3 之后已经在后台算好
+                std::vector<int32_t> order_rk = order_future.valid() ? order_future.get()
+                                                                     : std::vector<int32_t>();
                 build_vector_knn_with_tensorcore<DataT>(
                     N, D, *bucket_vecs_ptr, graph_ptr,
                     n_centroids, graph_K, neighbors_m,
                     *knn_acc,
                     centroid_knn_graph_host.data(), K,
-                    order_window_arg, step6_cache_bytes, nullptr, config.gpu_bucket_cache_mb << 20);
+                    order_window_arg, step6_cache_bytes,
+                    order_rk.empty() ? nullptr : &order_rk, config.gpu_bucket_cache_mb << 20);
             }
             double t6_after_build = std::chrono::duration<double>(Clock::now() - t6).count();
             double t6_build_vector_knn = t6_after_build - t6_topk_expand;
