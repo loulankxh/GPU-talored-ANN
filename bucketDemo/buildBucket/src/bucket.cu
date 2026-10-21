@@ -4164,7 +4164,12 @@ void build_vector_knn_with_tensorcore(
         }
         {
             auto gm0 = diag_now();
-            #pragma omp parallel for schedule(dynamic)
+            // 线程数封顶 8：每个 pool 只有 ~K+1 个小 job (SIFT1M 每个 ~100 行
+            // ≈ 13 KB)，80 线程 fork/join + 跨 NUMA 抢带宽反而更慢。实测
+            // (SIFT1M --out-of-core, 每轮 pool_memcpy): 80 线程 2.1–2.9s，
+            // 32: 1.6s, 16: 1.2–1.6s, 8: 1.3–1.6s, 4: 1.7s, 1: 5.3s。
+            static const int pool_copy_threads = std::min(8, omp_get_max_threads());
+            #pragma omp parallel for schedule(dynamic) num_threads(pool_copy_threads)
             for (int64_t j = 0; j < static_cast<int64_t>(copy_jobs.size()); ++j) {
                 const CopyJob& job = copy_jobs[static_cast<size_t>(j)];
                 std::memcpy(ids_pool64 + job.dest_ofs, job.src_ids, job.count * sizeof(int64_t));
