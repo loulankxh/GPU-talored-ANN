@@ -45,6 +45,11 @@
 #include <boost/program_options.hpp>
 
 #include <cuda_runtime.h>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/scan.h>
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
 
 #include "load.hpp"
 #include "graph_io.hpp"
@@ -1305,6 +1310,57 @@ static void run_method_B(
 }
 
 // =====================================================================
+// ---- Method E Phase 2 on the GPU (单 chunk、整张前向图在显存时) ----
+// 跟 CPU 路径 (build_rank_ordered_csr + merge_rank_ordered_into_row) 完全同一套
+// 规则：边按 (dst, rank, src) 排序 (两遍稳定 radix sort: 先 src，再
+// (dst<<16 | rank))，每行的反向边从最弱到最强依次插入 (shift/protect 规则不变)，
+// 输出逐位一致。
+__global__ void kern_e_extract(const edge_chunk::EdgeRecord* __restrict__ recs, uint64_t E, uint64_t N,
+                               uint32_t* __restrict__ dst, uint16_t* __restrict__ rank,
+                               uint32_t* __restrict__ src, uint32_t* __restrict__ row_cnt,
+                               int* __restrict__ err)
+{
+    uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= E) return;
+    const edge_chunk::EdgeRecord r = recs[i];
+    if (r.dst >= N) { atomicExch(err, 1); dst[i] = 0; rank[i] = 0; src[i] = r.src; return; }   // bounds check
+    dst[i] = r.dst; rank[i] = r.rank; src[i] = r.src;
+    atomicAdd(&row_cnt[r.dst], 1u);
+}
+
+__global__ void kern_e_key2(const uint64_t* __restrict__ idx, const uint32_t* __restrict__ dst,
+                            const uint16_t* __restrict__ rank, uint64_t E, uint64_t* __restrict__ key2)
+{
+    uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= E) return;
+    const uint64_t j = idx[i];
+    key2[i] = (static_cast<uint64_t>(dst[j]) << 16) | rank[j];
+}
+
+template <int KMAX>
+__global__ void kern_e_merge(const uint32_t* __restrict__ fwd, const uint32_t* __restrict__ row_off,
+                             const uint32_t* __restrict__ src_sorted, uint64_t N, int K_out,
+                             uint32_t* __restrict__ out)
+{
+    uint64_t j = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (j >= N) return;
+    uint32_t row[KMAX];
+    for (int p = 0; p < K_out; ++p) row[p] = fwd[j * K_out + p];
+    const uint32_t lo = row_off[j], hi = row_off[j + 1];
+    const uint32_t num_protected = static_cast<uint32_t>(K_out) / 2;
+    for (uint32_t k = hi; k > lo; ) {       // 最弱 (rank 最大) 先插，最强最后插
+        --k;
+        const uint32_t i = src_sorted[k];
+        uint32_t pos = static_cast<uint32_t>(K_out);
+        for (int p = 0; p < K_out; ++p) if (row[p] == i) { pos = static_cast<uint32_t>(p); break; }
+        if (pos < num_protected) continue;
+        uint32_t num_shift = (pos == static_cast<uint32_t>(K_out)) ? (K_out - num_protected - 1) : (pos - num_protected);
+        for (uint32_t sft = num_shift; sft > 0; --sft) row[num_protected + sft] = row[num_protected + sft - 1];
+        row[num_protected] = i;
+    }
+    for (int p = 0; p < K_out; ++p) out[j * K_out + p] = row[p];
+}
+
 // Method E: 单遍扫描 + per-chunk 磁盘 flush 的 scatter buffer（见
 // kern_scatter_rank 和 edge_chunk_accumulator.hpp），rank 保序，不要求
 // forward/output 整图常驻 host。
@@ -1379,6 +1435,9 @@ static void run_method_E(
     // 两块 N*K_out 大小的 pinned buffer (SIFT1M: 640 MB, cudaMallocHost ~0.3 s)。
     const bool single_drain = edges_in_memory && capacity_per_chunk >= total_edges;
     if (single_drain) overflow_cap = 1024;
+    // 单次 drain 且整张前向图一批就进了显存 (batch_rows >= N) 时，Phase 2 也在 GPU 上做
+    const bool gpu_phase2 = single_drain && static_cast<int64_t>(batch_rows) >= N && K_out <= 64;
+    std::vector<uint32_t> gpu_merged_rows;
 
     std::cout << "  [Method E] " << plan.label
               << ", num_chunks=" << num_chunks
@@ -1521,6 +1580,54 @@ static void run_method_E(
             uint32_t cnt = h_chunk_count[static_cast<size_t>(c)];
             if (cnt == 0) continue;
             uint32_t take = std::min(cnt, static_cast<uint32_t>(capacity_per_chunk));
+            if (single_drain && gpu_phase2) {
+                // Phase 2 直接在 GPU 上做 (边和整张前向图都已经在显存)
+                const uint64_t E = take;
+                uint32_t *d_dst = nullptr, *d_src = nullptr, *d_cnt = nullptr, *d_out = nullptr;
+                uint16_t* d_rank = nullptr; uint64_t *d_idx = nullptr, *d_key2 = nullptr; int* d_err = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_dst,  E * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&d_src,  E * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&d_rank, E * sizeof(uint16_t)));
+                CUDA_CHECK(cudaMalloc(&d_idx,  E * sizeof(uint64_t)));
+                CUDA_CHECK(cudaMalloc(&d_key2, E * sizeof(uint64_t)));
+                CUDA_CHECK(cudaMalloc(&d_cnt,  (static_cast<size_t>(N) + 1) * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&d_out,  static_cast<size_t>(N) * K_out * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMalloc(&d_err,  sizeof(int)));
+                CUDA_CHECK(cudaMemset(d_cnt, 0, (static_cast<size_t>(N) + 1) * sizeof(uint32_t)));
+                CUDA_CHECK(cudaMemset(d_err, 0, sizeof(int)));
+                const unsigned eb = static_cast<unsigned>((E + 255) / 256);
+                kern_e_extract<<<eb, 256>>>(d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk, E,
+                                            static_cast<uint64_t>(N), d_dst, d_rank, d_src, d_cnt, d_err);
+                CUDA_CHECK(cudaGetLastError());
+                auto pol = thrust::cuda::par;
+                thrust::sequence(pol, thrust::device_pointer_cast(d_idx), thrust::device_pointer_cast(d_idx) + E);
+                {   // 第 1 遍: 按 src 稳定排序 (src 键排完即为排好序的 src)
+                    thrust::stable_sort_by_key(pol, thrust::device_pointer_cast(d_src), thrust::device_pointer_cast(d_src) + E,
+                                               thrust::device_pointer_cast(d_idx));
+                }
+                kern_e_key2<<<eb, 256>>>(d_idx, d_dst, d_rank, E, d_key2);
+                CUDA_CHECK(cudaGetLastError());
+                // 第 2 遍: 按 (dst, rank) 稳定排序，src 跟着走 → (dst, rank, src) 序
+                thrust::stable_sort_by_key(pol, thrust::device_pointer_cast(d_key2), thrust::device_pointer_cast(d_key2) + E,
+                                           thrust::device_pointer_cast(d_src));
+                thrust::exclusive_scan(pol, thrust::device_pointer_cast(d_cnt),
+                                       thrust::device_pointer_cast(d_cnt) + N + 1, thrust::device_pointer_cast(d_cnt));
+                const unsigned nb = static_cast<unsigned>((N + 127) / 128);
+                if (K_out <= 32) kern_e_merge<32><<<nb, 128>>>(d_fwd_batch, d_cnt, d_src, static_cast<uint64_t>(N), K_out, d_out);
+                else             kern_e_merge<64><<<nb, 128>>>(d_fwd_batch, d_cnt, d_src, static_cast<uint64_t>(N), K_out, d_out);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                int h_err = 0;
+                CUDA_CHECK(cudaMemcpy(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost));
+                if (h_err) throw std::runtime_error("Method E (GPU phase 2): edge dst out of range");
+                gpu_merged_rows.resize(static_cast<size_t>(N) * K_out);
+                CUDA_CHECK(cudaMemcpy(gpu_merged_rows.data(), d_out, gpu_merged_rows.size() * sizeof(uint32_t),
+                                      cudaMemcpyDeviceToHost));
+                cudaFree(d_dst); cudaFree(d_src); cudaFree(d_rank); cudaFree(d_idx); cudaFree(d_key2);
+                cudaFree(d_cnt); cudaFree(d_out); cudaFree(d_err);
+                total_in_chunk += take;
+                continue;
+            }
             if (single_drain) {   // 唯一一次 drain，直接进 mem_edges
                 mem_edges.resize(take);
                 CUDA_CHECK(cudaMemcpy(mem_edges.data(), d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
@@ -1545,7 +1652,8 @@ static void run_method_E(
 
     auto t_finish0 = Clock::now();
     if (!edges_in_memory) acc.finish();
-    else if (mem_edges.size() != static_cast<size_t>(N) * static_cast<size_t>(K_out))
+    else if (gpu_phase2 ? gpu_merged_rows.size() != static_cast<size_t>(N) * static_cast<size_t>(K_out)
+                        : mem_edges.size() != static_cast<size_t>(N) * static_cast<size_t>(K_out))
         throw std::runtime_error("Method E: in-memory edge count " + std::to_string(mem_edges.size()) +
                                  " != N*K_out");
     double t_acc_finish = std::chrono::duration<double>(Clock::now() - t_finish0).count();
@@ -1577,11 +1685,15 @@ static void run_method_E(
         fwd_in2.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);
 
         graph_io::StreamingGraphWriter writer(out_path, N, K_out);
+        if (gpu_phase2) {
+            writer.write_rows(gpu_merged_rows.data(), 0, N);
+            std::cout << "  [Method E] phase 2 on GPU\n";
+        }
 
         std::vector<uint32_t> row_block;
         std::vector<edge_chunk::EdgeRecord> chunk_edges;
 
-        for (int32_t c = 0; c < num_chunks; ++c) {
+        for (int32_t c = 0; !gpu_phase2 && c < num_chunks; ++c) {
             uint32_t j_lo = plan.starts[static_cast<size_t>(c)];
             uint32_t j_hi = plan.starts[static_cast<size_t>(c) + 1];
             uint32_t chunk_sz = j_hi - j_lo;
