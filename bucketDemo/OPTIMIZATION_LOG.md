@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#57 (prune_windowed GPU path: no float copy, pinned double-buffered H2D / streamed D2H → writer)**, 2026-10-21:
+After **#61 (resident block top-M seeded with the running K-th distance in rounds 2..t)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **6.82** (0.59x CAGRA) | 0.9287 / 0.9773 / 0.9945 | 2223K / 1193K |
-| SIFT1M large (out-of-core path) | **10.23** (0.89x CAGRA) | 0.9146 / 0.9710 / 0.9923 | 1946K / 838K |
-| SIFT10M auto (→ large path, 1 run) | **96.09** (0.78x CAGRA) | 0.8379 / 0.9290 / 0.9737 | 1873K / 1012K |
+| SIFT1M auto (GPU-resident) | **6.31** (0.55x CAGRA) | 0.9272 / 0.9769 / 0.9942 | 2222K / 1192K |
+| SIFT1M large (out-of-core path) | **10.12** (0.88x CAGRA) | 0.9135 / 0.9708 / 0.9921 | 1950K / 1036K |
+| SIFT10M auto (→ large path, 1 run) | **95.94** (0.78x CAGRA) | 0.8400 / 0.9291 / 0.9737 | 1868K / 974K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -1646,6 +1646,48 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8379 / 1873K | 0.9290 / 1012K | 0.9737 / 526K | 0.9917 / 179K | 0.9980 / 68K |
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +8.2% (104.66 → 96.09 s, **0.78× CAGRA native**; the stored 104.66 s was the slower of #56's two runs, its rerun was 98.64 s), 1M-large 0.0%, 1M-auto −0.3%.
+
+### #61 — GPU-resident Step 6: block top-M threshold seeded with each point's running M-th distance (rounds 2..t)  (2026-10-21, commit TBD)
+**Idea / rationale:** the block top-M kernel's cost is the serial inserts of candidates that pass the row threshold (#60: ~120K warp instructions / row). In rounds 2..t the resident path already holds every point's running top-M (sorted ascending, `d_run_d`), and `resident_merge_kernel` keeps the best M of (running ∪ this round, deduped). So a candidate whose true distance is ≥ the point's running M-th can never enter the merged result. The kernel now starts the shared row threshold (#49) at `run_d[gid][M−1] − ‖q‖²` (kernel distances exclude ‖q‖²) instead of +inf. Fewer passing candidates means fewer inserts. Rows may now emit fewer than M valid entries (padded −1 / inf, sorted); the merge already handles that. Merged results are unchanged except for ties at the boundary. The out-of-core path has no device-resident running state and passes nullptr (unchanged). Follows the "fewer candidates, not cheaper inserts" note from #60 (the filter-by-current-k-th idea of raft `warp_sort_filtered`).
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+**Effect:** resident Step 6 loop rounds 2/3 0.91 → 0.71 s; Step 6 3.14 → 2.73 s.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.31 | +7.5% | +71.0% | 0.55x | bucket2 6.31 | 4116 | 1.71 |
+| sift1M_large | large | 10.12 | +1.1% | +86.5% | 0.88x | bucket2 8.34, prune 0.72, optimize_chunked 0.68, translate 0.38 | 1728 | 2.22 |
+| sift10M_auto | large | 95.94 | +0.2% | +46.2% | 0.78x | bucket2 83.36, prune 4.10, optimize_chunked 4.92, translate 3.56 | 8998 | 13.68 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.62 | 0.26 | 0.16 | 0.00 | 0.63 | 0.50 | 0.02 | 2.73 | 0.00 | 0.92 |
+| sift1M_large | 0.13 | 0.65 | 0.37 | 0.00 | 1.03 | 0.44 | 0.04 | 4.46 | 0.52 | 0.00 |
+| sift10M_auto | 1.34 | 7.59 | 1.91 | 0.00 | 18.49 | 2.79 | 1.69 | 44.46 | 4.07 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9732 | 0.9661 | 0.9593 | 0.9537 |
+| sift1M_large | 0.9749 | 0.9664 | 0.9591 | 0.9533 |
+| sift10M_auto | 0.9144 | 0.8981 | 0.8829 | 0.8713 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9272 / 2222K | 0.9769 / 1192K | 0.9942 / 563K | 0.9987 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9135 / 1950K | 0.9708 / 1036K | 0.9921 / 515K | 0.9981 / 188K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8400 / 1868K | 0.9291 / 974K | 0.9737 / 535K | 0.9919 / 186K | 0.9979 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +7.5% (6.82 → 6.31 s, 0.55× CAGRA native), 1M-large +1.1%, 10M-auto +0.2% (both paths untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

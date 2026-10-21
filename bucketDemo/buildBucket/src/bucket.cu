@@ -3173,7 +3173,11 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
     const int32_t* __restrict__ ids_pool,    // (pool_size,)  前 bucket_size 个即 query gid
     int32_t* __restrict__ out_neighbors,     // 第 gid 行、行宽 out_ld
     float*   __restrict__ out_dists,         // 同上，真实 L2²
-    int pool_size, int ldd, int K, int out_ld)
+    int pool_size, int ldd, int K, int out_ld,
+    // 非空 (GPU-resident round 2..t): 跨轮 running top-M (行宽 out_ld，升序)。
+    // 本轮候选的真实距离 ≥ 该点 running 第 M 个就进不了合并后的 top-M
+    // (resident_merge_kernel 取两者并集去重后的前 M)，拿它当行阈值初值
+    const float* __restrict__ seed_d = nullptr)
 {
     constexpr int LANES = 32;
     constexpr int K_PER_LANE = K_OUT / LANES;
@@ -3201,7 +3205,14 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
     auto key2f = [](unsigned k) {
         return __uint_as_float((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k);
     };
-    if (threadIdx.x == 0) s_th = 0xFFFFFFFFu;
+    if (threadIdx.x == 0) {
+        s_th = 0xFFFFFFFFu;
+        if (seed_d) {
+            const int64_t srow = static_cast<int64_t>(kRowByQuery ? q : ids_pool[q]);
+            const float sk = seed_d[srow * out_ld + out_ld - 1];
+            if (sk < INFINITY) s_th = f2key(sk - norms_pool[q]);   // kernel 内距离不含 ‖q‖²
+        }
+    }
     __syncthreads();
 
     // 每 lane 每次读 4 个候选 (float4)，提高在途访存量——一个 bucket 只有
@@ -3318,11 +3329,12 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
 static inline void launch_block_topM_resident(
     cudaStream_t stream, const float* d_dots, const float* d_norms_pool, const int32_t* d_ids_pool,
     int32_t* d_out_neighbors, float* d_out_dists,
-    int bucket_size, int pool_size, int ldd, int actual_M, int out_ld)
+    int bucket_size, int pool_size, int ldd, int actual_M, int out_ld,
+    const float* d_seed = nullptr)
 {
     constexpr int G = 8;
 #define LAUNCH_BLOCK_KOUT(KV) block_topK_from_dots_kernel<(KV), G><<<bucket_size, G * 32, 0, stream>>>( \
-        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld)
+        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld, d_seed)
     if      (actual_M <= 32)  LAUNCH_BLOCK_KOUT(32);
     else if (actual_M <= 64)  LAUNCH_BLOCK_KOUT(64);
     else if (actual_M <= 128) LAUNCH_BLOCK_KOUT(128);
@@ -3742,7 +3754,8 @@ struct GpuResidentKnn {
 
             // pool 前 bucket_size 行就是 query 自己: ids / ‖q‖² 都直接取 pool 的前缀
             launch_block_topM_resident(s.stream, s.dots, s.pool_norms, s.pool_ids,
-                                       d_cur_n, d_cur_d, bucket_size, ps, ldd, actual_M, /*out_ld=*/M);
+                                       d_cur_n, d_cur_d, bucket_size, ps, ldd, actual_M, /*out_ld=*/M,
+                                       has_run ? d_run_d : nullptr);
             CUDA_CHECK(cudaGetLastError());
         }
         double t_launch = std::chrono::duration<double>(Clock::now() - t1).count();
