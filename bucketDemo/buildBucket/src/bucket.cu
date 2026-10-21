@@ -17,6 +17,7 @@
 #include <type_traits>
 #include <omp.h>
 #include <optional>
+#include <deque>
 #include <fcntl.h>
 #include <unistd.h>
 #include <exception>
@@ -2891,9 +2892,12 @@ __device__ __forceinline__ void warp_topk_insert(
     }
 }
 
-template <int K_OUT, int G>
+// DotT = float (fp16/fp32 GEMM) 或 int32 (out-of-core INT8 GEMM，|dot| ≤ 128*128*128
+// < 2^24，转 float 精确)。kRowByQuery: 输出第 q 行 (out-of-core 每 bucket 一块
+// 本地输出)；否则输出第 ids_pool[q] 行 (GPU-resident 全局表)。
+template <int K_OUT, int G, typename DotT = float, bool kRowByQuery = false>
 __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
-    const float*   __restrict__ dots,        // (bucket_size, ldd)，ldd 是 4 的倍数 (float4 对齐)
+    const DotT*    __restrict__ dots,        // (bucket_size, ldd)，ldd 是 4 的倍数 (16 B 对齐)
     const float*   __restrict__ norms_pool,  // (pool_size,)  前 bucket_size 个即 ‖q‖²
     const int32_t* __restrict__ ids_pool,    // (pool_size,)  前 bucket_size 个即 query gid
     int32_t* __restrict__ out_neighbors,     // 第 gid 行、行宽 out_ld
@@ -2915,19 +2919,26 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
 
     // 每 lane 每次读 4 个候选 (float4)，提高在途访存量——一个 bucket 只有
     // bucket_size 个 block，占用率天然不高，标量读时这个 kernel 是延迟瓶颈。
-    const float* row = dots + static_cast<int64_t>(q) * ldd;
+    const DotT* row = dots + static_cast<int64_t>(q) * ldd;
     for (int jb = warp * LANES * 4; jb < pool_size; jb += G * LANES * 4) {
         int j0 = jb + lane * 4;
         float dd[4];
         if (j0 + 3 < pool_size) {
-            float4 dv = *reinterpret_cast<const float4*>(row + j0);
+            float4 dv;
+            if constexpr (std::is_same<DotT, float>::value) {
+                dv = *reinterpret_cast<const float4*>(row + j0);
+            } else {
+                int4 iv = *reinterpret_cast<const int4*>(row + j0);
+                dv = make_float4(static_cast<float>(iv.x), static_cast<float>(iv.y),
+                                 static_cast<float>(iv.z), static_cast<float>(iv.w));
+            }
             float4 nv = *reinterpret_cast<const float4*>(norms_pool + j0);
             dd[0] = nv.x - 2.0f * dv.x; dd[1] = nv.y - 2.0f * dv.y;
             dd[2] = nv.z - 2.0f * dv.z; dd[3] = nv.w - 2.0f * dv.w;
         } else {
             #pragma unroll
             for (int e = 0; e < 4; ++e)
-                dd[e] = (j0 + e < pool_size) ? norms_pool[j0 + e] - 2.0f * row[j0 + e] : INFINITY;
+                dd[e] = (j0 + e < pool_size) ? norms_pool[j0 + e] - 2.0f * static_cast<float>(row[j0 + e]) : INFINITY;
         }
         #pragma unroll
         for (int e = 0; e < 4; ++e) {
@@ -2997,7 +3008,7 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
     }
     if (warp != 0) return;
 
-    const int64_t out_row = static_cast<int64_t>(ids_pool[q]) * out_ld;
+    const int64_t out_row = static_cast<int64_t>(kRowByQuery ? q : ids_pool[q]) * out_ld;
     const float q_norm = norms_pool[q];
     int base = lane * K_PER_LANE;
     #pragma unroll
@@ -3028,6 +3039,28 @@ static inline void launch_block_topM_resident(
         throw std::runtime_error("GPU-resident path supports neighbors-m <= 256 (got "
                                  + std::to_string(actual_M) + "); use --out-of-core");
 #undef LAUNCH_BLOCK_KOUT
+}
+
+// out-of-core 路径用的同一个 block top-M kernel：输出按 bucket 内行号 q 写 (行宽
+// out_ld)，邻居 id 取 ids_pool (global id)，距离是真实 L2²——跟原来
+// dots_to_dist + raft select_k + gather (3 个 kernel) 的输出一致。返回 false
+// 表示 actual_M > 256 (shared memory 不够)，调用方回退到 raft select_k。
+template <typename DotT>
+static inline bool launch_block_topM_bucket(
+    cudaStream_t stream, const DotT* d_dots, const float* d_norms_pool, const int32_t* d_ids_pool,
+    int32_t* d_out_neighbors, float* d_out_dists,
+    int bucket_size, int pool_size, int ldd, int actual_M, int out_ld)
+{
+    constexpr int G = 8;
+#define LAUNCH_BUCKET_KOUT(KV) block_topK_from_dots_kernel<(KV), G, DotT, true><<<bucket_size, G * 32, 0, stream>>>( \
+        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld)
+    if      (actual_M <= 32)  LAUNCH_BUCKET_KOUT(32);
+    else if (actual_M <= 64)  LAUNCH_BUCKET_KOUT(64);
+    else if (actual_M <= 128) LAUNCH_BUCKET_KOUT(128);
+    else if (actual_M <= 256) LAUNCH_BUCKET_KOUT(256);
+    else return false;
+#undef LAUNCH_BUCKET_KOUT
+    return true;
 }
 
 // ============== GPU-resident fast path (数据集 + running KNN 都放得进显存时) ==============
@@ -4112,13 +4145,16 @@ void build_vector_knn_with_tensorcore(
 {
     auto func_t0 = std::chrono::high_resolution_clock::now();
     constexpr bool want_distances = true;  // 合并去重总是需要距离
-    // ============= Stage 2 路径选择（INT8 IMMA / fp32 fallback）=============
-    // - int8/uint8 → 走 INT8 IMMA Tensor Core（uint8 入口先减 128 转 int8）
+    // ============= Stage 2 路径选择（fp16 Tensor Core / fp32 fallback）=============
+    // - int8/uint8 → fp16 Tensor Core GEMM (fp32 累加)，跟 GPU-resident 路径一样:
+    //   |v| ≤ 255 在 fp16 里精确，D=128 点积 ≤ 8.3M < 2^24 → 距离精确。原来走
+    //   INT8 IMMA (uint8 先减 128)，但 V100 (sm_70) 没有 INT8 Tensor Core，
+    //   INT8 GemmEx 落到 dp4a，比 fp16 Tensor Core 慢一倍。
     // - 其它 (float/half/uint32/int32 等) → 走 fp32 cuBLAS GEMM（原行为）
     constexpr bool kIsInt8Path =
         std::is_same<DataT, int8_t>::value || std::is_same<DataT, uint8_t>::value;
-    using GemmInT  = typename std::conditional<kIsInt8Path, int8_t, float>::type;
-    using GemmOutT = typename std::conditional<kIsInt8Path, int32_t, float>::type;
+    using GemmInT  = typename std::conditional<kIsInt8Path, __half, float>::type;
+    using GemmOutT = float;
 
     std::cout << "[VectorKNN] Building per-vector KNN with Tensor Core matmul\n"
               << "  N=" << N << ", D=" << D
@@ -4267,7 +4303,8 @@ void build_vector_knn_with_tensorcore(
     // CPU memcpy + H2D 传输 + gather/shift kernel。
     size_t bytes_B_raw        = max_pool_size_ub * D * sizeof(DataT);
     size_t bytes_B            = max_pool_size_ub * D * sizeof(GemmInT);
-    size_t bytes_dots         = max_bucket_size * max_pool_size_ub * sizeof(GemmOutT);
+    // dots 行宽对齐到 4 (block top-M kernel 按 16 B 向量读)
+    size_t bytes_dots         = max_bucket_size * ((max_pool_size_ub + 3) / 4 * 4) * sizeof(GemmOutT);
     size_t bytes_norms_pool   = max_pool_size_ub * sizeof(float);
     size_t bytes_ids_bucket   = max_bucket_size * sizeof(int32_t);
     size_t bytes_ids_pool     = max_pool_size_ub * sizeof(int32_t);
@@ -4445,25 +4482,88 @@ void build_vector_knn_with_tensorcore(
         size_t dest_ofs;
     };
 
+    // scatter (逐点铺成 M 宽 + acc.add 进 chunk 写缓冲) 交给一个 consumer 线程，
+    // 不再串在主线程的 sync → scatter → submit 之间 (~0.7–1.0 s/轮)。主线程只把
+    // 这个 slot 的结果 (gid + bucket_size×actual_M 的邻居/距离, ~50 KB) 拷进一个
+    // 复用的 job buffer 再入队，然后就可以覆写 h_ids_bucket/h_out[slot] 提交下一
+    // 个 bucket。只有 scatter 线程调用 acc.add，按入队顺序处理 (跟原来的顺序一致)。
+    struct ScatterJob {
+        int bs = 0, aM = 0;
+        std::vector<int32_t> gid, nb;
+        std::vector<float>   d;
+    };
+    std::deque<std::unique_ptr<ScatterJob>> scatter_queue, scatter_free;
+    std::mutex scatter_mtx;
+    std::condition_variable scatter_cv;
+    bool scatter_done = false;            // guarded by scatter_mtx
+    std::exception_ptr scatter_exc;
+    double t_scatter_worker = 0;
+    std::thread scatter_thread([&]() {
+        try {
+            for (;;) {
+                std::unique_ptr<ScatterJob> job;
+                {
+                    std::unique_lock<std::mutex> lk(scatter_mtx);
+                    scatter_cv.wait(lk, [&] { return !scatter_queue.empty() || scatter_done; });
+                    if (scatter_queue.empty()) return;   // done 且已排空
+                    job = std::move(scatter_queue.front());
+                    scatter_queue.pop_front();
+                }
+                auto ts0 = std::chrono::high_resolution_clock::now();
+                for (int i = 0; i < job->bs; ++i) {
+                    std::fill(scatter_new_n.begin(), scatter_new_n.end(), -1);
+                    std::fill(scatter_new_d.begin(), scatter_new_d.end(),
+                              std::numeric_limits<float>::infinity());
+                    for (int m = 0; m < job->aM && m < M; ++m) {
+                        scatter_new_n[m] = job->nb[static_cast<size_t>(i) * job->aM + m];
+                        scatter_new_d[m] = job->d [static_cast<size_t>(i) * job->aM + m];
+                    }
+                    acc.add(job->gid[static_cast<size_t>(i)], scatter_new_n.data(), scatter_new_d.data());
+                }
+                t_scatter_worker += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - ts0).count();
+                {
+                    std::lock_guard<std::mutex> lk(scatter_mtx);
+                    scatter_free.push_back(std::move(job));
+                }
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lk(scatter_mtx);
+            scatter_exc = std::current_exception();
+            scatter_queue.clear();
+        }
+    });
+    struct ScatterJoin {
+        std::thread& t; std::mutex& m; std::condition_variable& cv; bool& done;
+        ~ScatterJoin() {
+            { std::lock_guard<std::mutex> lk(m); done = true; }
+            cv.notify_all();
+            if (t.joinable()) t.join();
+        }
+    } scatter_join{scatter_thread, scatter_mtx, scatter_cv, scatter_done};
+
     auto scatter_pending = [&](int slot) {
         if (pending[slot].c < 0) return;
         // h_ids_bucket[slot] 这时候还是"上一次派到这个 slot 的那个 bucket"的
-        // gid 数组 (本次循环要到下面 3b 才会覆写它)，直接用，不用额外记录。
-        int bs = pending[slot].bucket_size;
-        int aM = pending[slot].actual_M;
-        const int32_t* hp = h_out[slot];
-        const float*   hd = h_out_dists[slot];  // 始终已分配 (want_distances 内部恒为 true)
-        for (int i = 0; i < bs; ++i) {
-            int32_t gid = h_ids_bucket[slot][i];
-            std::fill(scatter_new_n.begin(), scatter_new_n.end(), -1);
-            std::fill(scatter_new_d.begin(), scatter_new_d.end(),
-                     std::numeric_limits<float>::infinity());
-            for (int m = 0; m < aM && m < M; ++m) {
-                scatter_new_n[m] = hp[static_cast<size_t>(i) * aM + m];
-                scatter_new_d[m] = hd[static_cast<size_t>(i) * aM + m];
-            }
-            acc.add(gid, scatter_new_n.data(), scatter_new_d.data());
+        // gid 数组 (本次循环要到下面 3b 才会覆写它)，拷一份给 scatter 线程。
+        const int bs = pending[slot].bucket_size;
+        const int aM = pending[slot].actual_M;
+        std::unique_ptr<ScatterJob> job;
+        {
+            std::lock_guard<std::mutex> lk(scatter_mtx);
+            if (scatter_exc) std::rethrow_exception(scatter_exc);
+            if (!scatter_free.empty()) { job = std::move(scatter_free.back()); scatter_free.pop_back(); }
         }
+        if (!job) job = std::make_unique<ScatterJob>();
+        const size_t n_out = static_cast<size_t>(bs) * aM;
+        job->bs = bs; job->aM = aM;
+        job->gid.assign(h_ids_bucket[slot], h_ids_bucket[slot] + bs);
+        job->nb.assign(h_out[slot], h_out[slot] + n_out);
+        job->d.assign(h_out_dists[slot], h_out_dists[slot] + n_out);   // 始终已分配 (want_distances 恒为 true)
+        {
+            std::lock_guard<std::mutex> lk(scatter_mtx);
+            scatter_queue.push_back(std::move(job));
+        }
+        scatter_cv.notify_one();
         pending[slot].c = -1;
     };
 
@@ -4697,14 +4797,9 @@ void build_vector_knn_with_tensorcore(
             int64_t blocks_B = (total_B + threads - 1) / threads;
 
             if constexpr (kIsInt8Path) {
-                gather_rows_raw<DataT><<<blocks_B, threads, 0, streams[slot]>>>(
-                    d_B_raw[slot], d_identity_idx,
-                    reinterpret_cast<DataT*>(d_B[slot]), pool_size, D);
-                // uint8 → int8 in-place 平移 (仅 uint8 路径；int8 数据本来就对)
-                if constexpr (std::is_same<DataT, uint8_t>::value) {
-                    shift_uint8_to_int8_inplace<<<blocks_B, threads, 0, streams[slot]>>>(
-                        reinterpret_cast<uint8_t*>(d_B[slot]), total_B);
-                }
+                // pool 已经按需要的行序拼好 (identity)，直接逐元素转 fp16
+                resident_convert_kernel<DataT, __half><<<blocks_B, threads, 0, streams[slot]>>>(
+                    d_B_raw[slot], reinterpret_cast<__half*>(d_B[slot]), total_B);
             } else {
                 gather_rows_int32<DataT><<<blocks_B, threads, 0, streams[slot]>>>(
                     d_B_raw[slot], d_identity_idx,
@@ -4720,14 +4815,18 @@ void build_vector_knn_with_tensorcore(
             CUDA_CHECK(cudaGetLastError());
         }
 
+        // dots 行宽: block top-M kernel (actual_M ≤ 256) 要 4 对齐; raft 回退路径按
+        // pool_size 紧凑排布
+        const int ldd_c = (actual_M <= 256) ? (pool_size + 3) / 4 * 4 : pool_size;
+
         // ---- 3e: cuBLAS GEMM 在 slot stream 上 (event 包夹做纯 GEMM 计时) ----
         cublasSetStream(cublas_handle, streams[slot]);
         CUDA_CHECK(cudaEventRecord(ev_gemm_start[slot], streams[slot]));
         {
             cublasStatus_t stat;
             if constexpr (kIsInt8Path) {
-                // INT8 IMMA: int8 in × int8 in → int32 out, Tensor Core
-                int alpha_i = 1, beta_i = 0;
+                // fp16 in × fp16 in → fp32 out (fp32 累加), Tensor Core
+                float alpha = 1.0f, beta = 0.0f;
                 // A 操作数直接传 d_B[slot] 本身: A 是 pool 的前 bucket_size
                 // 行，跟 B 是同一份已转型数据，lda=D 不变，cuBLAS 只读前
                 // bucket_size 行，不需要一份独立的 A buffer。
@@ -4735,16 +4834,16 @@ void build_vector_knn_with_tensorcore(
                     cublas_handle,
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     pool_size, bucket_size, D,
-                    &alpha_i,
-                    d_B[slot], CUDA_R_8I, D,
-                    d_B[slot], CUDA_R_8I, D,
-                    &beta_i,
-                    d_dots[slot], CUDA_R_32I, pool_size,
-                    CUBLAS_COMPUTE_32I,
+                    &alpha,
+                    d_B[slot], CUDA_R_16F, D,
+                    d_B[slot], CUDA_R_16F, D,
+                    &beta,
+                    d_dots[slot], CUDA_R_32F, ldd_c,
+                    CUBLAS_COMPUTE_32F,
                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
                 if (stat != CUBLAS_STATUS_SUCCESS)
                     throw std::runtime_error(
-                        "cublasGemmEx (INT8 IMMA) failed, status=" + std::to_string(stat));
+                        "cublasGemmEx (fp16 Tensor Core) failed, status=" + std::to_string(stat));
             } else {
                 float alpha = 1.0f, beta = 0.0f;
                 stat = cublasSgemm(
@@ -4755,7 +4854,7 @@ void build_vector_knn_with_tensorcore(
                     reinterpret_cast<const float*>(d_B[slot]), D,
                     reinterpret_cast<const float*>(d_B[slot]), D,
                     &beta,
-                    reinterpret_cast<float*>(d_dots[slot]), pool_size);
+                    reinterpret_cast<float*>(d_dots[slot]), ldd_c);
                 if (stat != CUBLAS_STATUS_SUCCESS)
                     throw std::runtime_error("cublasSgemm failed, status=" + std::to_string(stat));
             }
@@ -4772,6 +4871,13 @@ void build_vector_knn_with_tensorcore(
         #endif
         {
         #if USE_RAFT_SELECT_K
+            // actual_M ≤ 256: 单个 block top-M kernel (跟 GPU-resident 同一个，
+            // 输出按 bucket 内行号)，替代 dots_to_dist + raft select_k + gather
+            // 三个 kernel；更大的 M 回退到 raft select_k。
+            if (!launch_block_topM_bucket<GemmOutT>(
+                    streams[slot], d_dots[slot], d_norms_pool[slot], d_ids_pool[slot],
+                    d_out_neighbors[slot], d_out_dists[slot],
+                    bucket_size, pool_size, ldd_c, actual_M, /*out_ld=*/actual_M))
             // d_dots 被 dots_to_dist_inplace_kernel 原地改写为 float dist,
             // RAFT 输出落 d_select_idx/dist scratch, 最后 gather 到 d_out_neighbors
             launch_extract_topM_raft<GemmOutT>(
@@ -4822,6 +4928,18 @@ void build_vector_knn_with_tensorcore(
         CUDA_CHECK(cudaStreamSynchronize(streams[s]));
         consume_gemm_timing(s);
         scatter_pending(s);
+    }
+    // 等 scatter 线程把队列处理完 (acc 之后 finish_iteration_writes 才能安全用)
+    {
+        auto tj0 = std::chrono::high_resolution_clock::now();
+        { std::lock_guard<std::mutex> lk(scatter_mtx); scatter_done = true; }
+        scatter_cv.notify_all();
+        scatter_thread.join();
+        if (scatter_exc) std::rethrow_exception(scatter_exc);
+        std::cout << "  [VectorKNN] scatter worker: " << std::fixed << std::setprecision(3)
+                  << t_scatter_worker << "s (tail drain "
+                  << std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - tj0).count()
+                  << "s)\n";
     }
 
     auto loop_t1 = std::chrono::high_resolution_clock::now();

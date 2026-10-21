@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#27 (ITERATIONS 4 → 3, NPROBE 150 → 200)**, 2026-10-21:
+After **#30 (out-of-core Step 6 loop: scatter on a consumer thread + block top-M / fp16 GEMM)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **9.43** (0.82x CAGRA) | 0.9294 / 0.9773 / 0.9943 | 1937K / 1033K |
-| SIFT1M large (out-of-core path) | **24.17** | 0.9003 / 0.9638 / 0.9896 | 2219K / 1189K |
+| SIFT1M auto (GPU-resident) | **9.42** (0.82x CAGRA) | 0.9289 / 0.9775 / 0.9947 | 1947K / 1035K |
+| SIFT1M large (out-of-core path) | **22.80** (1.98x CAGRA) | 0.8997 / 0.9626 / 0.9887 | 2224K / 1190K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -859,6 +859,44 @@ First large run (`runs/iter21/sift1M_large`): 31.80 s (−3.3%, just over the 3%
 | ours sift1M_large | 0.9003 / 2219K | 0.9638 / 1189K | 0.9896 / 561K | 0.9977 / 189K | 0.9994 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-auto +10.8% (10.57 → 9.43 s, 0.82× CAGRA native), 1M-large +17.1% (29.15 → 24.17 s).
+
+### #30 — out-of-core Step 6 loop: scatter on a consumer thread + block top-M / fp16 GEMM  (2026-10-21)
+**Idea / rationale:** the out-of-core bucket loop (after #10/#11/#27) was split ~evenly between GPU wait (`stream_sync` ~1.25 s/round), host scatter (`scatter_pending` ~0.7 s: per point pad to M + `acc.add` into the chunk write buffers) and submit (~1.1 s). Two halves of the same loop, benchmarked together (each alone hid behind the other — #29 alone measured −1.6%):
+(1) **host:** scatter moves to a consumer thread — the main thread copies the slot's results (gid + bucket×actual_M ids/dists, ~50 KB) into a recycled job buffer and enqueues it, then immediately reuses `h_ids_bucket/h_out[slot]`; only the scatter thread calls `acc.add`, in enqueue order (same order as before); it is drained/joined before `finish_iteration_writes`, exceptions are rethrown, an RAII guard joins on unwind. main-thread scatter 0.7 → 0.16 s/round.
+(2) **GPU (= #29):** the resident `block_topK_from_dots_kernel` (templated on the dots type, output rows by bucket position) replaces dots_to_dist + raft `select_k` + gather (3 kernels; raft kept for M > 256), and the 8-bit GEMM uses fp16 tensor cores (exact, fp32 accumulation) instead of INT8 IMMA (dp4a on V100); dots ld padded to 4.
+Same structure as cuVS 26.12 `detail/cagra/cagra_build.cuh::build_knn_graph` (separate threads for host pre/post-processing around the batched GPU search). Loop 3.24 → ~2.9 s/round; KNN recall unchanged.
+**Files:** `src/bucket.cu`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 9.42 | +0.1% | +56.7% | 0.82x | bucket2 7.69, optimize 1.30, translate 0.44 | 3782 | 1.38 |
+| sift1M_large | large | 22.80 | +5.7% | +69.6% | 1.98x | bucket2 19.32, prune 1.40, optimize_chunked 1.65, translate 0.39 | 1386 | 3.86 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.76 | 1.08 | 0.12 | 0.00 | 0.68 | 0.65 | 0.02 | 3.34 | 0.00 | 0.48 |
+| sift1M_large | 0.57 | 2.20 | 0.16 | 0.00 | 3.82 | 1.40 | 0.03 | 9.51 | 0.92 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9737 | 0.9664 | 0.9600 | 0.9540 |
+| sift1M_large | 0.9746 | 0.9673 | 0.9592 | 0.9534 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9289 / 1947K | 0.9775 / 1035K | 0.9947 / 463K | 0.9988 / 188K | 0.9997 / 68K |
+| ours sift1M_large | 0.8997 / 2224K | 0.9626 / 1190K | 0.9887 / 562K | 0.9973 / 189K | 0.9993 / 66K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +5.7% (24.17 → 22.80 s, 1.98× CAGRA native), 1M-auto +0.1% (path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
