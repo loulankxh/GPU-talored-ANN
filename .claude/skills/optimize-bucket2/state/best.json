@@ -5,44 +5,44 @@
    "mode": "auto",
    "path": "resident",
    "reps": 3,
-   "build_total_s": 9.26,
+   "build_total_s": 9.22,
    "build_total_all_s": [
-    9.26,
-    9.24,
-    9.32
+    9.25,
+    9.2,
+    9.22
    ],
    "stages_s": {
-    "bucket2": 7.57,
+    "bucket2": 7.48,
     "optimize": 1.3,
-    "translate": 0.45
+    "translate": 0.46
    },
    "bucket2_steps_s": {
-    "Step 1 (Load sampled data)": 0.757,
-    "Step 2 (Select centroids)": 1.106,
-    "Step 3 (Centroid KNN graph)": 0.105,
+    "Step 1 (Load sampled data)": 0.755,
+    "Step 2 (Select centroids)": 1.141,
+    "Step 3 (Centroid KNN graph)": 0.106,
     "Step 3.5 (Load full dataset)": 0.0,
-    "Step 4 (Batch assignment)": 0.736,
-    "Step 4.5 (Inline reorder, round 1 only)": 0.45,
-    "Step 5 (Write buckets)": 0.025,
-    "Step 6 (Per-vector KNN, merge included)": 3.358,
+    "Step 4 (Batch assignment)": 0.662,
+    "Step 4.5 (Inline reorder, round 1 only)": 0.445,
+    "Step 5 (Write buckets)": 0.022,
+    "Step 6 (Per-vector KNN, merge included)": 3.353,
     "Wait (final iteration's background merge)": 0.0,
-    "Write (close + .npy convert)": 0.478
+    "Write (close + .npy convert)": 0.484
    },
    "peak_rss_gb": {
     "bucket2": 1.38,
     "optimize": 0.729,
     "translate": 0.131
    },
-   "gpu_peak_mib": 4022,
+   "gpu_peak_mib": 3878,
    "knn_similarity": {
     "n": 1000000,
     "degree": 64,
     "samples": 10000,
     "padding_rate": 0.0,
-    "recall@1": 0.9754,
-    "recall@10": 0.96777,
-    "recall@32": 0.96023,
-    "recall@64": 0.95426
+    "recall@1": 0.9746,
+    "recall@10": 0.96785,
+    "recall@32": 0.96016,
+    "recall@64": 0.95406
    },
    "search": {
     "n": 1000000,
@@ -53,28 +53,28 @@
     "points": [
      {
       "itopk": 32,
-      "recall": 0.9278,
-      "qps": 2214347.5
+      "recall": 0.92861,
+      "qps": 1948281.3
      },
      {
       "itopk": 64,
-      "recall": 0.97754,
-      "qps": 1189382.9
+      "recall": 0.97781,
+      "qps": 1035352.4
      },
      {
       "itopk": 128,
-      "recall": 0.99478,
-      "qps": 562050.2
+      "recall": 0.9947,
+      "qps": 506912.5
      },
      {
       "itopk": 256,
-      "recall": 0.9988,
-      "qps": 189016.6
+      "recall": 0.99884,
+      "qps": 187735.7
      },
      {
       "itopk": 512,
       "recall": 0.99973,
-      "qps": 68194.7
+      "qps": 68167.0
      }
     ]
    }
@@ -84,46 +84,46 @@
    "mode": "large",
    "path": "large",
    "reps": 3,
-   "build_total_s": 12.67,
+   "build_total_s": 11.9,
    "build_total_all_s": [
-    12.66,
-    12.67,
-    12.85
+    11.55,
+    12.08,
+    11.9
    ],
    "stages_s": {
-    "bucket2": 10.8,
-    "prune": 0.84,
-    "optimize_chunked": 0.64,
-    "translate": 0.38
+    "bucket2": 10.03,
+    "prune": 0.85,
+    "optimize_chunked": 0.65,
+    "translate": 0.41
    },
    "bucket2_steps_s": {
-    "Step 1 (Load sampled data)": 0.572,
-    "Step 2 (Select centroids)": 1.468,
-    "Step 3 (Centroid KNN graph)": 0.146,
+    "Step 1 (Load sampled data)": 0.69,
+    "Step 2 (Select centroids)": 1.482,
+    "Step 3 (Centroid KNN graph)": 0.142,
     "Step 3.5 (Load full dataset)": 0.0,
-    "Step 4 (Batch assignment)": 2.222,
-    "Step 4.5 (Inline reorder, round 1 only)": 0.444,
-    "Step 5 (Write buckets)": 0.025,
-    "Step 6 (Per-vector KNN, merge included)": 4.782,
-    "Wait (final iteration's background merge)": 0.44,
+    "Step 4 (Batch assignment)": 1.038,
+    "Step 4.5 (Inline reorder, round 1 only)": 0.419,
+    "Step 5 (Write buckets)": 0.047,
+    "Step 6 (Per-vector KNN, merge included)": 4.941,
+    "Wait (final iteration's background merge)": 0.42,
     "Write (close + .npy convert)": 0.0
    },
    "peak_rss_gb": {
-    "bucket2": 2.781,
-    "prune": 1.066,
+    "bucket2": 2.741,
+    "prune": 1.067,
     "optimize_chunked": 0.357,
     "translate": 0.131
    },
-   "gpu_peak_mib": 1674,
+   "gpu_peak_mib": 2052,
    "knn_similarity": {
     "n": 1000000,
     "degree": 64,
     "samples": 10000,
     "padding_rate": 0.0,
-    "recall@1": 0.9731,
-    "recall@10": 0.96617,
-    "recall@32": 0.95867,
-    "recall@64": 0.95256
+    "recall@1": 0.9755,
+    "recall@10": 0.96645,
+    "recall@32": 0.95952,
+    "recall@64": 0.95363
    },
    "search": {
     "n": 1000000,
@@ -134,36 +134,36 @@
     "points": [
      {
       "itopk": 32,
-      "recall": 0.91445,
-      "qps": 2218668.2
+      "recall": 0.91497,
+      "qps": 1947773.3
      },
      {
       "itopk": 64,
-      "recall": 0.97081,
-      "qps": 1188865.4
+      "recall": 0.97108,
+      "qps": 1034996.2
      },
      {
       "itopk": 128,
-      "recall": 0.99196,
-      "qps": 561223.8
+      "recall": 0.99219,
+      "qps": 532738.7
      },
      {
       "itopk": 256,
-      "recall": 0.99819,
-      "qps": 188891.3
+      "recall": 0.99821,
+      "qps": 179425.3
      },
      {
       "itopk": 512,
-      "recall": 0.99948,
-      "qps": 68145.1
+      "recall": 0.99952,
+      "qps": 68209.9
      }
     ]
    }
   }
  },
  "dirs": {
-  "sift1M_auto": "/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/iter41/sift1M_auto",
-  "sift1M_large": "/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/iter41/sift1M_large"
+  "sift1M_auto": "/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/iter42b/sift1M_auto",
+  "sift1M_large": "/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/iter42b/sift1M_large"
  },
  "initial_large_recall": {
   "sift1M_large": {

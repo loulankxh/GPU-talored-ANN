@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#41 (out-of-core 4 slots + fused ids/dists D2H)**, 2026-10-21:
+After **#42 (out-of-core raw dataset kept in host memory + parallel bucket write)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **9.26** (0.80x CAGRA) | 0.9278 / 0.9775 / 0.9948 | 2214K / 1189K |
-| SIFT1M large (out-of-core path) | **12.67** (1.10x CAGRA) | 0.9144 / 0.9708 / 0.9920 | 2219K / 1189K |
+| SIFT1M auto (GPU-resident) | **9.22** (0.80x CAGRA) | 0.9286 / 0.9778 / 0.9947 | 1948K / 1035K |
+| SIFT1M large (out-of-core path) | **11.90** (1.03x CAGRA) | 0.9150 / 0.9711 / 0.9922 | 1948K / 1035K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -80,7 +80,7 @@ Other:
 | # | idea | result | reason |
 |---|---|---|---|
 | 40 | Out-of-core Step 6 slots: OVERSUB 1.5 → 2.0 (3 → 4 slots on SIFT1M). Sweep: 3 slots 1.59 s/round, 4: 1.43, 6: 1.38 (+0.8 GB GPU). Patch: `bucketDemo/patches/iter40_ooc_4slots.patch` | large 12.87 s (+2.9%), GPU peak 1674–2052 MiB | just under 3%; bundled into accepted #41 |
-| 37 | Out-of-core Step 4 bucket write (in-memory mode from #36): deterministic multi-threaded `add_range_parallel` (per-thread per-bucket counts → prefix → parallel copy; same in-bucket order) + byte-array centroid test instead of `unordered_set`. Patch: `bucketDemo/patches/iter37_parallel_bucket_write.patch` | write part 0.13 → 0.03–0.06 s, but bucket_write total only 0.35 → 0.29 s/round (input read 0.14 s + sampled centroid read 0.07–0.1 s dominate); KNN recall unchanged | < 1% of the large path — not benchmarked |
+| 37 | Out-of-core Step 4 bucket write (in-memory mode from #36): deterministic multi-threaded `add_range_parallel` (per-thread per-bucket counts → prefix → parallel copy; same in-bucket order) + byte-array centroid test instead of `unordered_set`. Patch: `bucketDemo/patches/iter37_parallel_bucket_write.patch` | write part 0.13 → 0.03–0.06 s, but bucket_write total only 0.35 → 0.29 s/round (input read 0.14 s + sampled centroid read 0.07–0.1 s dominate); KNN recall unchanged | < 1% of the large path — not benchmarked; bundled into accepted #42 |
 | 31 | Out-of-core Step 4.5 inline reorder in memory when 2·N·D B ≤ cpu_limit/4 (read whole input, permute by inverse_perm in parallel, one sequential write — like the resident path; streaming per-bucket writer kept otherwise; output verified == base[inverse_perm]). Patch: `bucketDemo/patches/iter31_ooc_inmemory_reorder.patch` | pass3_write 1.03 → 0.385 s; large 22.09 s (+3.1%) then rerun 22.14 s (+2.9%) | borderline gain not confirmed (rerun just under 3%). Consistent ~0.65 s saving — bundle with the next large-path change |
 | 29 | Out-of-core Step 6 GPU path = resident's: block top-M kernel (templated on dots type, rows by bucket position, ld padded to 4) instead of dots_to_dist + raft select_k + gather (raft kept for M > 256), and fp16 tensor-core GEMM instead of INT8 IMMA (dp4a on V100). Patch: `bucketDemo/patches/iter29_ooc_block_topm_fp16.patch` | loop 3.24 → ~3.0–3.2 s/round (gpu_submit 1.1 → 0.95 s, stream_sync 1.25 → 1.1 s; GEMM time unchanged ~0.62 s/round); large 24.55 s (−1.6%), auto −0.2% | no gain: the out-of-core loop is now split ~evenly between GPU wait, host scatter (`scatter_pending` ~0.7–1.0 s) and launch/H2D submit (~1 s), none dominant |
 | 25 | Resident Step 6 `block_topK_from_dots_kernel`: replace warp 0's serial ballot-insert of the other (G−1)·K_OUT candidates by a shared-memory merge-path tree (G → … → 1, each pair merged by one warp with co-rank binary search; same top-K set, ties A-first). G=8 still best (16: 0.98 s, 4: 0.87 s/loop). Patch: `bucketDemo/patches/iter25_topm_tree_merge.patch` | resident loop 0.95 → 0.86 s/round; auto 10.93 s (+2.3%); large 30.98 s (−7.2%, path does not use this kernel — disk-writeback noise) | < 3% gain. Bundle with another Step 6 change. **Measurement note:** large-path totals swing ±2–3 s (up to ~10%) run to run from disk writeback (page cache can't be dropped without sudo), so the 3% "no config slower" rule rejects unrelated changes at random |
@@ -1185,6 +1185,43 @@ Borderline → large rerun (`runs/iter38/sift1M_large_b`): 13.98 s (+5.6%), reca
 | ours sift1M_large | 0.9144 / 2219K | 0.9708 / 1189K | 0.9920 / 561K | 0.9982 / 189K | 0.9995 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +4.4% (13.26 → 12.67 s, 1.10× CAGRA native; rerun +4.2%), 1M-auto −0.3% (noise, path untouched).
+
+### #42 — out-of-core: raw dataset kept in host memory + parallel bucket write  (2026-10-21, commit TBD)
+**Idea / rationale:** when 2·N·D B fits `cpu_limit/4` (the same rule as the in-memory Step 4.5 reorder), the out-of-core path reads the raw u8 dataset once in Step 1. Round 1's reorder permutes that copy instead of re-reading the file, and keeps the reordered copy as the new-coordinate dataset. Step 4 assignment (`batch_assign_with_cagra_anns`, new `host_raw` argument) and round 2..t bucket writes (`write_bucket_vectors_from_assignments`, centroids + chunks) take pointers into it instead of reading the disk 2–3 times per round. The copy is freed after the last round's bucket write; datasets over the budget (SIFT10M+) keep the per-range disk reads. Bundled with the #37 patch: deterministic multi-threaded `add_range_parallel` (in-memory mode, same in-bucket order) + byte-array centroid test. This follows the IVF-PQ build in cuVS 26.12 (`ivf_pq_build.cuh::extend`, `cagra_build.cuh::build_knn_graph`), which streams the host dataset from memory, not from files. Alone (run `iter42`) the change gave large 12.30 s (+2.9%, Step 4 2.22 → 1.55 s), with the bucket write's single-threaded copy left as the remaining cost.
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+**Per-round bucket write (large):** 0.40 s (centroid read 0.13 + read 0.125 + write 0.136) → 0.04–0.09 s.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 9.22 | +0.4% | +57.6% | 0.80x | bucket2 7.48, optimize 1.30, translate 0.46 | 3878 | 1.38 |
+| sift1M_large | large | 11.90 | +6.1% | +84.2% | 1.03x | bucket2 10.03, prune 0.85, optimize_chunked 0.65, translate 0.41 | 2052 | 2.74 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.76 | 1.14 | 0.11 | 0.00 | 0.66 | 0.45 | 0.02 | 3.35 | 0.00 | 0.48 |
+| sift1M_large | 0.69 | 1.48 | 0.14 | 0.00 | 1.04 | 0.42 | 0.05 | 4.94 | 0.42 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9746 | 0.9678 | 0.9602 | 0.9541 |
+| sift1M_large | 0.9755 | 0.9665 | 0.9595 | 0.9536 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9286 / 1948K | 0.9778 / 1035K | 0.9947 / 507K | 0.9988 / 188K | 0.9997 / 68K |
+| ours sift1M_large | 0.9150 / 1948K | 0.9711 / 1035K | 0.9922 / 533K | 0.9982 / 179K | 0.9995 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +6.1% (12.67 → 11.90 s, 1.03× CAGRA native), 1M-auto +0.4% (path untouched). Large GPU peak 2052 MiB in one rep (the known bucket-size outlier, #9), within the gate.
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

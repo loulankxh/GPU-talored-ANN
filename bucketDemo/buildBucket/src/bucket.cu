@@ -1010,6 +1010,60 @@ struct BucketVectorAccumulator {
 
     int64_t count(int64_t c) const { return bufs[static_cast<size_t>(c)].total_count; }
 
+    // 内存模式下批量写一段连续 gid [lo, lo+n) (跳过 is_centroid 的点)，多线程且
+    // 结果跟逐条 add() 完全一样：每个线程管一段连续 gid，先按桶计数，再按
+    // (桶, 线程) 前缀和定出每段的起始位置 → 桶内顺序仍是 gid 递增。
+    void add_range_parallel(int64_t lo, int64_t n, const DataT* data,
+                            const std::vector<int64_t>& assignments, const std::vector<char>& is_centroid) {
+        if (!in_memory) throw std::runtime_error("add_range_parallel: only in memory mode");
+        const size_t rec_bytes = record_bytes(D);
+        const int T = std::max(1, std::min<int>(omp_get_max_threads(), static_cast<int>((n + 4095) / 4096)));
+        const int64_t per = (n + T - 1) / T;
+        std::vector<int64_t> cnt(static_cast<size_t>(T) * n_centroids, 0);
+        int64_t n_bad = 0;
+        #pragma omp parallel for num_threads(T) schedule(static) reduction(+:n_bad)
+        for (int t = 0; t < T; ++t) {
+            int64_t* ct = cnt.data() + static_cast<size_t>(t) * n_centroids;
+            const int64_t a = lo + t * per, b = std::min(lo + n, a + per);
+            for (int64_t gi = a; gi < b; ++gi) {
+                if (is_centroid[static_cast<size_t>(gi)]) continue;
+                int64_t c = assignments[static_cast<size_t>(gi)];
+                if (c < 0 || c >= n_centroids) { ++n_bad; continue; }   // bounds check
+                ++ct[c];
+            }
+        }
+        if (n_bad > 0) throw std::runtime_error("add_range_parallel: invalid bucket id in assignments");
+        // 每个 (线程, 桶) 段的起始字节偏移；桶的 write_cursor / added_so_far 一次推进
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            auto& bk = bufs[static_cast<size_t>(c)];
+            int64_t cur = bk.write_cursor, add = 0;
+            for (int t = 0; t < T; ++t) {
+                int64_t k = cnt[static_cast<size_t>(t) * n_centroids + c];
+                cnt[static_cast<size_t>(t) * n_centroids + c] = cur;
+                cur += k * static_cast<int64_t>(rec_bytes);
+                add += k;
+            }
+            if (bk.added_so_far + add > bk.total_count)
+                throw std::runtime_error("add_range_parallel: exceeded histogram count for bucket " + std::to_string(c));
+            bk.write_cursor = cur;
+            bk.added_so_far += add;
+        }
+        #pragma omp parallel for num_threads(T) schedule(static)
+        for (int t = 0; t < T; ++t) {
+            int64_t* off = cnt.data() + static_cast<size_t>(t) * n_centroids;
+            const int64_t a = lo + t * per, b = std::min(lo + n, a + per);
+            for (int64_t gi = a; gi < b; ++gi) {
+                if (is_centroid[static_cast<size_t>(gi)]) continue;
+                int64_t c = assignments[static_cast<size_t>(gi)];
+                char* dst = mem.get() + off[c];
+                std::memcpy(dst, &gi, sizeof(int64_t));
+                std::memcpy(dst + sizeof(int64_t), data + static_cast<size_t>(gi - lo) * D,
+                            static_cast<size_t>(D) * sizeof(DataT));
+                off[c] += static_cast<int64_t>(rec_bytes);
+            }
+        }
+    }
+
     // 桶 c 的 cnt 条记录的起始地址: 内存模式直接指向合并缓冲区，否则读进 raw
     const char* bucket_bytes(int64_t c, int64_t cnt, std::vector<char>& raw) {
         const size_t nbytes = static_cast<size_t>(cnt) * record_bytes(D);
@@ -1195,7 +1249,10 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     int search_max_iters = 64,
     // 非空时 (GPU-resident 路径，仅非 PQ 模式)：直接从显存常驻数据集把这批
     // 点 gather 进 d_queries，不再读盘 + CPU 转型 + H2D。
-    const std::function<void(const int64_t* idx, int64_t n, CentroidT* d_out)>& gpu_query_loader = {})
+    const std::function<void(const int64_t* idx, int64_t n, CentroidT* d_out)>& gpu_query_loader = {},
+    // 非空时 (out-of-core 路径、原始数据集整份放得进 CPU 预算)：(N, D) 原始数据
+    // 已在 host 内存里 (当前坐标系)，直接按区间取指针，不再读盘。
+    const T* host_raw = nullptr)
 {
     constexpr bool is_pq = std::is_same<CentroidT, uint8_t>::value;
 
@@ -1374,12 +1431,18 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         int64_t batch_lo = non_centroid_indices[batch_start];
         int64_t batch_hi = non_centroid_indices[batch_end - 1];
         std::vector<T> raw_batch;
+        const T* raw_ptr = nullptr;
         if (!is_pq && gpu_query_loader) {
             gpu_query_loader(non_centroid_indices.data() + batch_start, batch_size, d_queries);
+        } else if (host_raw) {
+            if (batch_lo < 0 || batch_hi >= N || batch_lo > batch_hi)   // bounds check
+                throw std::runtime_error("batch_assign: host_raw range out of bounds");
+            raw_ptr = host_raw + static_cast<size_t>(batch_lo) * D;
         } else {
             int32_t N_tmp, D_tmp;
             load::read_bigann_raw_range<T>(input_path, batch_lo, batch_hi - batch_lo + 1,
                                             raw_batch, N_tmp, D_tmp);
+            raw_ptr = raw_batch.data();
         }
         auto tb1 = Clock::now();
         t_read += std::chrono::duration<double>(tb1 - tb0).count();
@@ -1392,7 +1455,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 int64_t gi = non_centroid_indices[batch_start + i];
                 int64_t local = gi - batch_lo;
                 for (int64_t d = 0; d < D; ++d) {
-                    batch_f32[i * D + d] = static_cast<float>(raw_batch[local * D + d]);
+                    batch_f32[i * D + d] = static_cast<float>(raw_ptr[local * D + d]);
                 }
             }
 
@@ -1420,7 +1483,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 h_local_rows[static_cast<size_t>(i)] = static_cast<int32_t>(local);
             }
             if (n_bad > 0) throw std::runtime_error("batch_assign: row offset out of read range");
-            CUDA_CHECK(cudaMemcpy(d_raw_range, raw_batch.data(), raw_elems * sizeof(T),
+            CUDA_CHECK(cudaMemcpy(d_raw_range, raw_ptr, raw_elems * sizeof(T),
                                   cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(d_local_rows, h_local_rows.data(), batch_size * sizeof(int32_t),
                                   cudaMemcpyHostToDevice));
@@ -1438,7 +1501,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 int64_t gi = non_centroid_indices[batch_start + i];
                 int64_t local = gi - batch_lo;
                 for (int64_t d = 0; d < D; ++d) {
-                    batch_data[i * D + d] = static_cast<CentroidT>(raw_batch[local * D + d]);
+                    batch_data[i * D + d] = static_cast<CentroidT>(raw_ptr[local * D + d]);
                 }
             }
 
@@ -1643,7 +1706,9 @@ void write_bucket_vectors_from_assignments(
     const std::vector<int64_t>& centroid_global_indices,
     const std::vector<int64_t>& assignments,
     BucketVectorAccumulator<DataT>& bucket_vecs,
-    int64_t chunk_bytes_budget = 512LL * 1024 * 1024)
+    int64_t chunk_bytes_budget = 512LL * 1024 * 1024,
+    // 非空时：(N, D) 原始数据已在 host 内存 (当前坐标系)，不再读盘
+    const DataT* host_raw = nullptr)
 {
     using Clock = std::chrono::high_resolution_clock;
     auto t0 = Clock::now();
@@ -1659,7 +1724,14 @@ void write_bucket_vectors_from_assignments(
 
     // ---- centroid 自己的向量: n_centroids 条，一次性小读 ----
     auto t_pre0 = Clock::now();
-    {
+    if (host_raw) {
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            const int64_t gi = centroid_global_indices[c];
+            if (gi < 0 || gi >= N)   // bounds check
+                throw std::runtime_error("write_bucket_vectors: centroid id out of range");
+            bucket_vecs.add(c, gi, host_raw + static_cast<size_t>(gi) * D);
+        }
+    } else {
         std::vector<DataT> centroid_vecs_raw;
         int32_t N_tmp, D_tmp;
         load::read_bigann_raw_sampled<DataT>(input_path, centroid_global_indices,
@@ -1679,20 +1751,39 @@ void write_bucket_vectors_from_assignments(
         1, chunk_bytes_budget / std::max<int64_t>(1, D * static_cast<int64_t>(sizeof(DataT))));
 
     double t_read = 0, t_write = 0;
+    std::vector<char> is_centroid;   // 内存模式下代替 centroid_set 的逐点哈希查找
     for (int64_t lo = 0; lo < N; lo += chunk_points) {
         int64_t hi = std::min(lo + chunk_points, N) - 1;
 
         auto tr0 = Clock::now();
         std::vector<DataT> raw_chunk;
-        int32_t N_tmp, D_tmp;
-        load::read_bigann_raw_range<DataT>(input_path, lo, hi - lo + 1, raw_chunk, N_tmp, D_tmp);
+        const DataT* chunk_ptr = nullptr;
+        if (host_raw) {
+            chunk_ptr = host_raw + static_cast<size_t>(lo) * D;
+        } else {
+            int32_t N_tmp, D_tmp;
+            load::read_bigann_raw_range<DataT>(input_path, lo, hi - lo + 1, raw_chunk, N_tmp, D_tmp);
+            chunk_ptr = raw_chunk.data();
+        }
         t_read += std::chrono::duration<double>(Clock::now() - tr0).count();
 
         auto tw0 = Clock::now();
-        for (int64_t gi = lo; gi <= hi; ++gi) {
-            if (centroid_set.find(gi) != centroid_set.end()) continue;  // 上面已经写过
-            bucket_vecs.add(assignments[static_cast<size_t>(gi)], gi,
-                             raw_chunk.data() + static_cast<size_t>(gi - lo) * D);
+        if (bucket_vecs.in_memory) {
+            if (is_centroid.empty()) {
+                is_centroid.assign(static_cast<size_t>(N), 0);
+                for (int64_t g : centroid_global_indices) {
+                    if (g < 0 || g >= N)   // bounds check
+                        throw std::runtime_error("write_bucket_vectors: centroid id out of range");
+                    is_centroid[static_cast<size_t>(g)] = 1;
+                }
+            }
+            bucket_vecs.add_range_parallel(lo, hi - lo + 1, chunk_ptr, assignments, is_centroid);
+        } else {
+            for (int64_t gi = lo; gi <= hi; ++gi) {
+                if (centroid_set.find(gi) != centroid_set.end()) continue;  // 上面已经写过
+                bucket_vecs.add(assignments[static_cast<size_t>(gi)], gi,
+                                 chunk_ptr + static_cast<size_t>(gi - lo) * D);
+            }
         }
         t_write += std::chrono::duration<double>(Clock::now() - tw0).count();
     }
@@ -5683,6 +5774,20 @@ int run_pipeline_impl(
                           << free_b / 1e9 << " GB -> out-of-core path\n";
             }
         }
+        // out-of-core 但原始数据 (两份: 本体 + round 1 重排时的新副本) 放得进
+        // CPU 预算的 1/4 时：整份原始数据集读进 host 内存一次 (round 1 重排后
+        // 换成新坐标系那份)，Step 4 的分配和 round 2..t 的 bucket 写入都直接
+        // 用它，不再每轮读盘 2~3 遍。超预算时 (SIFT10M 以上) 照旧按区间读盘。
+        const bool ooc_host_raw = !gres &&
+            static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= config.cpu_limit_bytes / 4;
+        if (ooc_host_raw) {
+            int32_t n_tmp = 0, d_tmp = 0;
+            load::read_bigann_raw_range<DataT>(input_path, 0, N, raw_host, n_tmp, d_tmp);
+            if (static_cast<int64_t>(raw_host.size()) != N * static_cast<int64_t>(D))
+                throw std::runtime_error("Step 1: host raw dataset size mismatch");
+            std::cout << "  [HostRaw] out-of-core dataset kept in host memory: "
+                      << raw_host.size() * sizeof(DataT) / 1e9 << " GB\n";
+        }
 
         elapsed_step1 = std::chrono::duration<double>(Clock::now() - t1).count();
         std::cout << "  Step 1 done [" << std::fixed << std::setprecision(3) << elapsed_step1 << "s]\n";
@@ -5952,7 +6057,8 @@ int run_pipeline_impl(
                 centroid_global_indices,
                 d_centroids_u8, u8_bytes,
                 d_graph, graph_bytes,
-                K, quantizer, Mbatch_bytes, search_max_iters);
+                K, quantizer, Mbatch_bytes, search_max_iters, {},
+                ooc_host_raw ? raw_host.data() : nullptr);
 
             CUDA_CHECK(cudaFree(d_centroids_u8));
         } else {
@@ -5968,7 +6074,8 @@ int run_pipeline_impl(
                 centroid_global_indices,
                 d_centroids_f32, centroid_gpu_bytes,
                 d_graph, graph_bytes,
-                K, quantizer, Mbatch_bytes, search_max_iters, loader);
+                K, quantizer, Mbatch_bytes, search_max_iters, loader,
+                ooc_host_raw ? raw_host.data() : nullptr);
 
             CUDA_CHECK(cudaFree(d_centroids_f32));
         }
@@ -5997,7 +6104,10 @@ int run_pipeline_impl(
         } else {
             write_bucket_vectors_from_assignments<DataT>(
                 working_input_path, N, D, n_centroids,
-                centroid_global_indices, assignments, *bucket_vecs_ptr);
+                centroid_global_indices, assignments, *bucket_vecs_ptr,
+                512LL * 1024 * 1024, ooc_host_raw ? raw_host.data() : nullptr);
+            // 最后一轮写完 bucket 之后 Step 6 只读 bucket_vecs，原始数据不再需要
+            if (ooc_host_raw && iter + 1 == iterations) raw_host = std::vector<DataT>();
         }
         double t4_bucket_write = std::chrono::duration<double>(Clock::now() - t4_bw0).count();
 
@@ -6132,8 +6242,12 @@ int run_pipeline_impl(
                 // 顺序写出 (SIFT1M 128 MB: 1.0 s → ~0.3 s)。超预算时走下面按桶缓冲
                 // 散写的流式 writer (内存只占 bucket_vec_buffer)。
                 std::vector<DataT> raw_all;
-                int32_t n_tmp = 0, d_tmp = 0;
-                load::read_bigann_raw_range<DataT>(working_input_path, 0, N, raw_all, n_tmp, d_tmp);
+                if (ooc_host_raw) {
+                    raw_all = std::move(raw_host);   // Step 1 已整份读入 (旧坐标系)
+                } else {
+                    int32_t n_tmp = 0, d_tmp = 0;
+                    load::read_bigann_raw_range<DataT>(working_input_path, 0, N, raw_all, n_tmp, d_tmp);
+                }
                 if (static_cast<int64_t>(raw_all.size()) != N * static_cast<int64_t>(D) ||
                     static_cast<int64_t>(reorder_info.inverse_perm.size()) != N)
                     throw std::runtime_error("Inline reorder: size mismatch in in-memory path");
@@ -6152,6 +6266,8 @@ int run_pipeline_impl(
                           static_cast<std::streamsize>(reordered.size() * sizeof(DataT)));
                 if (!out.good())
                     throw std::runtime_error("Inline reorder: failed writing " + data_reordered_path);
+                // 重排后的副本就是新坐标系下的原始数据集：round 2..t 继续用它
+                if (ooc_host_raw && iterations > 1) raw_host = std::move(reordered);
             } else {
                 auto writer = reordered_io::ReorderedDatasetWriter<DataT>::create(
                     data_reordered_path, D, n_centroids,
