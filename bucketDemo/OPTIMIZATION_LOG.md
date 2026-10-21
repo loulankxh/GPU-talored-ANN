@@ -1732,7 +1732,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +8.5% (95.94 → 87.75 s, **0.72× CAGRA native**), 1M-large +3.2% (10.12 → 9.80 s), 1M-auto −0.8% (noise; path untouched).
 
-### #66 — blob mode: skip Belady setup (#65) + gather kernels issued by the producer thread  (2026-10-21, commit TBD)
+### #66 — blob mode: skip Belady setup (#65) + gather kernels issued by the producer thread  (2026-10-21, commit 802da7d)
 **Idea / rationale:** in #64's blob mode (whole round of bucket data on the GPU), (1) #65 patch: neither Belady cache is used, so the future-access table (0.8 s/round on SIFT10M) and cache construction (0.5 s/round) are skipped (empty tables), and gather jobs are built straight from `blob_locate`, bypassing the device cache; (2) the producer thread, now nearly idle, also launches the gather kernel on the slot's stream right after writing the job table (+ `ev_h2d` record before it may rewrite the table). The main thread frees a slot only after enqueuing that bucket's GEMM / top-M / D2H, so stream order keeps the next gather from overwriting a pool still being read. The main thread is left with GEMM + top-M + D2H: out-of-core submit 6.1 → 4.7 s/round on SIFT10M; the loop is GPU-bound again (stream_sync 3.4–6.0 s). Non-blob paths unchanged.
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
