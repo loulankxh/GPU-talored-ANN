@@ -7,7 +7,7 @@
 #                prune_windowed + optimize_chunked -m E.            (default)
 #     -m large : force the large-dataset path end to end
 #                (bucket2 --out-of-core, prune_windowed, optimize_chunked -m E).
-#     -r REPS  : full build repetitions (median is reported). default 3 (sift10M: 1)
+#     -r REPS  : full build repetitions (median is reported). default 1
 #     -q       : skip quality eval (timing only)
 #     -k       : keep the big intermediate files (default: delete after eval)
 #
@@ -32,7 +32,7 @@ while getopts "d:m:r:o:qk" o; do
   esac
 done
 case $DS in
-  sift1M)  BASE=$ROOT/dataset/sift1M/base.1M.u8bin;   : "${REPS:=3}" ;;
+  sift1M)  BASE=$ROOT/dataset/sift1M/base.1M.u8bin;   : "${REPS:=1}" ;;
   sift10M) BASE=$ROOT/dataset/sift10M/base.10M.u8bin; : "${REPS:=1}" ;;
   *) echo "-d sift1M|sift10M required"; exit 1 ;;
 esac

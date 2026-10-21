@@ -75,8 +75,8 @@ Also:
 ```bash
 S=/home/lanlu/microBenchmark/.claude/skills/optimize-bucket2/scripts
 R=/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/iter<N>
-bash $S/run_pipeline.sh -d sift1M -m auto  -r 3 -o $R/sift1M_auto     # GPU-resident path: timing median of 3 + quality
-bash $S/run_pipeline.sh -d sift1M -m large -r 3 -o $R/sift1M_large    # large-dataset path (out-of-core + prune_windowed + optimize_chunked -m E): median of 3 + quality + memory
+bash $S/run_pipeline.sh -d sift1M -m auto  -r 1 -o $R/sift1M_auto     # GPU-resident path: timing + quality
+bash $S/run_pipeline.sh -d sift1M -m large -r 1 -o $R/sift1M_large    # large-dataset path (out-of-core + prune_windowed + optimize_chunked -m E): timing + quality + memory
 ```
 Run them with `run_in_background` and wait for the completion notification. Any non-zero exit / "FAILED" = reject (after checking it isn't an environment issue such as a busy GPU or full disk; `df -h /home/lanlu` must keep > 50 GB free).
 Quality measured per run: (a) `knn_similarity` — pre-prune degree-64 `vector_knn` vs exact KNN (recall@1/10/32/64 on 10K sampled points); (b) `search` — final translated degree-32 graph through the cuVS CAGRA searcher, **recall@10 and QPS** at itopk 32…512 (+ graph defect counts). Always keep both recall and QPS in the log.
