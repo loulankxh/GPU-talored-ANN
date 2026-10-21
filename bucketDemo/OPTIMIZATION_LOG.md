@@ -35,15 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#32 (out-of-core: in-memory inline reorder + ≥1 ChunkedKNN chunk per thread)**, 2026-10-21:
+After **#33 (out-of-core Step 6: GPU-side Belady bucket cache, pools gathered on the GPU)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **9.48** (0.82x CAGRA) | 0.9291 / 0.9773 / 0.9944 | 2168K / 1188K |
-| SIFT1M large (out-of-core path) | **21.11** (1.83x CAGRA) | 0.8984 / 0.9630 / 0.9888 | 1941K / 897K |
-| CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
-
-(auto 9.48 vs 9.42: path untouched, noise.)
+| SIFT1M auto (GPU-resident) | **9.35** (0.81x CAG0.9296 / 0.9778 / 0.9945) | 0.9296 / 0.9778 / 0.9945 | 1943K / 1034K |
+| SIFT1M large (out-of-core path) | **18.63** (1.61x CAG0.9296 / 0.9778 / 0.9945) | 0.8993 / 0.9627 / 0.9893 | 1938K / 1032K |
+| CAG0.9296 / 0.9778 / 0.9945 native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
 
@@ -935,6 +933,41 @@ Same structure as cuVS 26.12 `detail/cagra/cagra_build.cuh::build_knn_graph` (se
 | ours sift1M_large | 0.8984 / 1941K | 0.9630 / 897K | 0.9888 / 532K | 0.9973 / 189K | 0.9994 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +7.4% (22.80 → 21.11 s, 1.83× CAGRA native), 1M-auto −0.6% (path untouched).
+
+### #33 — out-of-core Step 6: GPU-side Belady bucket cache, pools gathered on the GPU  (2026-10-21, commit 9d1e26e)
+**Idea / rationale:** with the scatter (#30) and GPU work fixed, the out-of-core bucket loop was bound by the producer's host pool assembly: each bucket's pool (own bucket + nprobe=200 neighbour buckets ≈ 20K rows × 136 B ≈ 2.7 MB) was memcpy'd on the host and uploaded — ~27 GB of host copy + H2D per round, although consecutive buckets in DiskJoin order share most neighbours. Now (8-bit data, `--gpu-bucket-cache-mb`, default 2048, 0 = old path) a second `BeladyBucketCache<DevBucket>` with the same future-access lists keeps buckets on the GPU (int32 ids + raw u8 rows, one `cudaMallocAsync` block per bucket on a dedicated copy stream, loaded from the host cache on a miss). The producer only writes a per-slot job table (ids, vecs, count, dest) in the unchanged pool order (center first → identical results) and records a per-slot load event on the copy stream; the main thread makes the slot stream wait on it, uploads the job table and launches `devcache_gather_pool_kernel` (gather + u8→fp16 into `d_B`, ids into `d_ids_pool`); norms / GEMM / top-M / D2H unchanged. **Safety:** eviction is stream-ordered — `DevBucket` release waits until its last-using position has been submitted, makes the copy stream wait on that position's gather-done event (tagged ring of 1024 events; ring slots are synchronised before reuse, so a tag mismatch means "already complete"), then `cudaFreeAsync`. New opt-in `BeladyBucketCache::set_pin_current_position`: buckets already fetched at the current position are never evicted (they are in the current job table) — without it a tiny budget deadlocked (first 20 MB test timed out); host caches keep pure Belady. Pool-capacity bounds check kept. Like cuVS 26.12 `cagra_ace.cuh` keeping partitions device-resident across neighbouring partition builds. Tests: 2048 MB → 10K uploads/round, 0 evictions, loop 2.9 → 1.95 s/round; 20 MB → ~210K evictions/round, completes, KNN recall@64 identical (0.9538 vs 0.9536).
+**Files:** `src/bucket.cu`, `src/bucket_order.hpp`  **Params changed:** none (new flag default 2048 MB)
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 9.35 | +1.4% | +57.0% | 0.81x | bucket2 7.69, optimize 1.26, translate 0.40 | 3726 | 1.38 |
+| sift1M_large | large | 18.63 | +11.7% | +75.2% | 1.61x | bucket2 15.22, prune 1.40, optimize_chunked 1.65, translate 0.47 | 1620 | 3.61 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.73 | 1.14 | 0.11 | 0.00 | 0.68 | 0.67 | 0.02 | 3.36 | 0.00 | 0.48 |
+| sift1M_large | 0.57 | 2.23 | 0.15 | 0.00 | 3.15 | 0.77 | 0.03 | 6.97 | 0.46 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9765 | 0.9662 | 0.9579 | 0.9524 |
+| sift1M_large | 0.9753 | 0.9671 | 0.9593 | 0.9537 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9296 / 1943K | 0.9778 / 1034K | 0.9945 / 517K | 0.9987 / 188K | 0.9998 / 68K |
+| ours sift1M_large | 0.8993 / 1938K | 0.9627 / 1032K | 0.9893 / 533K | 0.9972 / 188K | 0.9994 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +11.7% (21.11 → 18.63 s, 1.61× CAGRA native), 1M-auto +1.4% (path untouched). GPU peak 1386–1620 MiB (gate 1919).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
