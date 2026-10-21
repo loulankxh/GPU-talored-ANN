@@ -1,0 +1,96 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 462e85c..f7110fb 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -1010,6 +1010,60 @@ struct BucketVectorAccumulator {
+ 
+     int64_t count(int64_t c) const { return bufs[static_cast<size_t>(c)].total_count; }
+ 
++    // 内存模式下批量写一段连续 gid [lo, lo+n) (跳过 is_centroid 的点)，多线程且
++    // 结果跟逐条 add() 完全一样：每个线程管一段连续 gid，先按桶计数，再按
++    // (桶, 线程) 前缀和定出每段的起始位置 → 桶内顺序仍是 gid 递增。
++    void add_range_parallel(int64_t lo, int64_t n, const DataT* data,
++                            const std::vector<int64_t>& assignments, const std::vector<char>& is_centroid) {
++        if (!in_memory) throw std::runtime_error("add_range_parallel: only in memory mode");
++        const size_t rec_bytes = record_bytes(D);
++        const int T = std::max(1, std::min<int>(omp_get_max_threads(), static_cast<int>((n + 4095) / 4096)));
++        const int64_t per = (n + T - 1) / T;
++        std::vector<int64_t> cnt(static_cast<size_t>(T) * n_centroids, 0);
++        int64_t n_bad = 0;
++        #pragma omp parallel for num_threads(T) schedule(static) reduction(+:n_bad)
++        for (int t = 0; t < T; ++t) {
++            int64_t* ct = cnt.data() + static_cast<size_t>(t) * n_centroids;
++            const int64_t a = lo + t * per, b = std::min(lo + n, a + per);
++            for (int64_t gi = a; gi < b; ++gi) {
++                if (is_centroid[static_cast<size_t>(gi)]) continue;
++                int64_t c = assignments[static_cast<size_t>(gi)];
++                if (c < 0 || c >= n_centroids) { ++n_bad; continue; }   // bounds check
++                ++ct[c];
++            }
++        }
++        if (n_bad > 0) throw std::runtime_error("add_range_parallel: invalid bucket id in assignments");
++        // 每个 (线程, 桶) 段的起始字节偏移；桶的 write_cursor / added_so_far 一次推进
++        for (int64_t c = 0; c < n_centroids; ++c) {
++            auto& bk = bufs[static_cast<size_t>(c)];
++            int64_t cur = bk.write_cursor, add = 0;
++            for (int t = 0; t < T; ++t) {
++                int64_t k = cnt[static_cast<size_t>(t) * n_centroids + c];
++                cnt[static_cast<size_t>(t) * n_centroids + c] = cur;
++                cur += k * static_cast<int64_t>(rec_bytes);
++                add += k;
++            }
++            if (bk.added_so_far + add > bk.total_count)
++                throw std::runtime_error("add_range_parallel: exceeded histogram count for bucket " + std::to_string(c));
++            bk.write_cursor = cur;
++            bk.added_so_far += add;
++        }
++        #pragma omp parallel for num_threads(T) schedule(static)
++        for (int t = 0; t < T; ++t) {
++            int64_t* off = cnt.data() + static_cast<size_t>(t) * n_centroids;
++            const int64_t a = lo + t * per, b = std::min(lo + n, a + per);
++            for (int64_t gi = a; gi < b; ++gi) {
++                if (is_centroid[static_cast<size_t>(gi)]) continue;
++                int64_t c = assignments[static_cast<size_t>(gi)];
++                char* dst = mem.get() + off[c];
++                std::memcpy(dst, &gi, sizeof(int64_t));
++                std::memcpy(dst + sizeof(int64_t), data + static_cast<size_t>(gi - lo) * D,
++                            static_cast<size_t>(D) * sizeof(DataT));
++                off[c] += static_cast<int64_t>(rec_bytes);
++            }
++        }
++    }
++
+     // 桶 c 的 cnt 条记录的起始地址: 内存模式直接指向合并缓冲区，否则读进 raw
+     const char* bucket_bytes(int64_t c, int64_t cnt, std::vector<char>& raw) {
+         const size_t nbytes = static_cast<size_t>(cnt) * record_bytes(D);
+@@ -1679,6 +1733,7 @@ void write_bucket_vectors_from_assignments(
+         1, chunk_bytes_budget / std::max<int64_t>(1, D * static_cast<int64_t>(sizeof(DataT))));
+ 
+     double t_read = 0, t_write = 0;
++    std::vector<char> is_centroid;   // 内存模式下代替 centroid_set 的逐点哈希查找
+     for (int64_t lo = 0; lo < N; lo += chunk_points) {
+         int64_t hi = std::min(lo + chunk_points, N) - 1;
+ 
+@@ -1689,10 +1744,18 @@ void write_bucket_vectors_from_assignments(
+         t_read += std::chrono::duration<double>(Clock::now() - tr0).count();
+ 
+         auto tw0 = Clock::now();
+-        for (int64_t gi = lo; gi <= hi; ++gi) {
+-            if (centroid_set.find(gi) != centroid_set.end()) continue;  // 上面已经写过
+-            bucket_vecs.add(assignments[static_cast<size_t>(gi)], gi,
+-                             raw_chunk.data() + static_cast<size_t>(gi - lo) * D);
++        if (bucket_vecs.in_memory) {
++            if (is_centroid.empty()) {
++                is_centroid.assign(static_cast<size_t>(N), 0);
++                for (int64_t g : centroid_global_indices) is_centroid[static_cast<size_t>(g)] = 1;
++            }
++            bucket_vecs.add_range_parallel(lo, hi - lo + 1, raw_chunk.data(), assignments, is_centroid);
++        } else {
++            for (int64_t gi = lo; gi <= hi; ++gi) {
++                if (centroid_set.find(gi) != centroid_set.end()) continue;  // 上面已经写过
++                bucket_vecs.add(assignments[static_cast<size_t>(gi)], gi,
++                                 raw_chunk.data() + static_cast<size_t>(gi - lo) * D);
++            }
+         }
+         t_write += std::chrono::duration<double>(Clock::now() - tw0).count();
+     }
