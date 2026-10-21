@@ -35,7 +35,7 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#35 (bucket processing order computed in the background right after Step 3)**, 2026-10-21:
+After **#36 (out-of-core bucket_vecs kept in memory within cpu_limit/4)**, 2026-10-21 — auto 9.18 s (0.80x), large **14.81 s (1.28x CAGRA)**; table below is from #35:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
@@ -1038,6 +1038,41 @@ Same structure as cuVS 26.12 `detail/cagra/cagra_build.cuh::build_knn_graph` (se
 | ours sift1M_large | 0.8995 / 1941K | 0.9631 / 1035K | 0.9892 / 492K | 0.9973 / 185K | 0.9993 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +5.5% (16.81 → 15.89 s, 1.38× CAGRA native), 1M-auto +2.1% (9.39 → 9.19 s, 0.80×).
+
+### #36 — out-of-core bucket_vecs kept in memory within cpu_limit/4  (2026-10-21)
+**Idea / rationale:** rounds ≥ 2 wrote every point's (gid, vector) record into per-bucket write buffers flushed to `bucket_vecs_merged.bin` (bucket_write ~0.4 s + write-throttled `finish_iteration` 0.4–0.6 s per round), which Step 6's host cache then read back. When the round's merged size N·(8+D) B ≤ cpu_limit/4, `BucketVectorAccumulator` now writes each record straight to its final offset (known from the histogram) in one host buffer and `read_bucket*` memcpy from it (bounds-checked); larger data keeps the file path (verified with `--cpu-limit 400000000`). finish_iteration 0.4–0.6 → 0 s. Patch also at `bucketDemo/patches/iter36_bucketvecs_in_memory.patch`.
+**Files:** `src/bucket.cu`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 9.18 | +0.1% | +57.8% | 0.80x | bucket2 7.50, optimize 1.30, translate 0.39 | 3862 | 1.38 |
+| sift1M_large | large | 14.81 | +6.8% | +80.3% | 1.28x | bucket2 11.33, prune 1.42, optimize_chunked 1.62, translate 0.45 | 1488 | 2.77 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.75 | 1.09 | 0.10 | 0.00 | 0.67 | 0.48 | 0.02 | 3.36 | 0.00 | 0.48 |
+| sift1M_large | 0.57 | 1.54 | 0.16 | 0.00 | 2.24 | 0.45 | 0.03 | 5.23 | 0.45 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9733 | 0.9663 | 0.9595 | 0.9531 |
+| sift1M_large | 0.9751 | 0.9668 | 0.9599 | 0.9539 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9286 / 1902K | 0.9770 / 1035K | 0.9944 / 533K | 0.9987 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.8996 / 1945K | 0.9632 / 1031K | 0.9892 / 500K | 0.9972 / 186K | 0.9993 / 68K |
+
+**Verdict:** ACCEPT — 1M-large +6.8% (15.89 → 14.81 s, 1.28× CAGRA native), 1M-auto +0.1% (path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

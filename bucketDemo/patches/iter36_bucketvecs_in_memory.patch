@@ -1,0 +1,135 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 1eabd4f..462e85c 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -855,6 +855,17 @@ struct BucketVectorAccumulator {
+     std::fstream merged_out;             // 本轮写句柄 (随机位置 seekp+write)
+     std::ifstream merged_in;             // Step 6/7 共用的持久读句柄
+ 
++    // 内存模式: 本轮合并后的总字节数 (N*(8+D*sizeof)) 不超过 mem_budget 时，
++    // 每条记录直接写到它在合并缓冲区里的最终位置 (histogram 已经给出每个桶
++    // 的偏移)，不经过 per-bucket 写缓冲/文件/flush，读桶就是 memcpy。原来
++    // round ≥2 每轮 bucket_write + finish_iteration (落盘, 被 dirty 页限速)
++    // ~0.8–1.0 s。超预算时走文件，跟原来一样。
++    size_t mem_budget = 0;
++    bool in_memory = false;
++    std::unique_ptr<char[]> mem;
++    size_t mem_cap = 0;
++    void set_in_memory_budget(size_t bytes) { mem_budget = bytes; }
++
+     static constexpr size_t record_bytes(int64_t D) {
+         return sizeof(int64_t) + static_cast<size_t>(D) * sizeof(DataT);
+     }
+@@ -904,6 +915,14 @@ struct BucketVectorAccumulator {
+             pos += b.total_count * static_cast<int64_t>(rec_bytes);
+         }
+ 
++        in_memory = static_cast<size_t>(pos) <= mem_budget;
++        if (in_memory) {
++            if (static_cast<size_t>(pos) > mem_cap) {
++                mem.reset(new char[static_cast<size_t>(std::max<int64_t>(pos, 1))]);   // 不初始化: 每个字节都会被 add 写一次
++                mem_cap = static_cast<size_t>(pos);
++            }
++            return;
++        }
+         if (merged_out.is_open()) merged_out.close();
+         merged_out.clear();
+         merged_out.open(merged_path, std::ios::binary | std::ios::out | std::ios::trunc);
+@@ -945,6 +964,13 @@ struct BucketVectorAccumulator {
+         ++b.added_so_far;
+ 
+         size_t rec_bytes = record_bytes(D);
++        if (in_memory) {
++            char* dst = mem.get() + b.write_cursor;
++            std::memcpy(dst, &gid, sizeof(int64_t));
++            std::memcpy(dst + sizeof(int64_t), vec, static_cast<size_t>(D) * sizeof(DataT));
++            b.write_cursor += static_cast<int64_t>(rec_bytes);
++            return;
++        }
+         size_t off = b.count * rec_bytes;
+         std::memcpy(b.data.get() + off, &gid, sizeof(int64_t));
+         std::memcpy(b.data.get() + off + sizeof(int64_t), vec, static_cast<size_t>(D) * sizeof(DataT));
+@@ -960,13 +986,14 @@ struct BucketVectorAccumulator {
+     void finish_iteration() {
+         for (int64_t c = 0; c < n_centroids; ++c) {
+             auto& b = bufs[static_cast<size_t>(c)];
+-            flush_bucket(c);
++            if (!in_memory) flush_bucket(c);
+             if (b.added_so_far != b.total_count)
+                 throw std::runtime_error(
+                     "BucketVectorAccumulator: bucket " + std::to_string(c) + " got "
+                     + std::to_string(b.added_so_far) + " add() calls, expected "
+                     + std::to_string(b.total_count) + " from histogram");
+         }
++        if (in_memory) return;
+         merged_out.close();
+ 
+         // merged_in may already be open from a previous iteration when this
+@@ -983,6 +1010,23 @@ struct BucketVectorAccumulator {
+ 
+     int64_t count(int64_t c) const { return bufs[static_cast<size_t>(c)].total_count; }
+ 
++    // 桶 c 的 cnt 条记录的起始地址: 内存模式直接指向合并缓冲区，否则读进 raw
++    const char* bucket_bytes(int64_t c, int64_t cnt, std::vector<char>& raw) {
++        const size_t nbytes = static_cast<size_t>(cnt) * record_bytes(D);
++        const int64_t off = merged_offset[static_cast<size_t>(c)];
++        if (in_memory) {
++            if (static_cast<size_t>(off) + nbytes > mem_cap)   // bounds check
++                throw std::runtime_error("BucketVectorAccumulator: bucket " + std::to_string(c) + " out of range");
++            return mem.get() + off;
++        }
++        raw.resize(nbytes);
++        merged_in.seekg(static_cast<std::streamoff>(off));
++        merged_in.read(raw.data(), static_cast<std::streamsize>(nbytes));
++        if (!merged_in.good())
++            throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
++        return raw.data();
++    }
++
+     // 顺序整块读出 bucket c 的全部 (gid, vector) 记录 (从合并文件里按已知偏移 seek)。
+     void read_bucket(int64_t c, std::vector<int64_t>& ids_out, std::vector<DataT>& vecs_out) {
+         int64_t cnt = count(c);
+@@ -991,14 +1035,10 @@ struct BucketVectorAccumulator {
+         if (cnt == 0) return;
+ 
+         size_t rec_bytes = record_bytes(D);
+-        std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
+-        merged_in.seekg(static_cast<std::streamoff>(merged_offset[static_cast<size_t>(c)]));
+-        merged_in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+-        if (!merged_in.good())
+-            throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
+-
++        std::vector<char> raw;
++        const char* src = bucket_bytes(c, cnt, raw);
+         for (int64_t i = 0; i < cnt; ++i) {
+-            const char* p = raw.data() + static_cast<size_t>(i) * rec_bytes;
++            const char* p = src + static_cast<size_t>(i) * rec_bytes;
+             std::memcpy(&ids_out[static_cast<size_t>(i)], p, sizeof(int64_t));
+             std::memcpy(vecs_out.data() + static_cast<size_t>(i) * static_cast<size_t>(D),
+                         p + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
+@@ -1013,14 +1053,10 @@ struct BucketVectorAccumulator {
+         if (cnt == 0) return;
+ 
+         size_t rec_bytes = record_bytes(D);
+-        std::vector<char> raw(static_cast<size_t>(cnt) * rec_bytes);
+-        merged_in.seekg(static_cast<std::streamoff>(merged_offset[static_cast<size_t>(c)]));
+-        merged_in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+-        if (!merged_in.good())
+-            throw std::runtime_error("BucketVectorAccumulator: read failed for bucket " + std::to_string(c));
+-
++        std::vector<char> raw;
++        const char* src = bucket_bytes(c, cnt, raw);
+         for (int64_t i = 0; i < cnt; ++i) {
+-            const char* p = raw.data() + static_cast<size_t>(i) * rec_bytes;
++            const char* p = src + static_cast<size_t>(i) * rec_bytes;
+             std::memcpy(ids_out_ptr + i, p, sizeof(int64_t));
+             std::memcpy(vecs_out_ptr + static_cast<size_t>(i) * static_cast<size_t>(D),
+                         p + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
+@@ -5775,6 +5811,7 @@ int run_pipeline_impl(
+             bucket_vecs_ptr = std::make_unique<BucketVectorAccumulator<DataT>>(
+                 BucketVectorAccumulator<DataT>::create(
+                     bucket_vec_dir, n_centroids, D, config.bucket_vec_buffer_bytes));
++            bucket_vecs_ptr->set_in_memory_budget(config.cpu_limit_bytes / 4);
+         }
+         double t2_bucket_vec_create = std::chrono::duration<double>(Clock::now() - t2_bvc0).count();
+ 
