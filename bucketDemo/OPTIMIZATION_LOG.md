@@ -76,6 +76,7 @@ Other:
 
 | # | idea | result | reason |
 |---|---|---|---|
+| 12 | k-means|| (Step 2): update d(x, C) incrementally with only the newly sampled candidates + elementwise min (cuVS 26.12 `cluster/detail/kmeans.cuh::initScalableKMeansPlusPlus`), instead of recomputing against all candidates each round; same sampled candidates (counts identical) | auto 15.42 s (+4.5%) then rerun 15.74 s (+2.5%); large 39.51 s (−1.4%): Step 2 4.67 → 3.43 s but the final background-merge wait grew 2.02 → 2.92 s (Step 2 was hiding the previous round's ChunkedKNN merge) | borderline gain not confirmed on rerun. Retry together with a faster out-of-core merge (`merge_iteration` write_running ~1.1 s/chunk), where the Step 2 saving would show up on the large path too |
 
 ## Iterations
 
