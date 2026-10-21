@@ -1559,7 +1559,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +3.1% (10.72 → 10.39 s; rerun +3.5%), 10M-auto +1.7% (110.94 → 109.02 s, 0.89× CAGRA native; −5.5 GB RSS), 1M-auto +0.7%.
 
-### #56 — KMeans|| d(x, C) via exact fp16 Tensor Core GEMM (8-bit data)  (2026-10-21, commit TBD)
+### #56 — KMeans|| d(x, C) via exact fp16 Tensor Core GEMM (8-bit data)  (2026-10-21, commit d3c3596)
 **Idea / rationale:** KMeans|| (Step 2) computes d(x, C) for the train subset against each round's new candidates with cuVS fp32 `brute_force` (CUDA cores; SIFT10M: 1M train points × ~50K candidates per call, kmeans_parallel 4.15 s/round). For 8-bit data the same exact fp16 GEMM argument as Step 4 (#22) holds: values exact in fp16, products / sums < 2²⁴ exact in fp32. So `KmeansMinDistF16` converts X once to fp16 (+ ‖x‖²), and per call converts C, runs 4096-row tiles of `cublasGemmEx` fp16→fp32 Tensor Core GEMM and a warp-per-row min of ‖c‖² − 2x·c (+ ‖x‖², clamped at 0 like L2Expanded). The L2 values are bit-identical to brute_force, so D² sampling is unchanged: SIFT10M round-1 candidate counts and psi identical (49770 / 50007 / 50014). Only used when the input is uint8/int8 and PQ is off; other types keep brute_force. Same tiled GEMM + select shape as cuVS 26.12 `detail/knn_brute_force.cuh::tiled_brute_force_knn`, with tensor-core fp16 inputs.
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
