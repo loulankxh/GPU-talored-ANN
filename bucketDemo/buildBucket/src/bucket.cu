@@ -129,6 +129,9 @@ struct LoadConfig {
     // (centroid 数仍按 N*centroid_ratio)，default 1.0 = 用全部点
     float kmeans_train_fraction;
 
+    // out-of-core Step 6: GPU 端 bucket 缓存预算 (MB, 0 = 关闭)，见 DevBucket
+    size_t gpu_bucket_cache_mb;
+
     // Output
     bool save_dists;               // 写 vector_dists.bin (default true)；流水线后续阶段不读它
     bool save_npy;                 // 额外写 neighbors.npy (int64, 给 Python 端评测用), default true;
@@ -153,6 +156,7 @@ struct LoadConfig {
         gpu_safety_margin(0.1f),
         knn_k(32),
         kmeans_train_fraction(1.0f),
+        gpu_bucket_cache_mb(2048),
         save_dists(true),
         save_npy(true)
     {}
@@ -569,6 +573,9 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
         config.kmeans_train_fraction = vm["kmeans-train-fraction"].as<float>();
         if (!(config.kmeans_train_fraction > 0.0f && config.kmeans_train_fraction <= 1.0f))
             throw std::runtime_error("--kmeans-train-fraction must be in (0, 1]");
+    }
+    if (vm.count("gpu-bucket-cache-mb")) {
+        config.gpu_bucket_cache_mb = vm["gpu-bucket-cache-mb"].as<size_t>();
     }
     if (vm.count("skip-dists")) {
         config.save_dists = !vm["skip-dists"].as<bool>();
@@ -4133,6 +4140,73 @@ inline void convert_vector_knn_to_npy(const std::string& knn_path, const std::st
  * round 1 分配完就已经把数据集重排写进 data_reordered.<ext> 了，直接按 offset 读，
  * 不需要 BucketVectorAccumulator 那份按桶散写的临时文件。
  */
+// ---- out-of-core Step 6: GPU 端 bucket 缓存 ----
+// 原来每个 bucket 的 pool (自己 + nprobe 个近邻桶, NPROBE=200 时 ~2.7 MB) 都在
+// CPU 上 memcpy 拼好再 H2D——相邻处理的桶近邻集合大量重叠 (DiskJoin 顺序的
+// 本意)，同一个桶的数据每轮被拷/传 ~nprobe 次 (SIFT1M ~27 GB/轮)。现在每个桶
+// 在 GPU 缓存里只传一次 (预算内，Belady 淘汰，跟 host 缓存用同一份未来访问
+// 表)，pool 由 GPU gather kernel 按 job 表从缓存里拼出来 (顺便 u8→fp16)。
+struct DevPoolJob {
+    const int32_t* ids;   // 桶的 gid (device)
+    const void*    vecs;  // 桶的原始向量 (device, DataT)
+    int32_t count;
+    int32_t dest;         // 在 pool 里的起始行
+};
+
+template <typename DataT>
+__global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+                                            __half* __restrict__ B, int32_t* __restrict__ ids_pool,
+                                            int D)
+{
+    const DevPoolJob jb = jobs[blockIdx.x];
+    const DataT* v = static_cast<const DataT*>(jb.vecs);
+    for (int r = threadIdx.x; r < jb.count; r += blockDim.x)
+        ids_pool[jb.dest + r] = jb.ids[r];
+    const int64_t n = static_cast<int64_t>(jb.count) * D;
+    __half* out = B + static_cast<int64_t>(jb.dest) * D;
+    for (int64_t e = threadIdx.x; e < n; e += blockDim.x)
+        out[e] = __float2half_rn(static_cast<float>(v[e]));
+}
+
+// 释放前必须等到最后一次读它的 gather 已经完成 (由 ctx 提供: 等主线程提交到
+// last_pos，再让 copy_stream 等那个位置的事件)，然后 stream-ordered free。
+struct DevCacheCtx {
+    cudaStream_t copy_stream = nullptr;
+    std::function<void(int32_t last_pos)> before_free;   // 在 producer 线程上调用
+};
+
+struct DevBucket {
+    void*   d_buf  = nullptr;   // [int32 ids (count, 16B 对齐)] [DataT vecs (count*D)]
+    const int32_t* d_ids = nullptr;
+    const void*    d_vecs = nullptr;
+    int64_t count = 0;
+    size_t  bytes = 0;
+    mutable int32_t last_pos = -1;   // 最近一次被拼进 pool 的处理位置
+    DevCacheCtx* ctx = nullptr;
+
+    DevBucket() = default;
+    DevBucket(const DevBucket&) = delete;
+    DevBucket& operator=(const DevBucket&) = delete;
+    DevBucket(DevBucket&& o) noexcept { take(o); }
+    DevBucket& operator=(DevBucket&& o) noexcept {
+        if (this != &o) { release(); take(o); }
+        return *this;
+    }
+    ~DevBucket() { release(); }
+private:
+    void take(DevBucket& o) {
+        d_buf = o.d_buf; d_ids = o.d_ids; d_vecs = o.d_vecs; count = o.count; bytes = o.bytes;
+        last_pos = o.last_pos; ctx = o.ctx;
+        o.d_buf = nullptr; o.d_ids = nullptr; o.d_vecs = nullptr; o.count = 0; o.bytes = 0; o.last_pos = -1;
+    }
+    void release() {
+        if (!d_buf) return;
+        if (ctx && ctx->before_free) ctx->before_free(last_pos);
+        cudaFreeAsync(d_buf, ctx ? ctx->copy_stream : nullptr);
+        d_buf = nullptr; d_ids = nullptr; d_vecs = nullptr; count = 0; bytes = 0;
+    }
+};
+
 template <typename DataT, typename BucketReaderT>
 void build_vector_knn_with_tensorcore(
     int64_t N,
@@ -4147,7 +4221,8 @@ void build_vector_knn_with_tensorcore(
     uint32_t order_graph_K,
     int32_t order_window_arg,
     size_t cache_bytes,
-    const std::vector<int32_t>* precomputed_order = nullptr)
+    const std::vector<int32_t>* precomputed_order = nullptr,
+    size_t gpu_cache_bytes = 0)
 {
     auto func_t0 = std::chrono::high_resolution_clock::now();
     constexpr bool want_distances = true;  // 合并去重总是需要距离
@@ -4233,6 +4308,10 @@ void build_vector_knn_with_tensorcore(
     auto vec_bucket_bytes = [](const VecBucket<DataT>& b) {
         return b.ids.size() * sizeof(int64_t) + b.vecs.size() * sizeof(DataT);
     };
+    // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (只在 8-bit 数据、预算 > 0 时用)
+    const bool use_dev_cache = kIsInt8Path && gpu_cache_bytes > 0;
+    std::vector<std::vector<int32_t>> future_access_dev;
+    if (use_dev_cache) future_access_dev = future_access;
     bucket_order::BeladyBucketCache<VecBucket<DataT>> bucket_cache(
         std::move(future_access), cache_bytes, vec_bucket_bytes);
     auto bucket_loader = [&](int32_t bid) {
@@ -4627,6 +4706,48 @@ void build_vector_knn_with_tensorcore(
     std::mutex stage_mtx;
     std::condition_variable stage_cv;
     bool stage_abort = false, prod_failed = false;  // guarded by stage_mtx
+
+    // ---- GPU 端 bucket 缓存 (use_dev_cache) ----
+    // 每个 slot: pinned job 表 + device job 表 + 加载完成事件 (producer 在
+    // copy_stream 上记，主线程让 slot stream 等它)。gather 完成事件按处理位置
+    // 放进一个带 tag 的环形表 (主线程记)，淘汰时 copy_stream 等最后一次读该桶
+    // 的那个位置；位置被环形表覆盖前主线程会先同步它，所以 tag 不匹配 = 早已完成。
+    constexpr int kPosRing = 1024;
+    struct PosEvent { cudaEvent_t ev = nullptr; int32_t pos = -1; };
+    std::vector<PosEvent> pos_ring;
+    int32_t submitted_pos = -1;                   // guarded by stage_mtx
+    cudaStream_t copy_stream = nullptr;
+    DevPoolJob* h_jobs[MAX_SLOTS] = {nullptr};
+    DevPoolJob* d_jobs[MAX_SLOTS] = {nullptr};
+    int n_jobs_staged[MAX_SLOTS] = {0};
+    cudaEvent_t ev_load[MAX_SLOTS] = {nullptr};
+    DevCacheCtx dev_ctx;
+    std::unique_ptr<bucket_order::BeladyBucketCache<DevBucket>> dev_cache;
+    if (use_dev_cache) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
+        pos_ring.resize(kPosRing);
+        for (auto& pe : pos_ring) CUDA_CHECK(cudaEventCreateWithFlags(&pe.ev, cudaEventDisableTiming));
+        for (int sl = 0; sl < num_slots; ++sl) {
+            CUDA_CHECK(cudaMallocHost(&h_jobs[sl], (static_cast<size_t>(K) + 1) * sizeof(DevPoolJob)));
+            CUDA_CHECK(cudaMalloc(&d_jobs[sl], (static_cast<size_t>(K) + 1) * sizeof(DevPoolJob)));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ev_load[sl], cudaEventDisableTiming));
+        }
+        dev_ctx.copy_stream = copy_stream;
+        dev_ctx.before_free = [&](int32_t last_pos) {
+            if (last_pos < 0) return;
+            std::unique_lock<std::mutex> lk(stage_mtx);
+            stage_cv.wait(lk, [&] { return submitted_pos >= last_pos || stage_abort; });
+            const PosEvent& pe = pos_ring[static_cast<size_t>(last_pos % kPosRing)];
+            if (pe.pos == last_pos) cudaStreamWaitEvent(copy_stream, pe.ev, 0);
+        };
+        dev_cache = std::make_unique<bucket_order::BeladyBucketCache<DevBucket>>(
+            std::move(future_access_dev), gpu_cache_bytes,
+            [](const DevBucket& b) { return b.bytes; });
+        dev_cache->set_pin_current_position(true);   // 本 position 的桶都在 job 表里，不能被淘汰
+        std::cout << "  [VectorKNN] GPU bucket cache: " << gpu_cache_bytes / 1e6 << " MB\n";
+    }
+    double t_dev_upload = 0;
+    int64_t n_dev_loads = 0;
     std::exception_ptr prod_exc;
     double t_wait_producer = 0;
 
@@ -4653,6 +4774,75 @@ void build_vector_knn_with_tensorcore(
                 // 自己 bucket 里 → 各 bucket 互不相交，拼出来的 pool 不会重复。
                 // 先顺序 get() (cache 非线程安全；同一 pos 内的桶彼此不会互相淘汰)，
                 // 只记源指针，再并行 memcpy (见 #6: 线程数封顶 8)。
+                if (use_dev_cache) {
+                    // pool 由 GPU 从 bucket 缓存 gather；这里只解析/加载桶、写 job 表
+                    size_t dofs = 0;
+                    int nj = 0;
+                    auto dev_loader = [&](int32_t bid) {
+                        auto tu0 = diag_now();
+                        const VecBucket<DataT>& hb = bucket_cache.get(pos, bid, bucket_loader);
+                        DevBucket db;
+                        db.ctx = &dev_ctx;
+                        db.count = static_cast<int64_t>(hb.ids.size());
+                        const size_t ids_bytes = (static_cast<size_t>(db.count) * sizeof(int32_t) + 15) / 16 * 16;
+                        const size_t vec_bytes = static_cast<size_t>(db.count) * D * sizeof(DataT);
+                        db.bytes = ids_bytes + vec_bytes;
+                        CUDA_CHECK(cudaMallocAsync(&db.d_buf, std::max<size_t>(db.bytes, 16), copy_stream));
+                        std::vector<int32_t> ids32(static_cast<size_t>(db.count));
+                        for (int64_t i = 0; i < db.count; ++i) ids32[static_cast<size_t>(i)] = static_cast<int32_t>(hb.ids[static_cast<size_t>(i)]);
+                        char* base = static_cast<char*>(db.d_buf);
+                        db.d_ids  = reinterpret_cast<const int32_t*>(base);
+                        db.d_vecs = base + ids_bytes;
+                        if (db.count > 0) {
+                            CUDA_CHECK(cudaMemcpyAsync(base, ids32.data(), static_cast<size_t>(db.count) * sizeof(int32_t),
+                                                       cudaMemcpyHostToDevice, copy_stream));
+                            CUDA_CHECK(cudaMemcpyAsync(base + ids_bytes, hb.vecs.data(), vec_bytes,
+                                                       cudaMemcpyHostToDevice, copy_stream));
+                        }
+                        ++n_dev_loads;
+                        t_dev_upload += diag_secs(tu0, diag_now());
+                        return db;
+                    };
+                    auto add_dev = [&](int64_t bid) {
+                        if (bucket_count[bid] == 0) return;
+                        auto ga0 = diag_now();
+                        const DevBucket& db = dev_cache->get(pos, static_cast<int32_t>(bid), dev_loader);
+                        t_cache_get += diag_secs(ga0, diag_now());
+                        db.last_pos = pos;
+                        if (dofs + static_cast<size_t>(db.count) > max_pool_size_ub)   // bounds check
+                            throw std::runtime_error("VectorKNN: pool overflow at pos " + std::to_string(pos));
+                        h_jobs[slot][nj++] = DevPoolJob{db.d_ids, db.d_vecs, static_cast<int32_t>(db.count),
+                                                        static_cast<int32_t>(dofs)};
+                        dofs += static_cast<size_t>(db.count);
+                    };
+                    add_dev(c);
+                    for (uint32_t k = 0; k < K; ++k) {
+                        uint32_t nb_c = centroid_knn_graph[c * K + k];
+                        if (nb_c < static_cast<uint32_t>(n_centroids)) add_dev(static_cast<int64_t>(nb_c));
+                    }
+                    CUDA_CHECK(cudaEventRecord(ev_load[slot], copy_stream));
+                    n_jobs_staged[slot] = nj;
+                    Staged& st = staged[slot];
+                    st.pool_size   = static_cast<int>(dofs);
+                    st.bucket_size = static_cast<int>(bucket_count[c]);
+                    st.actual_M    = std::min(M, st.pool_size - 1);
+                    if (st.actual_M > 0) {
+                        // 自己桶的 gid (host 缓存里的那份)，给 scatter 用
+                        const VecBucket<DataT>& hc = bucket_cache.get(pos, static_cast<int32_t>(c), bucket_loader);
+                        if (static_cast<int>(hc.ids.size()) != st.bucket_size)
+                            throw std::runtime_error("VectorKNN: center bucket size mismatch");
+                        for (int i = 0; i < st.bucket_size; ++i)
+                            staged_ids_bucket[slot][static_cast<size_t>(i)] = static_cast<int32_t>(hc.ids[static_cast<size_t>(i)]);
+                    }
+                    t_poolbuild += diag_secs(pb0, diag_now());
+                    {
+                        std::lock_guard<std::mutex> lk(stage_mtx);
+                        slot_ready_pos[slot] = pos;
+                    }
+                    stage_cv.notify_all();
+                    continue;
+                }
+
                 int64_t* ids_pool64 = h_ids_pool64[slot];
                 DataT*   vecs_pool  = h_B_raw[slot];
                 size_t ofs = 0;  // 以"点数"计，不是字节
@@ -4763,6 +4953,7 @@ void build_vector_knn_with_tensorcore(
             {
                 std::lock_guard<std::mutex> lk(stage_mtx);
                 slot_ready_pos[slot] = -1;
+                submitted_pos = pos;   // 这个位置没有 gather (见 dev 缓存的淘汰等待)
             }
             stage_cv.notify_all();
             t_wait_producer += diag_secs(dt2, diag_now());
@@ -4773,6 +4964,39 @@ void build_vector_knn_with_tensorcore(
         auto dt3 = diag_now();
         t_wait_producer += diag_secs(dt2, dt3);
 
+        if (use_dev_cache) {
+            // ---- 3c/3d (dev 缓存): 等这个位置的桶加载完，按 job 表 gather pool ----
+            const int nj = n_jobs_staged[slot];
+            CUDA_CHECK(cudaStreamWaitEvent(streams[slot], ev_load[slot], 0));
+            CUDA_CHECK(cudaMemcpyAsync(d_ids_bucket[slot], h_ids_bucket[slot],
+                                       bucket_size * sizeof(int32_t),
+                                       cudaMemcpyHostToDevice, streams[slot]));
+            CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
+                                       cudaMemcpyHostToDevice, streams[slot]));
+            CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));
+            devcache_gather_pool_kernel<DataT><<<nj, 256, 0, streams[slot]>>>(
+                d_jobs[slot], reinterpret_cast<__half*>(d_B[slot]), d_ids_pool[slot], static_cast<int>(D));
+            CUDA_CHECK(cudaGetLastError());
+            {
+                // gather 完成事件 (淘汰等待用)；环形表覆盖前先确认旧位置已完成
+                PosEvent& pe = pos_ring[static_cast<size_t>(pos % kPosRing)];
+                if (pe.pos >= 0) CUDA_CHECK(cudaEventSynchronize(pe.ev));
+                std::lock_guard<std::mutex> lk(stage_mtx);
+                CUDA_CHECK(cudaEventRecord(pe.ev, streams[slot]));
+                pe.pos = pos;
+                h2d_pending[slot] = true;
+                slot_ready_pos[slot] = -1;
+                submitted_pos = pos;
+            }
+            stage_cv.notify_all();
+            {
+                const int threads = 256;
+                int64_t blocks_n = (pool_size + threads - 1) / threads;
+                compute_row_norms_kernel<GemmInT><<<blocks_n, threads, 0, streams[slot]>>>(
+                    d_B[slot], d_norms_pool[slot], pool_size, D);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        } else {
         // ---- 3c: 上传 id 列表 + 原始向量 (async on slot stream) ----
         CUDA_CHECK(cudaMemcpyAsync(d_ids_bucket[slot], h_ids_bucket[slot],
                                    bucket_size * sizeof(int32_t),
@@ -4820,6 +5044,7 @@ void build_vector_knn_with_tensorcore(
                 d_B[slot], d_norms_pool[slot], pool_size, D);
             CUDA_CHECK(cudaGetLastError());
         }
+        }   // !use_dev_cache
 
         // dots 行宽: block top-M kernel (actual_M ≤ 256) 要 4 对齐; raft 回退路径按
         // pool_size 紧凑排布
@@ -4974,6 +5199,18 @@ void build_vector_knn_with_tensorcore(
     }
 
     // ---- 释放 ----
+    if (use_dev_cache) {
+        std::cout << "  [VectorKNN] GPU bucket cache: " << n_dev_loads << " bucket uploads, upload "
+                  << std::fixed << std::setprecision(3) << t_dev_upload << "s, evictions "
+                  << dev_cache->evictions() << "\n";
+        dev_cache.reset();                       // 释放全部 device 桶 (都已提交)
+        CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+        CUDA_CHECK(cudaStreamDestroy(copy_stream));
+        for (auto& pe : pos_ring) cudaEventDestroy(pe.ev);
+        for (int sl = 0; sl < num_slots; ++sl) {
+            cudaFreeHost(h_jobs[sl]); cudaFree(d_jobs[sl]); cudaEventDestroy(ev_load[sl]);
+        }
+    }
     cudaFree(d_identity_idx);
     for (int s = 0; s < num_slots; ++s) {
         cudaFree(d_B_raw[s]);
@@ -6064,14 +6301,14 @@ int run_pipeline_impl(
                     *knn_acc,
                     centroid_knn_graph_host.data(), K,
                     order_window_arg, step6_cache_bytes,
-                    &bucket_process_order_round1);
+                    &bucket_process_order_round1, config.gpu_bucket_cache_mb << 20);
             } else {
                 build_vector_knn_with_tensorcore<DataT>(
                     N, D, *bucket_vecs_ptr, graph_ptr,
                     n_centroids, graph_K, neighbors_m,
                     *knn_acc,
                     centroid_knn_graph_host.data(), K,
-                    order_window_arg, step6_cache_bytes);
+                    order_window_arg, step6_cache_bytes, nullptr, config.gpu_bucket_cache_mb << 20);
             }
             double t6_after_build = std::chrono::duration<double>(Clock::now() - t6).count();
             double t6_build_vector_knn = t6_after_build - t6_topk_expand;
@@ -6282,6 +6519,9 @@ int main(int argc, char** argv) {
             ("kmeans-train-fraction", po::value<float>(),
                 "Step 2 (dataset fits on GPU): train KMeans|| on this random fraction of the points "
                 "(centroid count stays N*centroid-ratio; default 1.0 = all points)")
+            ("gpu-bucket-cache-mb", po::value<size_t>(),
+                "Out-of-core Step 6: GPU-side bucket cache budget in MB (Belady eviction; default 2048, 0 = off "
+                "→ pools assembled on the host and uploaded per bucket)")
             ("skip-dists",    po::bool_switch()->default_value(false),
                 "Don't write vector_dists.bin (distances of vector_knn.bin; no later pipeline stage reads it)")
             ("skip-npy",      po::bool_switch()->default_value(false),

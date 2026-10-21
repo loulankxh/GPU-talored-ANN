@@ -347,8 +347,19 @@ public:
           next_use_(static_cast<size_t>(B_), 0),
           next_use_heap_(next_use_) {}
 
+    // 开启后 make_room 不淘汰本 position 已经 get() 过的桶 (调用方在同一个
+    // position 里持有多个桶的引用/地址直到整个 position 处理完——例如 GPU 端
+    // bucket 缓存把它们写进同一张 job 表)。全部都被 pin 时允许暂时超预算。
+    // 默认关闭: 纯 Belady 行为不变。
+    void set_pin_current_position(bool on) {
+        pin_current_ = on;
+        if (on) last_get_pos_.assign(static_cast<size_t>(B_), -1);
+    }
+
     template <typename Loader>
     const BucketT& get(int32_t position, int32_t bucket_id, Loader&& loader) {
+        current_pos_ = position;
+        if (pin_current_) last_get_pos_[static_cast<size_t>(bucket_id)] = position;
         if (resident_[bucket_id]) {
             advance_pointer(bucket_id, position);
             return slot_[bucket_id];
@@ -392,7 +403,17 @@ private:
     }
 
     void make_room(size_t incoming_bytes) {
+        std::vector<int32_t> pinned;
         while (resident_count_ > 0 && used_bytes_ + incoming_bytes > capacity_bytes_) {
+            if (next_use_heap_.empty()) break;   // 剩下的全被 pin 住
+            if (pin_current_) {
+                int32_t cand = next_use_heap_.pop_max();
+                if (last_get_pos_[static_cast<size_t>(cand)] == current_pos_) {
+                    pinned.push_back(cand);
+                    continue;
+                }
+                next_use_heap_.push_or_update(cand);
+            }
             // Evict whichever resident bucket is needed farthest in the
             // future (or never again, sentinel = INT32_MAX) - i.e. Belady's
             // optimal offline policy. Ties broken by higher bucket id;
@@ -406,6 +427,7 @@ private:
             --resident_count_;
             ++evictions_;
         }
+        for (int32_t v : pinned) next_use_heap_.push_or_update(v);
         // If a single bucket's bytes alone exceed capacity_bytes_, the loop
         // above empties the cache and still can't make room - we insert it
         // anyway (used_bytes_ temporarily over budget for that one entry)
@@ -426,6 +448,9 @@ private:
     IndexedMaxHeap next_use_heap_;    // max-heap over next_use_, by bucket id
     size_t resident_count_ = 0;
     uint64_t evictions_ = 0;
+    bool pin_current_ = false;
+    int32_t current_pos_ = -1;
+    std::vector<int32_t> last_get_pos_;   // pin_current_ 时: 桶 → 最近一次 get 的 position
 };
 
 }  // namespace bucket_order
