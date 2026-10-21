@@ -1388,7 +1388,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +6.4% (11.66 → 10.91 s, 0.95× CAGRA native), 10M-auto +4.1% (163.74 → 157.00 s), 1M-auto +2.4% (7.38 → 7.20 s).
 
-### #50 — Step 4 assignment: exact fp16 GEMM only up to 32K centroids, CAGRA graph search (itopk 32) above  (2026-10-21, commit TBD)
+### #50 — Step 4 assignment: exact fp16 GEMM only up to 32K centroids, CAGRA graph search (itopk 32) above  (2026-10-21, commit 1a799f2)
 **Idea / rationale:** the exact top-2 assignment (#7/#8/#22: fp16 GEMM vs all centroids + top-2 kernel) costs ∝ N × n_centroids. Each 4096-query tile also writes and re-reads a 4096 × n_centroids fp32 dots matrix, so at SIFT10M (9.9M points × 100K centroids) the round is memory-bound: 11.1 s/round "search", ~7.8 TB of dots traffic. CAGRA single-CTA search on the centroid KNN graph (cuVS `cagra::search`, already the PQ / fallback path; cost ∝ N × log n_centroids) is cheaper once the centroids are many. Since only the top 2 are needed, itopk drops 64 → 32 (smallest 32-aligned value). SIFT10M one-round measurements: exact 11.15 s, CAGRA itopk 64 9.27 s, CAGRA itopk 32 5.19 s; bucket sizes the same (max 850–862, avg 100). SIFT1M (10K centroids) keeps the exact path (0.12 s/round vs ~0.7 s for CAGRA). Env overrides: `BUCKET2_EXACT_ASSIGN_MAX` (default 32768), `BUCKET2_ASSIGN_ITOPK` (default 32).
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
