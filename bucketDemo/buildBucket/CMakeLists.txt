@@ -11,7 +11,7 @@ if(NOT DEFINED CMAKE_CXX_COMPILER)
     set(CMAKE_CXX_COMPILER ${TOOL_ENV}/bin/x86_64-conda-linux-gnu-g++)
 endif()
 set(CMAKE_CUDA_HOST_COMPILER ${CMAKE_CXX_COMPILER})
-if(NOT DEFINED CMAKE_BUILD_TYPE)
+if(NOT CMAKE_BUILD_TYPE)  # CMake 4 pre-defines it as "", so NOT DEFINED never fires
     set(CMAKE_BUILD_TYPE Release)
 endif()
 set(CMAKE_PREFIX_PATH ${CUVS_ENV} ${TOOL_ENV})

@@ -2,7 +2,8 @@
 """Accept / reject one candidate iteration against state/best.json.
 
 usage:
-  judge.py RUN_1M_AUTO RUN_1M_LARGE RUN_10M_LARGE [--update] [--md]
+  judge.py RUN_1M_AUTO RUN_1M_LARGE [--update] [--md]
+    (SIFT10M is not part of the loop for now — user decision 2026-10-21)
     RUN_*    : run_pipeline.sh output dirs (each holds metrics.json)
     --update : on ACCEPT (or when best.json does not exist yet) write the
                candidate as the new state/best.json
@@ -11,16 +12,16 @@ usage:
 Rules (agreed with the user):
   correctness  every run produced a graph; final graph has 0 bad ids / self loops /
                duplicate edges; final degree 32, pre-prune degree 64;
-               sift1M auto must take the resident path, sift10M large the large path.
-  speed        build_total (sum of all stages) of sift1M-auto or sift10M-large is
+               sift1M auto must take the resident path, sift1M large the large path.
+  speed        build_total (sum of all stages) of sift1M-auto or sift1M-large is
                >= 3% faster than best, and no config is > 3% slower than best.
-  quality      sift1M CAGRA-search recall@10 at every itopk:
+  quality      CAGRA-search recall@10 at every itopk, sift1M auto + large:
                  resident path: >= best - 0.01  and  >= CAGRA - 0.01
                  large path   : >= best - 0.01  and  >= min(CAGRA - 0.01, initial large baseline)
                                 (the large path starts below CAGRA-1%; it may not get worse
                                  than where it started, and closing the gap is a valid goal)
                pre-prune KNN recall@64 (sampled exact KNN) >= best - 0.01 on every run.
-  memory       large path (sift10M): host peak RSS per stage and GPU peak <= 1.2x best
+  memory       large path (sift1M large): host peak RSS per stage and GPU peak <= 1.2x best
                (scalability guard: nothing may start growing with N).
 """
 import json, os, sys
@@ -29,24 +30,31 @@ SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(SKILL, "state")
 BEST = os.path.join(STATE, "best.json")
 CAGRA = json.load(open(os.path.join(STATE, "cagra_baseline.json")))
-KEYS = ["sift1M_auto", "sift1M_large", "sift10M_large"]
+KEYS = ["sift1M_auto", "sift1M_large"]
 SPEED_GAIN, SPEED_TOL, RECALL_TOL, MEM_TOL = 0.03, 0.03, 0.01, 1.2
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 flags = {a for a in sys.argv[1:] if a.startswith("--")}
-if len(args) != 3:
+if len(args) != len(KEYS):
     sys.exit(__doc__)
 cand = {k: json.load(open(os.path.join(d, "metrics.json"))) for k, d in zip(KEYS, args)}
 cand_dirs = dict(zip(KEYS, map(os.path.abspath, args)))
 best = json.load(open(BEST)) if os.path.exists(BEST) else None
 
 fail, notes = [], []
+
+def initial_floor(b, k):
+    """recall table of the large path at the first baseline (it starts below CAGRA-1%)."""
+    init = b.get("initial_large_recall", {})
+    if init and all(isinstance(v, float) for v in init.values()):  # old format: sift1M only
+        init = {"sift1M_large": init}
+    return init.get(k)
 recalls = lambda m: {str(p["itopk"]): p["recall"] for p in m.get("search", {}).get("points", [])}
 
 # ---- correctness
 for k, m in cand.items():
     s = m.get("search")
-    if k.startswith("sift1M") and not s:
+    if not s:
         fail.append(f"{k}: no search result")
     if s:
         if s["bad_ids"] or s["self_loops"] or s["dup_edges"]:
@@ -60,7 +68,7 @@ for k, m in cand.items():
         fail.append(f"{k}: pre-prune degree {kn['degree']} != 64")
 if cand["sift1M_auto"]["path"] != "resident":
     fail.append("sift1M auto did not take the resident path")
-for k in ("sift1M_large", "sift10M_large"):
+for k in ("sift1M_large",):
     if cand[k]["path"] != "large":
         fail.append(f"{k} did not take the large path")
 
@@ -72,20 +80,23 @@ if best:
         speed[k] = (b - c) / b
         if speed[k] < -SPEED_TOL:
             fail.append(f"{k}: {(-speed[k]) * 100:.1f}% slower than best ({c:.2f}s vs {b:.2f}s)")
-    if max(speed["sift1M_auto"], speed["sift10M_large"]) < SPEED_GAIN:
-        fail.append("no primary config is >= 3% faster than best "
-                    f"(1M auto {speed['sift1M_auto'] * 100:+.1f}%, 10M large {speed['sift10M_large'] * 100:+.1f}%)")
+    if max(speed.values()) < SPEED_GAIN:
+        fail.append("no config is >= 3% faster than best ("
+                    + ", ".join(f"{k} {v * 100:+.1f}%" for k, v in speed.items()) + ")")
 
-    for k in ("sift1M_auto", "sift1M_large"):
+    for k in KEYS:
         cr, br = recalls(cand[k]), recalls(best["runs"][k])
-        floor_init = best["initial_large_recall"] if k == "sift1M_large" else None
-        for it, cag in CAGRA["sift1M"]["search"].items():
+        cag_tab = CAGRA[k.split("_")[0]].get("search")
+        floor_init = initial_floor(best, k) if k.endswith("_large") else None
+        for it in (cag_tab or CAGRA["sift1M"]["search"]):
             if it not in cr:
                 fail.append(f"{k}: missing itopk {it}"); continue
-            if cr[it] < br[it] - RECALL_TOL:
+            if it in br and cr[it] < br[it] - RECALL_TOL:
                 fail.append(f"{k} itopk {it}: recall {cr[it]:.4f} < best {br[it]:.4f} - 0.01")
-            cag_floor = cag - RECALL_TOL
-            if floor_init is not None:
+            if cag_tab is None:
+                continue
+            cag_floor = cag_tab[it] - RECALL_TOL
+            if floor_init and it in floor_init:
                 cag_floor = min(cag_floor, floor_init[it])
             if cr[it] < cag_floor:
                 fail.append(f"{k} itopk {it}: recall {cr[it]:.4f} < floor {cag_floor:.4f}")
@@ -95,12 +106,12 @@ if best:
         if c < b - RECALL_TOL:
             fail.append(f"{k}: pre-prune recall@64 {c:.4f} < best {b:.4f} - 0.01")
 
-    c, b = cand["sift10M_large"], best["runs"]["sift10M_large"]
+    c, b = cand["sift1M_large"], best["runs"]["sift1M_large"]
     for st, v in c["peak_rss_gb"].items():
         if st in b["peak_rss_gb"] and v > MEM_TOL * b["peak_rss_gb"][st] + 0.2:
-            fail.append(f"sift10M large {st}: peak RSS {v:.2f}GB > 1.2x best {b['peak_rss_gb'][st]:.2f}GB")
+            fail.append(f"sift1M large {st}: peak RSS {v:.2f}GB > 1.2x best {b['peak_rss_gb'][st]:.2f}GB")
     if c["gpu_peak_mib"] and b["gpu_peak_mib"] and c["gpu_peak_mib"] > MEM_TOL * b["gpu_peak_mib"] + 256:
-        fail.append(f"sift10M large: GPU peak {c['gpu_peak_mib']}MiB > 1.2x best {b['gpu_peak_mib']}MiB")
+        fail.append(f"sift1M large: GPU peak {c['gpu_peak_mib']}MiB > 1.2x best {b['gpu_peak_mib']}MiB")
 else:
     notes.append("no best.json yet: this run becomes the baseline")
 
@@ -110,7 +121,9 @@ print(json.dumps({"verdict": verdict, "fail": fail, "notes": notes,
 
 if "--update" in flags and (verdict == "ACCEPT" or best is None):
     new = {"runs": cand, "dirs": cand_dirs,
-           "initial_large_recall": best["initial_large_recall"] if best else recalls(cand["sift1M_large"])}
+           "initial_large_recall": ({k: initial_floor(best, k) or recalls(cand[k])
+                                     for k in ("sift1M_large",)} if best else
+                                    {k: recalls(cand[k]) for k in ("sift1M_large",)})}
     if best:
         new["baseline_runs"] = best.get("baseline_runs", best["runs"])
     json.dump(new, open(BEST, "w"), indent=1)
@@ -141,13 +154,15 @@ if "--md" in flags:
     for k in KEYS:
         kn = cand[k].get("knn_similarity", {})
         print(f"| {k} | " + " | ".join(f"{kn.get(f'recall@{x}', float('nan')):.4f}" for x in (1, 10, 32, 64)) + " |")
-    print("\n**(b) final graph (degree 32, original ids), cuVS CAGRA search, SIFT1M recall@10 / QPS**\n")
+    print("\n**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**\n")
     its = list(CAGRA["sift1M"]["search"])
     print("| graph | " + " | ".join(f"itopk {i}" for i in its) + " |")
     print("|---|" + "---|" * len(its))
-    print("| CAGRA native (64→32) | " + " | ".join(
-        f"{CAGRA['sift1M']['search'][i]:.4f} / {CAGRA['sift1M']['qps'][i] / 1e3:.0f}K" for i in its) + " |")
-    for k in ("sift1M_auto", "sift1M_large", "sift10M_large"):
+    for ds in ("sift1M", "sift10M"):
+        if "search" in CAGRA[ds]:
+            print(f"| CAGRA native 64→32, {ds} | " + " | ".join(
+                f"{CAGRA[ds]['search'][i]:.4f} / {CAGRA[ds]['qps'][i] / 1e3:.0f}K" for i in its) + " |")
+    for k in KEYS:
         pts = {str(p["itopk"]): p for p in cand[k].get("search", {}).get("points", [])}
         if pts:
             print(f"| ours {k} | " + " | ".join(
