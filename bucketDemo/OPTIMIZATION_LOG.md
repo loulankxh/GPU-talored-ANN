@@ -35,13 +35,15 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#30 (out-of-core Step 6 loop: scatter on a consumer thread + block top-M / fp16 GEMM)**, 2026-10-21:
+After **#32 (out-of-core: in-memory inline reorder + ≥1 ChunkedKNN chunk per thread)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **9.42** (0.82x CAGRA) | 0.9289 / 0.9775 / 0.9947 | 1947K / 1035K |
-| SIFT1M large (out-of-core path) | **22.80** (1.98x CAGRA) | 0.8997 / 0.9626 / 0.9887 | 2224K / 1190K |
+| SIFT1M auto (GPU-resident) | **9.48** (0.82x CAGRA) | 0.9291 / 0.9773 / 0.9944 | 2168K / 1188K |
+| SIFT1M large (out-of-core path) | **21.11** (1.83x CAGRA) | 0.8984 / 0.9630 / 0.9888 | 1941K / 897K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
+
+(auto 9.48 vs 9.42: path untouched, noise.)
 
 ## Ideas backlog
 
@@ -898,6 +900,41 @@ Same structure as cuVS 26.12 `detail/cagra/cagra_build.cuh::build_knn_graph` (se
 | ours sift1M_large | 0.8997 / 2224K | 0.9626 / 1190K | 0.9887 / 562K | 0.9973 / 189K | 0.9993 / 66K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +5.7% (24.17 → 22.80 s, 1.98× CAGRA native), 1M-auto +0.1% (path untouched).
+
+### #32 — out-of-core: in-memory inline reorder + ≥1 ChunkedKNN chunk per thread  (2026-10-21)
+**Idea / rationale:** two large-path pieces, benchmarked together: (1) #31 — when 2·N·D B ≤ cpu_limit/4 the round-1 inline reorder reads the whole input, permutes by inverse_perm in parallel and writes `data_reordered` once, instead of routing 1M rows through 10K per-bucket buffered writers (pass3_write 1.03 → 0.39 s; output verified == base[inverse_perm]; streaming writer kept for larger data; alone +3.1% / +2.9%). (2) `ChunkedKnnAccumulator::create` derived `chunk_size` only from memory per thread (4 GB / 80 / 512 B ≈ 100K → 10 chunks on SIFT1M), so the per-chunk-parallel merge used 10 of 80 threads; `chunk_size` is now also capped at ceil(N / threads) (SIFT1M: 80 chunks of 12.5K). Smaller chunks only lower per-merge-thread memory. Merges: round-2 2.5 → 1.1 s, final (exposed) wait 0.9 → 0.47 s; less background write overlap also shortened Step 4's flush. Like cuVS 26.12 `cagra_ace.cuh` sizing partitions for parallelism, not just memory. bucket2 RSS 3.86 → 3.58 GB.
+**Files:** `src/bucket.cu`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 9.48 | -0.6% | +56.4% | 0.82x | bucket2 7.71, optimize 1.31, translate 0.47 | 3894 | 1.38 |
+| sift1M_large | large | 21.11 | +7.4% | +71.9% | 1.83x | bucket2 17.64, prune 1.41, optimize_chunked 1.65, translate 0.38 | 1386 | 3.58 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.76 | 1.09 | 0.10 | 0.00 | 0.68 | 0.66 | 0.02 | 3.35 | 0.00 | 0.49 |
+| sift1M_large | 0.57 | 2.20 | 0.15 | 0.00 | 3.07 | 0.76 | 0.03 | 9.61 | 0.41 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9751 | 0.9674 | 0.9598 | 0.9538 |
+| sift1M_large | 0.9767 | 0.9673 | 0.9603 | 0.9540 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9291 / 2168K | 0.9773 / 1188K | 0.9944 / 562K | 0.9988 / 179K | 0.9997 / 68K |
+| ours sift1M_large | 0.8984 / 1941K | 0.9630 / 897K | 0.9888 / 532K | 0.9973 / 189K | 0.9994 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +7.4% (22.80 → 21.11 s, 1.83× CAGRA native), 1M-auto −0.6% (path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

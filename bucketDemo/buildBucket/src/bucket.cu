@@ -3607,6 +3607,12 @@ struct ChunkedKnnAccumulator {
             cpu_mem_budget_bytes / static_cast<size_t>(desired_parallelism));
         int64_t chunk_size_from_mem = std::max<int64_t>(kMinChunkPoints,
             static_cast<int64_t>(mem_per_chunk_budget / std::max<size_t>(1, bytes_per_point)));
+        // 至少切成 desired_parallelism 个 chunk: merge 按 chunk 并行，chunk 数
+        // 少于线程数时只用得上 num_chunks 个线程 (SIFT1M: 预算推出 10 个 chunk，
+        // 80 核只用 10 个，最后一轮 merge 的等待 ~0.9 s 全露在外面)。chunk 更小
+        // 只会让每个 merge 线程的常驻内存更少，不改变内存上限。
+        chunk_size_from_mem = std::min<int64_t>(chunk_size_from_mem,
+            std::max<int64_t>(1, (N + desired_parallelism - 1) / desired_parallelism));
 
         int64_t kMaxOpenChunks = 512;  // getrlimit 失败时的兜底默认值
         {
@@ -5807,6 +5813,32 @@ int run_pipeline_impl(
                 if (!out.good())
                     throw std::runtime_error("Inline reorder: failed writing " + data_reordered_path);
                 gres->permute(reorder_info.inverse_perm);
+            } else if (static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= config.cpu_limit_bytes / 4) {
+                // out-of-core 但原始数据 (两份: 读入 + 重排后) 放得进 CPU 预算的
+                // 1/4: 跟 GPU-resident 一样整份读入、按 inverse_perm 并行重排、一次
+                // 顺序写出 (SIFT1M 128 MB: 1.0 s → ~0.3 s)。超预算时走下面按桶缓冲
+                // 散写的流式 writer (内存只占 bucket_vec_buffer)。
+                std::vector<DataT> raw_all;
+                int32_t n_tmp = 0, d_tmp = 0;
+                load::read_bigann_raw_range<DataT>(working_input_path, 0, N, raw_all, n_tmp, d_tmp);
+                if (static_cast<int64_t>(raw_all.size()) != N * static_cast<int64_t>(D) ||
+                    static_cast<int64_t>(reorder_info.inverse_perm.size()) != N)
+                    throw std::runtime_error("Inline reorder: size mismatch in in-memory path");
+                std::vector<DataT> reordered(raw_all.size());
+                #pragma omp parallel for schedule(static)
+                for (int64_t i = 0; i < N; ++i) {
+                    std::memcpy(reordered.data() + static_cast<size_t>(i) * D,
+                                raw_all.data() + static_cast<size_t>(reorder_info.inverse_perm[i]) * D,
+                                static_cast<size_t>(D) * sizeof(DataT));
+                }
+                raw_all = std::vector<DataT>();
+                std::ofstream out(data_reordered_path, std::ios::binary | std::ios::trunc);
+                int32_t hdr[2] = {static_cast<int32_t>(N), static_cast<int32_t>(D)};
+                out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+                out.write(reinterpret_cast<const char*>(reordered.data()),
+                          static_cast<std::streamsize>(reordered.size() * sizeof(DataT)));
+                if (!out.good())
+                    throw std::runtime_error("Inline reorder: failed writing " + data_reordered_path);
             } else {
                 auto writer = reordered_io::ReorderedDatasetWriter<DataT>::create(
                     data_reordered_path, D, n_centroids,
