@@ -1224,7 +1224,7 @@ Borderline → large rerun (`runs/iter38/sift1M_large_b`): 13.98 s (+5.6%), reca
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +6.1% (12.67 → 11.90 s, 1.03× CAGRA native), 1M-auto +0.4% (path untouched). Large GPU peak 2052 MiB in one rep (the known bucket-size outlier, #9), within the gate.
 
-### #43 — Step 1 single raw read + parallel u8→f32; Step 2 pinned, reused KMeans|| train-subset buffer  (2026-10-21, commit TBD)
+### #43 — Step 1 single raw read + parallel u8→f32; Step 2 pinned, reused KMeans|| train-subset buffer  (2026-10-21, commit ca281b6)
 **Idea / rationale:** temporary timers showed host-side overheads in both paths. (1) Step 2: before the GPU work, each round built the KMeans|| training subset in a fresh `std::vector<float>`, and the `resize` zero-filled and page-faulted 128 MB on one thread (0.09 s/round, 0.15–0.40 s for the whole subsample). The subset now goes into a pinned `cudaHostAlloc` buffer, allocated once with 5% slack and reused across rounds; the parallel gather writes into it, and the H2D upload is from pinned memory. (2) Step 1: `sample_from` spent 0.56 s in `read_u8bin_to_f32` (single-threaded convert), and the GPU-resident / out-of-core host-raw path then read the whole file again. For u8 data the file is now read once into `raw_host` and converted to float in parallel; `raw_host` is freed if neither user needs it. This follows cuVS 26.12 `ivf_pq_build.cuh` / `cagra_build.cuh`, which stage host batches through pinned buffers that are reused, not reallocated per batch.
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
