@@ -39,8 +39,8 @@ After **#18 (prune_windowed: batched positions + parallel bulk load)**, 2026-10-
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **16.24** | see #18 tables | |
-| SIFT1M large (out-of-core path) | **34.12** | see #18 tables | |
+| SIFT1M auto (GPU-resident) | **16.24** | 0.9288 / 0.9770 / 0.9943 | 1948K / 1034K |
+| SIFT1M large (out-of-core path) | **34.12** | 0.8974 / 0.9618 / 0.9884 | 1946K / 931K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 (auto 16.24 vs 16.17 after #13: path untouched since, run-to-run noise.)
