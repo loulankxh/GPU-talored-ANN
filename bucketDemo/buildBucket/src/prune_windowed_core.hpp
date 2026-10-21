@@ -45,6 +45,8 @@ struct PointData {
 // (typically center bucket + its centroid-knn neighbors). O(1) average
 // lookup; this is the CPU-side counterpart of the device kernel's sorted
 // array + binary search (a hash map isn't available in device code).
+// Per-point hash map -- kept for the standalone unit test (arbitrary,
+// non-contiguous windows). prune_windowed itself uses BucketWindow below.
 class WindowLookup {
 public:
     void clear() { map_.clear(); }
@@ -61,9 +63,64 @@ public:
         auto it = map_.find(global_id);
         return it == map_.end() ? nullptr : &it->second;
     }
+    bool get(uint32_t global_id, PointData& out) const {
+        const PointData* p = find(global_id);
+        if (!p) return false;
+        out = *p;
+        return true;
+    }
     size_t size() const { return map_.size(); }
 private:
     std::unordered_map<uint32_t, PointData> map_;
+};
+
+// Bucket-granular window: the reordered id space is contiguous per bucket
+// (bucket at processing position p owns [offsets[p], offsets[p+1])), so
+// membership is just "is the bucket containing id in the window" -- resolved
+// by a binary search over bucket_offsets + one slot per *bucket* (not per
+// point). Replaces the per-position unordered_map build (serial, ~(K+1)x
+// bucket rows inserted per position) and its teardown. Memory: n_buckets
+// slots, independent of N.
+class BucketWindow {
+public:
+    BucketWindow(const uint32_t* offsets, int32_t n_buckets)
+        : offsets_(offsets), n_buckets_(n_buckets), slots_(static_cast<size_t>(n_buckets)) {}
+    void clear() {
+        for (int32_t p : active_) slots_[static_cast<size_t>(p)] = Slot{};
+        active_.clear();
+    }
+    // Registers bucket at processing position `pos` (rows [offsets[pos],
+    // offsets[pos+1])) with its candidate rows (stride M) and vectors (stride D).
+    void add_bucket(int32_t pos, const int32_t* candidates, int32_t M,
+                    const float* vectors, int32_t D) {
+        if (pos < 0 || pos >= n_buckets_)
+            throw std::runtime_error("BucketWindow::add_bucket: pos out of range");
+        Slot& s = slots_[static_cast<size_t>(pos)];
+        if (!s.candidates) active_.push_back(pos);
+        s = Slot{candidates, vectors, M, D};
+    }
+    bool get(uint32_t global_id, PointData& out) const {
+        if (global_id >= offsets_[n_buckets_]) return false;   // bounds check: out-of-range id
+        // last p with offsets[p] <= id
+        const uint32_t* it = std::upper_bound(offsets_, offsets_ + n_buckets_ + 1, global_id);
+        int32_t p = static_cast<int32_t>(it - offsets_) - 1;
+        const Slot& s = slots_[static_cast<size_t>(p)];
+        if (!s.candidates) return false;
+        size_t row = global_id - offsets_[p];
+        out.candidates = s.candidates + row * static_cast<size_t>(s.M);
+        out.vector = s.vectors + row * static_cast<size_t>(s.D);
+        return true;
+    }
+private:
+    struct Slot {
+        const int32_t* candidates = nullptr;
+        const float* vectors = nullptr;
+        int32_t M = 0, D = 0;
+    };
+    const uint32_t* offsets_;
+    int32_t n_buckets_;
+    std::vector<Slot> slots_;
+    std::vector<int32_t> active_;
 };
 
 // Row-local L2 sort: point a_id's own M_in raw candidates, sorted ascending
@@ -73,29 +130,31 @@ private:
 // which by construction (bucket2's nprobe-bounded search) should almost
 // always already be in the window. A candidate whose vector isn't resident
 // is conservatively sorted to the back (never wrongly treated as "close").
+template <class Window>
 inline void sort_row_by_l2(
     uint32_t a_id, const int32_t* a_candidates_raw, int32_t M_in, int32_t D,
-    const WindowLookup& window,
+    const Window& window,
     std::vector<int32_t>& out_sorted)   // resized to M_in, -1 = padding, ascending distance
 {
-    const PointData* a = window.find(a_id);
-    if (!a)
+    PointData a;
+    if (!window.get(a_id, a))
         throw std::runtime_error("sort_row_by_l2: point " + std::to_string(a_id) +
                                  " itself not resident (bug: center bucket must always be loaded)");
-    const float* a_vec = a->vector;
+    const float* a_vec = a.vector;
 
     struct Cand { float dist; int32_t id; };
-    std::vector<Cand> cands;
+    thread_local std::vector<Cand> cands;
+    cands.clear();
     cands.reserve(static_cast<size_t>(M_in));
     for (int32_t k = 0; k < M_in; ++k) {
         int32_t id = a_candidates_raw[k];
         if (id < 0) continue;
-        const PointData* c = window.find(static_cast<uint32_t>(id));
+        PointData c;
         float dist;
-        if (c) {
+        if (window.get(static_cast<uint32_t>(id), c)) {
             float acc = 0.f;
             for (int32_t x = 0; x < D; ++x) {
-                float diff = a_vec[x] - c->vector[x];
+                float diff = a_vec[x] - c.vector[x];
                 acc += diff * diff;
             }
             dist = acc;
@@ -117,26 +176,54 @@ inline void sort_row_by_l2(
 // A's closer candidates D (rank kAD < kAB) also have B in their own
 // candidate row. D resolved through `window`; D outside it contributes 0
 // (see file header for why that's conservative, not incorrect).
+//
+// Instead of the O(M^3) "for each (D, B) scan D's row" triple loop, A's
+// row goes into a small open-addressing table (id -> rank, duplicates kept
+// as separate entries) and each D's row is streamed once against it:
+// O(M^2) probes. A per-rank stamp (= last kAD that counted it) keeps the
+// "count (D, B) at most once" semantics of the original loop even if D's row
+// holds B twice, so the counts are identical.
+template <class Window>
 inline void compute_detour_counts(
     const int32_t* a_sorted_candidates, int32_t M_in,
-    const WindowLookup& window,
+    const Window& window,
     std::vector<uint32_t>& detour_count_out)   // resized to M_in
 {
     detour_count_out.assign(static_cast<size_t>(M_in), 0);
+    uint32_t cap = 16;
+    while (cap < 2u * static_cast<uint32_t>(M_in)) cap <<= 1;
+    const uint32_t mask = cap - 1;
+    thread_local std::vector<int32_t> tkey, trank, stamp;
+    tkey.assign(cap, -1);
+    trank.resize(cap);
+    stamp.assign(static_cast<size_t>(M_in), -1);
+    auto hash = [mask](int32_t id) { return (static_cast<uint32_t>(id) * 2654435761u) & mask; };
+    for (int32_t k = 0; k < M_in; ++k) {
+        int32_t id = a_sorted_candidates[k];
+        if (id < 0) continue;
+        uint32_t h = hash(id);
+        while (tkey[h] >= 0) h = (h + 1) & mask;
+        tkey[h] = id;
+        trank[h] = k;
+    }
+
     for (int32_t kAD = 0; kAD < M_in - 1; ++kAD) {
         int32_t d_id = a_sorted_candidates[kAD];
         if (d_id < 0) continue;
-        const PointData* d = window.find(static_cast<uint32_t>(d_id));
-        if (!d) continue;   // D outside window: no detour info, conservative skip
+        PointData d;
+        if (!window.get(static_cast<uint32_t>(d_id), d)) continue;   // D outside window: conservative skip
 
-        for (int32_t kAB = kAD + 1; kAB < M_in; ++kAB) {
-            int32_t b_id = a_sorted_candidates[kAB];
+        for (int32_t kDB = 0; kDB < M_in; ++kDB) {
+            int32_t b_id = d.candidates[kDB];
             if (b_id < 0) continue;
-            bool found = false;
-            for (int32_t kDB = 0; kDB < M_in; ++kDB) {
-                if (d->candidates[kDB] == b_id) { found = true; break; }
+            for (uint32_t h = hash(b_id); tkey[h] >= 0; h = (h + 1) & mask) {
+                if (tkey[h] != b_id) continue;
+                int32_t kAB = trank[h];
+                if (kAB > kAD && stamp[static_cast<size_t>(kAB)] != kAD) {
+                    stamp[static_cast<size_t>(kAB)] = kAD;
+                    detour_count_out[static_cast<size_t>(kAB)]++;
+                }
             }
-            if (found) detour_count_out[static_cast<size_t>(kAB)]++;
         }
     }
 }
@@ -173,14 +260,15 @@ inline void select_pruned_row(
 }
 
 // Convenience: the three steps above, composed for one point.
+template <class Window>
 inline void prune_one_point(
     uint32_t a_id, const int32_t* a_candidates_raw, int32_t M_in, int32_t D,
-    const WindowLookup& window, int32_t output_degree,
+    const Window& window, int32_t output_degree,
     uint32_t* out_row)
 {
-    std::vector<int32_t> sorted;
+    thread_local std::vector<int32_t> sorted;
     sort_row_by_l2(a_id, a_candidates_raw, M_in, D, window, sorted);
-    std::vector<uint32_t> detour;
+    thread_local std::vector<uint32_t> detour;
     compute_detour_counts(sorted.data(), M_in, window, detour);
     select_pruned_row(sorted.data(), M_in, detour, output_degree, out_row);
 }

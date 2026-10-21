@@ -65,6 +65,7 @@ namespace fs = std::filesystem;
 // in the reordered id space. This is the BeladyBucketCache's BucketT.
 // ---------------------------------------------------------------------
 struct BucketWindowBlock {
+    int32_t pos = 0;   // processing position (index into bucket_offsets)
     int64_t first_global_id = 0;
     int64_t count = 0;
     int32_t M_in = 0;
@@ -189,6 +190,7 @@ int main(int argc, char** argv)
             uint32_t hi = offsets_new[static_cast<size_t>(pos) + 1];
 
             BucketWindowBlock blk;
+            blk.pos = pos;
             blk.first_global_id = lo;
             blk.count = static_cast<int64_t>(hi - lo);
             blk.M_in = M_in;
@@ -236,6 +238,8 @@ int main(int argc, char** argv)
         // path even with high thread counts, so they're worth isolating
         // explicitly rather than assuming the OMP region dominates just
         // because it's the only parallel part.
+        prune_windowed::BucketWindow window(offsets_new.data(), n_buckets);
+
         double t_fetch = 0, t_window_build = 0, t_compute = 0, t_write = 0;
         int64_t min_center_count = std::numeric_limits<int64_t>::max(), max_center_count = 0;
 
@@ -277,29 +281,15 @@ int main(int argc, char** argv)
             }
             t_fetch += std::chrono::duration<double>(Clock::now() - tf0).count();
 
-            // Deliberately *not* hoisted+reused across positions: measured
-            // slower that way (7.8s vs 4.5s here on Sift1M). Bucket size is
-            // wildly skewed (min=1, max=705, avg=100 in that run) --
-            // unordered_map's bucket-array capacity only ever grows, never
-            // shrinks, so the first oversized position's window (up to
-            // ~700*(K+1) entries) locks in a bucket array sized for that
-            // outlier, and every *other* (typically ~100*(K+1)-sized)
-            // position then pays worse insert/clear locality hashing into a
-            // table ~10x sparser than it needs, instead of each position
-            // getting a table sized to its own actual need. A fresh map per
-            // position costs a few incremental rehashes to grow from empty,
-            // but that's cheaper than permanently inheriting one rare
-            // position's size for the other ~9999.
+            // Bucket-granular window (one slot per bucket, reused across
+            // positions): replaces the old per-position unordered_map over
+            // every window row, whose serial build + teardown cost more than
+            // the parallel compute itself.
             auto tw0 = Clock::now();
-            prune_windowed::WindowLookup window;
-            for (const auto* blkp : position_scratch) {
-                const auto& blk = *blkp;
-                for (int64_t k = 0; k < blk.count; ++k) {
-                    window.add(static_cast<uint32_t>(blk.first_global_id + k),
-                              blk.candidates.data() + k * blk.M_in,
-                              blk.vectors.data() + k * blk.D);
-                }
-            }
+            window.clear();
+            for (const auto* blkp : position_scratch)
+                window.add_bucket(blkp->pos, blkp->candidates.data(), blkp->M_in,
+                                  blkp->vectors.data(), blkp->D);
             t_window_build += std::chrono::duration<double>(Clock::now() - tw0).count();
 
             const BucketWindowBlock& center = *position_scratch[0];
@@ -324,7 +314,8 @@ int main(int argc, char** argv)
                 for (int32_t k = 0; k < M_in; ++k) {
                     if (raw[k] < 0) continue;
                     total_lookups++;
-                    if (window.find(static_cast<uint32_t>(raw[k]))) total_hits++;
+                    prune_windowed::PointData pd;
+                    if (window.get(static_cast<uint32_t>(raw[k]), pd)) total_hits++;
                 }
 
                 prune_windowed::prune_one_point(
