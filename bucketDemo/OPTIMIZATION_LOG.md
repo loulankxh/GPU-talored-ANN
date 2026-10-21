@@ -1431,7 +1431,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +11.6% (157.00 → 138.79 s, 1.13× CAGRA native), 1M-auto +0.3%, 1M-large −1.8% (rerun; within the 3% tolerance).
 
-### #51 — KMeans|| training subset fraction 0.25 → 0.10  (2026-10-21, commit TBD)
+### #51 — KMeans|| training subset fraction 0.25 → 0.10  (2026-10-21, commit 7a74a8b)
 **Idea / rationale:** Step 2 runs KMeans|| D² oversampling on a Bernoulli(F) subset of the working set (#14; cost ∝ train points × candidates). F=0.25 was picked on SIFT1M only (#14 sweep); at SIFT10M the subset is 2.5M points and Step 2 was 34.8 s (KMeans|| 10.4 s/round). Same as cuVS 26.12 IVF-PQ `kmeans_trainset_fraction` (`ivf_pq/ivf_pq_build.cuh`), which trains on a fixed fraction. The centroid count stays N·centroid_ratio, the centroids are still real data points, and the subset still has > 4× centroids (SIFT1M 100K vs 10K; SIFT10M 1M vs 100K).
 **Files:** none  **Params changed:** `BUCKET2_EXTRA`: `--kmeans-train-fraction 0.25` → `0.10`
 **Effect:** SIFT10M Step 2 34.8 → 15.1 s; SIFT1M auto Step 2 0.66 → 0.36 s; pre-prune KNN recall and final search recall unchanged within noise.
