@@ -1,0 +1,81 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index e7458b4..d4249ab 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -2947,24 +2947,50 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
+         s_id  [warp][lane * K_PER_LANE + p] = reg_id[p];
+     }
+     __syncthreads();
+-    if (warp != 0) return;
+ 
+-    for (int w = 1; w < G; ++w) {
+-        for (int base = 0; base < K_OUT; base += LANES) {
+-            float my_dist = s_dist[w][base + lane];
+-            int32_t my_id = s_id[w][base + lane];
+-            unsigned mask = __ballot_sync(ALL, my_dist < threshold);
+-            while (mask) {
+-                int src = __ffs(mask) - 1;
+-                mask &= mask - 1;
+-                float   c_dist = __shfl_sync(ALL, my_dist, src);
+-                int32_t c_id   = __shfl_sync(ALL, my_id, src);
+-                if (c_dist >= threshold) continue;
+-                warp_topk_insert<K_PER_LANE>(reg_dist, reg_id, c_dist, c_id, lane);
+-                threshold = __shfl_sync(ALL, reg_dist[K_PER_LANE - 1], LANES - 1);
++    // G 份各自升序的 top-K 列表做树形归并 (G → G/2 → … → 1)：每层每对列表由
++    // 一个 warp 用 merge-path (co-rank 二分) 并行算出合并后的前 K_OUT 个，
++    // 每 lane 负责 K_PER_LANE 个输出位置。原来是 warp 0 把其余 (G-1)*K_OUT 个
++    // 候选逐个 ballot + 移位插入，串行 ~几百次插入，占了这个 kernel 的大头。
++    // 同距离时 A (低编号 warp) 在前，结果集合跟原来一致，只有并列项的先后可能不同。
++    for (int step = 1; step < G; step <<= 1) {
++        float   o_dist[K_PER_LANE];
++        int32_t o_id  [K_PER_LANE];
++        const bool active = (warp % (2 * step) == 0) && (warp + step < G);
++        if (active) {
++            const float*   Ad = s_dist[warp];        const int32_t* Ai = s_id[warp];
++            const float*   Bd = s_dist[warp + step]; const int32_t* Bi = s_id[warp + step];
++            #pragma unroll
++            for (int p = 0; p < K_PER_LANE; ++p) {
++                const int k = lane * K_PER_LANE + p;   // 输出第 k 小 (0-based)
++                // i = 前 k+1 个合并结果里来自 A 的个数
++                int lo = max(0, k + 1 - K_OUT), hi = min(k + 1, K_OUT);
++                while (lo < hi) {
++                    int i = (lo + hi) >> 1;
++                    int j = k + 1 - i;
++                    // A 取 i 个太少 ⇔ B[j-1] 严格大于 A[i] (A 优先)
++                    if (j > 0 && i < K_OUT && Ad[i] <= Bd[j - 1]) lo = i + 1;
++                    else hi = i;
++                }
++                const int i = lo, j = k + 1 - i;
++                // 第 k 个 = A[i-1] 与 B[j-1] 中较晚出现的那个
++                // (相等时 B 在合并序里更靠后，所以取 B)
++                const bool fromA = (j == 0) || (i > 0 && Ad[i - 1] > Bd[j - 1]);
++                o_dist[p] = fromA ? Ad[i - 1] : Bd[j - 1];
++                o_id[p]   = fromA ? Ai[i - 1] : Bi[j - 1];
++            }
++        }
++        __syncthreads();
++        if (active) {
++            #pragma unroll
++            for (int p = 0; p < K_PER_LANE; ++p) {
++                s_dist[warp][lane * K_PER_LANE + p] = o_dist[p];
++                s_id  [warp][lane * K_PER_LANE + p] = o_id[p];
+             }
+         }
++        __syncthreads();
+     }
++    if (warp != 0) return;
+ 
+     const int64_t out_row = static_cast<int64_t>(ids_pool[q]) * out_ld;
+     const float q_norm = norms_pool[q];
+@@ -2972,9 +2998,9 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
+     #pragma unroll
+     for (int p = 0; p < K_PER_LANE; ++p) {
+         if (base + p < K) {
+-            int32_t local = reg_id[p];
++            int32_t local = s_id[0][base + p];
+             out_neighbors[out_row + base + p] = (local >= 0) ? ids_pool[local] : -1;
+-            out_dists[out_row + base + p]     = (local >= 0) ? reg_dist[p] + q_norm : INFINITY;
++            out_dists[out_row + base + p]     = (local >= 0) ? s_dist[0][base + p] + q_norm : INFINITY;
+         }
+     }
+ }
