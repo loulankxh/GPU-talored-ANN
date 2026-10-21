@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#3 (translate_ids: bounded in-memory output window instead of per-row pwrite)**, 2026-10-21:
+After **#4 (bucket2 `--skip-npy`: don't write the unused neighbors.npy)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **20.01** | 0.9300 / 0.9779 / 0.9947 | 1948K / 1035K |
-| SIFT1M large (out-of-core path) | **56.36** | 0.8988 / 0.9620 / 0.9885 | 2000K / 1033K |
+| SIFT1M auto (GPU-resident) | **19.18** | 0.9303 / 0.9781 / 0.9948 | 1943K / 1035K |
+| SIFT1M large (out-of-core path) | **55.44** | 0.8971 / 0.9619 / 0.9891 | 1996K / 949K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -57,13 +57,13 @@ From the IVF-PQ CAGRA build (cuVS 26.12 `neighbors/detail/cagra/cagra_build.cuh:
 - ACE (`detail/cagra/cagra_ace.cuh`): cuVS's own partitioned out-of-core CAGRA build — check its partition I/O and per-partition graph merge for ideas for `prune_windowed` / `optimize_chunked`.
 
 Other:
-- Skip the `neighbors.npy` conversion inside bucket2's "Write" step (the pipeline never reads it) or make it optional.
 - SIFT10M Step 2 (centroid selection on the full 10M working set) is far slower than on 1M — sample before kmeans|| (cuVS kmeans uses a sampled init); compare `cpp/src/cluster/detail/kmeans_balanced.cuh` / `kmeans.cuh` init.
 - Step 4.5 inline reorder and Step 6 `pool_build` / `scatter_pending` dominate the SIFT10M out-of-core loop — overlap host gather with GPU work (pinned staging, double buffering).
 - Large path quality gap (prune_windowed vs cuVS optimize): SIFT1M recall@10 at itopk 32 is ~3 points below CAGRA — study `cpp/src/neighbors/detail/cagra/graph_core.cuh` (`optimize`: detour counting / rank-based pruning / reverse-edge merge) and align `prune_windowed_core.hpp` + `optimize_chunked` method E with it.
 - `optimize` (resident) spends most of its time in file load + sanitize, not in the cuVS call.
 - `prune_windowed` after #2 (3.9s): compute 2.6s forks an OMP region per bucket of ~100 rows on 80 threads — process several positions per parallel region, or move the detour count to GPU (cuVS `kern_fused_prune`). Store cached vectors as u8 (4x less cache memory → fewer evictions on SIFT10M); keep the dataset handle open in the loader.
-- Resident `optimize` (2.1s) — check load + sanitize vs the cuVS call; bucket2 "Write (close + .npy convert)" (1.4–2.2s) writes `neighbors.npy` that nothing reads.
+- Resident `optimize` (2.1s) — check load + sanitize vs the cuVS call.
+- bucket2 still writes `vector_dists.bin` (256 MB on SIFT1M) that no later stage reads — same treatment as #4 (`--skip-dists`), check `knn_similarity.py` / eval don't need it first.
 - bucket2 Step 6 (large path, 22–26s) is the largest single step of the large path.
 
 ## Tried & rejected
@@ -222,6 +222,45 @@ prune_windowed breakdown: fetch 0.98s (was 3.74), compute 2.60s, wall 3.88s (was
 [exited with code 0]
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-auto +6.1% (21.30 → 20.01 s), 1M-large +1.4% (57.14 → 56.36 s; translate 2.16 → 0.44 s, offset by bucket2 noise).
+
+### #4 — bucket2 `--skip-npy`: don't write the unused neighbors.npy  (2026-10-21)
+**Idea / rationale:** bucket2's "Write" step converted `vector_knn.bin` into `neighbors.npy` (int64, 512 MB on SIFT1M) for Python-side evaluation; no pipeline stage reads it (optimize / prune_windowed / knn_similarity all read `vector_knn.bin`). New flag `--skip-npy` (default off, so standalone behaviour is unchanged) skips it on both the GPU-resident (`GpuResidentKnn::write_outputs`) and out-of-core (`convert_vector_knn_to_npy`) paths; `params.sh` sets `BUCKET2_EXTRA="--skip-npy"`. cuVS's CAGRA build likewise only emits the graph it needs. Write step: 1.41 → 0.76 s (auto), 2.22 → 1.09 s (large); bucket2 peak RSS on auto 2.06 → 1.58 GB (no int64 copy).
+**Files:** `src/bucket.cu`  **Params changed:** `BUCKET2_EXTRA="--skip-npy"`
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 19.18 | +4.1% | +11.8% | 1.66x | bucket2 16.71, optimize 2.08, translate 0.35 | 4120 | 1.58 |
+| sift1M_large | large | 55.44 | +1.6% | +26.2% | 4.80x | bucket2 46.03, prune 3.95, optimize_chunked 5.26, translate 0.45 | 1910 | 4.24 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.73 | 3.38 | 1.27 | 0.00 | 3.25 | 1.12 | 0.02 | 5.65 | 0.00 | 0.76 |
+| sift1M_large | 0.55 | 5.12 | 1.79 | 0.00 | 9.30 | 1.76 | 0.03 | 23.21 | 2.61 | 1.09 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9934 | 0.9891 | 0.9864 | 0.9839 |
+| sift1M_large | 0.9922 | 0.9894 | 0.9866 | 0.9840 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9303 / 1943K | 0.9781 / 1035K | 0.9948 / 495K | 0.9988 / 187K | 0.9997 / 68K |
+| ours sift1M_large | 0.8971 / 1996K | 0.9619 / 949K | 0.9891 / 485K | 0.9974 / 189K | 0.9994 / 67K |
+
+[exited with code 0]
+
+Borderline auto gain → rerun (`runs/iter4/sift1M_auto_b`): 19.40 s, +3.05% → also ACCEPT.
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +4.1% / +3.05% on rerun (20.01 → 19.18 s), 1M-large +1.6% (56.36 → 55.44 s).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

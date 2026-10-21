@@ -117,6 +117,10 @@ struct LoadConfig {
     // KNN graph parameters
     uint32_t knn_k;                // KNN graph degree for centroids, range [1, 1000], default 32
 
+    // Output
+    bool save_npy;                 // 额外写 neighbors.npy (int64, 给 Python 端评测用), default true;
+                                   // 构建流水线本身不读它
+
     static constexpr uint32_t MAX_KNN_K = 1000;
 
     // Constructor with safe defaults
@@ -134,7 +138,8 @@ struct LoadConfig {
         use_pq(false),
         seed(42),
         gpu_safety_margin(0.1f),
-        knn_k(32)
+        knn_k(32),
+        save_npy(true)
     {}
 };
 
@@ -544,6 +549,9 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
     }
     if (vm.count("use-pq")) {
         config.use_pq = vm["use-pq"].as<bool>();
+    }
+    if (vm.count("skip-npy")) {
+        config.save_npy = !vm["skip-npy"].as<bool>();
     }
     if (vm.count("pq-bits-start")) {
         config.pq_bits_start = vm["pq-bits-start"].as<uint32_t>();
@@ -3110,7 +3118,7 @@ struct GpuResidentKnn {
                   << "s) merge=" << t_merge << "s\n";
     }
 
-    // 最终结果只下载一次，三个文件并行写
+    // 最终结果只下载一次，三个文件并行写 (npy_path 为空则不写 .npy)
     void write_outputs(const std::string& knn_path, const std::string& dist_path,
                        const std::string& npy_path) const {
         size_t nm = static_cast<size_t>(N) * M;
@@ -3129,7 +3137,7 @@ struct GpuResidentKnn {
         };
         auto f_knn  = std::async(std::launch::async, [&] { write_bin(knn_path, h_n.data(), nm * sizeof(int32_t)); });
         auto f_dist = std::async(std::launch::async, [&] { write_bin(dist_path, h_d.data(), nm * sizeof(float)); });
-        {
+        if (!npy_path.empty()) {
             std::vector<int64_t> h64(nm);
             #pragma omp parallel for schedule(static)
             for (int64_t i = 0; i < static_cast<int64_t>(nm); ++i) h64[i] = h_n[i];
@@ -5406,8 +5414,9 @@ int run_pipeline_impl(
         if (gres) {
             auto t_write = Clock::now();
             gres->write_outputs(output_dir + "/vector_knn.bin", output_dir + "/vector_dists.bin",
-                                output_dir + "/neighbors.npy");
-            std::cout << "[WriteVectorKNN] Saved vector_knn.bin / vector_dists.bin / neighbors.npy\n";
+                                config.save_npy ? output_dir + "/neighbors.npy" : std::string());
+            std::cout << "[WriteVectorKNN] Saved vector_knn.bin / vector_dists.bin"
+                      << (config.save_npy ? " / neighbors.npy" : " (--skip-npy)") << "\n";
             elapsed_write_knn = std::chrono::duration<double>(Clock::now() - t_write).count();
         } else if (neighbors_m > 0) {
             auto t_write = Clock::now();
@@ -5417,10 +5426,12 @@ int run_pipeline_impl(
 
             // 分块把 vector_knn.bin 转成 neighbors.npy，给 Python 端评测用
             // (纯顺序拷贝+类型转换，不需要整份常驻内存)
-            convert_vector_knn_to_npy(
-                output_dir + "/vector_knn.bin", output_dir + "/neighbors.npy",
-                N, neighbors_m, config.cpu_limit_bytes / 4);
-            std::cout << "[WriteVectorKNN] Saved neighbors.npy\n";
+            if (config.save_npy) {
+                convert_vector_knn_to_npy(
+                    output_dir + "/vector_knn.bin", output_dir + "/neighbors.npy",
+                    N, neighbors_m, config.cpu_limit_bytes / 4);
+                std::cout << "[WriteVectorKNN] Saved neighbors.npy\n";
+            }
             elapsed_write_knn = std::chrono::duration<double>(Clock::now() - t_write).count();
         }
 
@@ -5547,6 +5558,9 @@ int main(int argc, char** argv) {
             ("sample-rate",   po::value<float>(),      "Sampling ratio (default 0.1)")
             ("centroid-ratio", po::value<float>(),     "Centroid ratio (default 0.01)")
             ("use-pq",        po::value<bool>(),       "Force PQ quantization")
+            ("skip-npy",      po::bool_switch()->default_value(false),
+                "Don't write neighbors.npy (vector_knn.bin as int64 NumPy, only for Python-side eval; "
+                "the build pipeline never reads it)")
             ("pq-bits-start", po::value<uint32_t>(),   "PQ starting bits (default 8)")
             ("pq-bits-min",   po::value<uint32_t>(),   "PQ minimum bits (default 4)")
             ("seed",          po::value<uint32_t>(),   "Random seed (default 42)")

@@ -16,7 +16,7 @@ CHUNKED_GPU_BUDGET_MB=16000
 CHUNKED_EDGE_BUFFER_MB=16000
 
 # extra flags appended verbatim (keep empty unless an optimization needs them)
-BUCKET2_EXTRA=""
+BUCKET2_EXTRA="--skip-npy"
 OPTIMIZE_EXTRA="--skip-sort"
 PRUNE_EXTRA=""
 CHUNKED_EXTRA=""
