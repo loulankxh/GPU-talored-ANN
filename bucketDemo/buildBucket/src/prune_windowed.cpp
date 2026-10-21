@@ -298,20 +298,28 @@ int main(int argc, char** argv)
             const int32_t D_all = dataset_D_peek;
             const size_t n_cand = static_cast<size_t>(N) * M_in;
             const size_t n_vec  = static_cast<size_t>(N) * D_all;
+            const bool u8_data = (dataset_ext == ".u8bin" || dataset_ext == ".i8bin");
+            // GPU 路径只读原始 u8 字节: 先判定，走 GPU 时不再分配 / 转换整份 float 向量
+            // (SIFT10M: 5.1 GB 内存 + 一遍转换，GPU kernel 根本不用)
+            const int32_t Wmax = static_cast<int32_t>(ck.K) + 1;
+            const bool use_gpu = u8_data &&
+                prune_windowed_gpu::available(N, M_in, D_all, n_buckets, Wmax, output_degree);
             std::unique_ptr<int32_t[]> all_cand_buf(new int32_t[n_cand]);   // 不初始化，pread 直接填
-            std::unique_ptr<float[]>   all_vec_buf(new float[n_vec]);
+            std::unique_ptr<float[]>   all_vec_buf(use_gpu ? nullptr : new float[n_vec]);
             std::unique_ptr<uint8_t[]> raw_u8;   // u8 数据集时保留原始字节给 GPU kernel
             // vector_knn.bin: int64 N + int32 M header (12 B)，之后 (N, M) int32
             parallel_pread(vknn_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
                            n_cand * sizeof(int32_t), all_cand_buf.get());
-            if (dataset_ext == ".u8bin" || dataset_ext == ".i8bin") {
+            if (u8_data) {
                 // 跟 load::read_u8bin_chunk_to_f32 同样的转换 (按 uint8 读)，并行做
                 raw_u8.reset(new uint8_t[n_vec]);
                 parallel_pread(dataset_path, static_cast<off_t>(2 * sizeof(int32_t)), n_vec, raw_u8.get());
-                float* out = all_vec_buf.get();
-                #pragma omp parallel for schedule(static)
-                for (int64_t i = 0; i < static_cast<int64_t>(n_vec); ++i)
-                    out[i] = static_cast<float>(raw_u8[static_cast<size_t>(i)]);
+                if (!use_gpu) {
+                    float* out = all_vec_buf.get();
+                    #pragma omp parallel for schedule(static)
+                    for (int64_t i = 0; i < static_cast<int64_t>(n_vec); ++i)
+                        out[i] = static_cast<float>(raw_u8[static_cast<size_t>(i)]);
+                }
             } else {
                 std::vector<float> tmp;
                 int32_t D_tmp = 0;
@@ -335,8 +343,7 @@ int main(int argc, char** argv)
             // ---- GPU fast path (u8 数据, M_in ≤ 64, 放得进显存): 同样的窗口语义，
             // 一个 warp 一个点 (见 prune_windowed_gpu.cu)。窗口 = 处理位置 p 自己
             // + 它的 centroid-knn 近邻桶所在的位置，按位置排序去重。
-            const int32_t Wmax = static_cast<int32_t>(ck.K) + 1;
-            if (raw_u8 && prune_windowed_gpu::available(N, M_in, D_all, n_buckets, Wmax, output_degree)) {
+            if (use_gpu) {
                 auto tg0 = Clock::now();
                 std::vector<int32_t> win(static_cast<size_t>(n_buckets) * Wmax, std::numeric_limits<int32_t>::max());
                 std::vector<int32_t> win_len(static_cast<size_t>(n_buckets), 0);
@@ -353,14 +360,19 @@ int main(int argc, char** argv)
                     len = static_cast<int32_t>(std::unique(wp, wp + len) - wp);
                     win_len[static_cast<size_t>(pos)] = len;
                 }
-                std::vector<uint32_t> out_rows(static_cast<size_t>(N) * output_degree);
+                // 结果按行块经 pinned 暂存区直接流给 writer (不再先拷进一份 N*out_deg
+                // 的 host buffer 再写)；写盘时间跟后续块的 D2H 重叠
+                double t_sink = 0;
                 prune_windowed_gpu::run(all_cand, raw_u8.get(), N, M_in, D_all,
                                         offsets_new.data(), n_buckets, win, win_len, Wmax,
-                                        output_degree, out_rows.data());
-                t_compute += std::chrono::duration<double>(Clock::now() - tg0).count();
-                auto tr0 = Clock::now();
-                writer.write_rows(out_rows.data(), 0, N);
-                t_write += std::chrono::duration<double>(Clock::now() - tr0).count();
+                                        output_degree,
+                                        [&](const uint32_t* rows, int64_t row0, int64_t n) {
+                                            auto tw0 = Clock::now();
+                                            writer.write_rows(rows, row0, n);
+                                            t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
+                                        });
+                t_write += t_sink;
+                t_compute += std::chrono::duration<double>(Clock::now() - tg0).count() - t_sink;
                 min_center_count = max_center_count = 0;
                 std::cout << "  mode=batched+GPU\n";
                 goto pruned_done;

@@ -25,6 +25,8 @@
 #include <cuda_runtime.h>
 
 #include "prune_windowed_gpu.hpp"
+#include <cstring>
+#include <algorithm>
 
 namespace {
 
@@ -201,10 +203,73 @@ bool available(int64_t N, int M, int D, int n_buckets, int W, int out_deg)
     return need < free_b * 0.8;
 }
 
+// 大块传输经两块 pinned 暂存区双缓冲 (cuVS 26.12 cagra_build.cuh::build_knn_graph
+// 处理 host batch 的同一做法): 多线程把下一块拷进 pinned 区的同时，上一块在 DMA。
+// 原来整份 pageable cudaMemcpy (SIFT10M: 3.84 GB 上传 1.37 s ≈ 2.8 GB/s)，结果再
+// 拷回一块新分配的 1.28 GB pageable buffer (清零 0.9 s + D2H 0.8 s) 之后才写盘。
+namespace {
+struct Staging {
+    static constexpr size_t kChunk = size_t(64) << 20;
+    void* pin[2] = {nullptr, nullptr};
+    cudaEvent_t ev[2] = {nullptr, nullptr};
+    bool used[2] = {false, false};
+    cudaStream_t st = nullptr;
+    Staging() {
+        PWG_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+        for (int b = 0; b < 2; ++b) {
+            PWG_CHECK(cudaMallocHost(&pin[b], kChunk));
+            PWG_CHECK(cudaEventCreateWithFlags(&ev[b], cudaEventDisableTiming));
+        }
+    }
+    ~Staging() {
+        for (int b = 0; b < 2; ++b) { cudaFreeHost(pin[b]); cudaEventDestroy(ev[b]); }
+        cudaStreamDestroy(st);
+    }
+    static void par_copy(void* dst, const void* src, size_t n) {
+        const int64_t pieces = static_cast<int64_t>((n + (size_t(1) << 20) - 1) >> 20);
+        #pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < pieces; ++i) {
+            const size_t off = static_cast<size_t>(i) << 20;
+            std::memcpy(static_cast<char*>(dst) + off, static_cast<const char*>(src) + off,
+                        std::min(size_t(1) << 20, n - off));
+        }
+    }
+    void h2d(void* d, const void* h, size_t bytes) {
+        for (size_t off = 0, k = 0; off < bytes; off += kChunk, ++k) {
+            const int b = static_cast<int>(k & 1);
+            const size_t n = std::min(kChunk, bytes - off);
+            if (used[b]) PWG_CHECK(cudaEventSynchronize(ev[b]));   // 这块 pinned 区的上一次 DMA 完成
+            par_copy(pin[b], static_cast<const char*>(h) + off, n);
+            PWG_CHECK(cudaMemcpyAsync(static_cast<char*>(d) + off, pin[b], n, cudaMemcpyHostToDevice, st));
+            PWG_CHECK(cudaEventRecord(ev[b], st));
+            used[b] = true;
+        }
+    }
+    // d 上 (N, w) 的 uint32 行 → 按行块经 pinned 区交给 sink (DMA 跟 sink 重叠)
+    void d2h_rows(const uint32_t* d, int64_t N, int w,
+                  const std::function<void(const uint32_t*, int64_t, int64_t)>& sink) {
+        PWG_CHECK(cudaStreamSynchronize(st));
+        const int64_t rows_per = std::max<int64_t>(1, static_cast<int64_t>(kChunk / (static_cast<size_t>(w) * 4)));
+        auto issue = [&](int64_t r0, int b) {
+            const int64_t n = std::min(rows_per, N - r0);
+            PWG_CHECK(cudaMemcpyAsync(pin[b], d + r0 * w, static_cast<size_t>(n) * w * 4, cudaMemcpyDeviceToHost, st));
+            PWG_CHECK(cudaEventRecord(ev[b], st));
+        };
+        if (N > 0) issue(0, 0);
+        for (int64_t r0 = 0, k = 0; r0 < N; r0 += rows_per, ++k) {
+            const int b = static_cast<int>(k & 1);
+            if (r0 + rows_per < N) issue(r0 + rows_per, b ^ 1);   // 另一块 pinned 区的 sink 已经返回
+            PWG_CHECK(cudaEventSynchronize(ev[b]));
+            sink(static_cast<const uint32_t*>(pin[b]), r0, std::min(rows_per, N - r0));
+        }
+    }
+};
+}  // namespace
+
 void run(const int32_t* h_cand, const uint8_t* h_vec, int64_t N, int M, int D,
          const uint32_t* h_offsets, int n_buckets,
          const std::vector<int32_t>& h_win, const std::vector<int32_t>& h_win_len, int W,
-         int out_deg, uint32_t* h_out)
+         int out_deg, const std::function<void(const uint32_t*, int64_t, int64_t)>& sink)
 {
     int32_t* d_cand = nullptr; uint8_t* d_vec = nullptr; uint32_t* d_off = nullptr;
     int32_t* d_win = nullptr; int32_t* d_wl = nullptr; uint32_t* d_out = nullptr; int* d_err = nullptr;
@@ -213,6 +278,7 @@ void run(const int32_t* h_cand, const uint8_t* h_vec, int64_t N, int M, int D,
         cudaFree(d_wl); cudaFree(d_out); cudaFree(d_err);
     };
     try {
+        Staging stg;
         PWG_CHECK(cudaMalloc(&d_cand, static_cast<size_t>(N) * M * sizeof(int32_t)));
         PWG_CHECK(cudaMalloc(&d_vec,  static_cast<size_t>(N) * D));
         PWG_CHECK(cudaMalloc(&d_off,  (static_cast<size_t>(n_buckets) + 1) * sizeof(uint32_t)));
@@ -220,23 +286,23 @@ void run(const int32_t* h_cand, const uint8_t* h_vec, int64_t N, int M, int D,
         PWG_CHECK(cudaMalloc(&d_wl,   h_win_len.size() * sizeof(int32_t)));
         PWG_CHECK(cudaMalloc(&d_out,  static_cast<size_t>(N) * out_deg * sizeof(uint32_t)));
         PWG_CHECK(cudaMalloc(&d_err,  sizeof(int)));
-        PWG_CHECK(cudaMemcpy(d_cand, h_cand, static_cast<size_t>(N) * M * sizeof(int32_t), cudaMemcpyHostToDevice));
-        PWG_CHECK(cudaMemcpy(d_vec,  h_vec,  static_cast<size_t>(N) * D, cudaMemcpyHostToDevice));
-        PWG_CHECK(cudaMemcpy(d_off,  h_offsets, (static_cast<size_t>(n_buckets) + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        PWG_CHECK(cudaMemcpy(d_win,  h_win.data(), h_win.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        PWG_CHECK(cudaMemcpy(d_wl,   h_win_len.data(), h_win_len.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
-        PWG_CHECK(cudaMemset(d_err, 0, sizeof(int)));
+        stg.h2d(d_cand, h_cand, static_cast<size_t>(N) * M * sizeof(int32_t));
+        stg.h2d(d_vec,  h_vec,  static_cast<size_t>(N) * D);
+        stg.h2d(d_off,  h_offsets, (static_cast<size_t>(n_buckets) + 1) * sizeof(uint32_t));
+        stg.h2d(d_win,  h_win.data(), h_win.size() * sizeof(int32_t));
+        stg.h2d(d_wl,   h_win_len.data(), h_win_len.size() * sizeof(int32_t));
+        PWG_CHECK(cudaMemsetAsync(d_err, 0, sizeof(int), stg.st));
         const int64_t blocks = (N + kWarpsPerBlock - 1) / kWarpsPerBlock;
-        prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32>>>(
+        prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
             d_cand, d_vec, d_off, d_win, d_wl, N, M, D, n_buckets, W, out_deg, d_out, d_err);
         PWG_CHECK(cudaGetLastError());
-        PWG_CHECK(cudaDeviceSynchronize());
         int h_err = 0;
-        PWG_CHECK(cudaMemcpy(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost));
+        PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
+        PWG_CHECK(cudaStreamSynchronize(stg.st));
         if (h_err)
             throw std::runtime_error("prune_windowed_gpu: fewer than output_degree valid candidates "
                                      "(check --output-degree <= M_in and padding)");
-        PWG_CHECK(cudaMemcpy(h_out, d_out, static_cast<size_t>(N) * out_deg * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        stg.d2h_rows(d_out, N, out_deg, sink);
     } catch (...) {
         cleanup();
         throw;

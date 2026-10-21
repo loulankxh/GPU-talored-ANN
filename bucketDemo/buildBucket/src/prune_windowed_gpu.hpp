@@ -2,6 +2,7 @@
 #pragma once
 #include <cstdint>
 #include <vector>
+#include <functional>
 
 namespace prune_windowed_gpu {
 // true if a CUDA device is present, M <= 64 and the working set fits in free GPU memory
@@ -12,5 +13,8 @@ bool available(int64_t N, int M, int D, int n_buckets, int W, int out_deg);
 void run(const int32_t* cand, const uint8_t* vec, int64_t N, int M, int D,
          const uint32_t* offsets, int n_buckets,
          const std::vector<int32_t>& win, const std::vector<int32_t>& win_len, int W,
-         int out_deg, uint32_t* out);
+         int out_deg,
+         // 结果按行块交回 (rows 指向 pinned 暂存区，row0 起 n 行，行宽 out_deg)，
+         // 依次递增、覆盖 [0, N)；回调返回后暂存区会被复用
+         const std::function<void(const uint32_t* rows, int64_t row0, int64_t n)>& sink);
 }

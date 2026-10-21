@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#56 (KMeans|| d(x, C) via exact fp16 Tensor Core GEMM for 8-bit data)**, 2026-10-21:
+After **#57 (prune_windowed GPU path: no float copy, pinned double-buffered H2D / streamed D2H → writer)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **6.80** (0.59x CAGRA) | 0.9283 / 0.9771 / 0.9943 | 1947K / 936K |
-| SIFT1M large (out-of-core path) | **10.23** (0.89x CAGRA; rerun) | see #56 | |
-| SIFT10M auto (→ large path, 1 run) | **104.66** (0.85x CAGRA; rerun 98.64 s = 0.80x) | 0.8392 / 0.9287 / 0.9742 | 1872K / 1040K |
+| SIFT1M auto (GPU-resident) | **6.82** (0.59x CAGRA) | 0.9287 / 0.9773 / 0.9945 | 2223K / 1193K |
+| SIFT1M large (out-of-core path) | **10.23** (0.89x CAGRA) | 0.9146 / 0.9710 / 0.9923 | 1946K / 838K |
+| SIFT10M auto (→ large path, 1 run) | **96.09** (0.78x CAGRA) | 0.8379 / 0.9290 / 0.9737 | 1873K / 1012K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -1601,6 +1601,48 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8392 / 1872K | 0.9287 / 1040K | 0.9742 / 526K | 0.9923 / 186K | 0.9980 / 68K |
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +4.0% (109.02 → 104.66 s; rerun +9.5%, 98.64 s = 0.80× CAGRA native), 1M-large +1.5% (rerun) / +3.2%, 1M-auto +0.3%.
+
+### #57 — prune_windowed GPU path: no float copy; pinned double-buffered H2D; results streamed D2H → writer  (2026-10-21, commit TBD)
+**Idea / rationale:** timers inside the #38 GPU prune on SIFT10M showed compute 4.3 s = output vector zero-fill 0.92 s + pageable H2D of 3.84 GB 1.37 s (2.8 GB/s) + kernel 1.08 s + D2H into fresh pageable pages 0.80 s, then a separate 1.17 s write; the bulk load also converted the whole dataset to a float copy (5.1 GB) that the GPU kernel never reads. Now: (1) decide GPU vs CPU before the bulk load and skip the float buffer on the GPU path; (2) `Staging` with two 64 MB pinned buffers: OpenMP memcpy of the next chunk into one buffer while the previous chunk DMAs from the other (same pinned-staging pattern as cuVS 26.12 `cagra_build.cuh::build_knn_graph`); (3) results come back in row chunks through the pinned buffers into a sink callback that feeds `StreamingGraphWriter` directly (no N × out_deg host buffer; D2H overlaps the write). Output byte-identical (cmp on the SIFT10M intermediates).
+**Files:** `bucketDemo/buildBucket/src/prune_windowed.cpp`, `prune_windowed_gpu.cu`, `prune_windowed_gpu.hpp`
+**Params changed:** none
+**SIFT10M:** prune 7.00 → 4.05 s (compute 4.3 → 1.85 s), prune peak RSS 10.2 → 4.1 GB.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.82 | -0.3% | +68.6% | 0.59x | bucket2 6.82 | 3828 | 1.72 |
+| sift1M_large | large | 10.23 | +0.0% | +86.4% | 0.89x | bucket2 8.42, prune 0.72, optimize_chunked 0.66, translate 0.43 | 1938 | 2.23 |
+| sift10M_auto | large | 96.09 | +8.2% | +46.2% | 0.78x | bucket2 83.81, prune 4.05, optimize_chunked 4.88, translate 3.35 | 8998 | 14.07 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.63 | 0.26 | 0.17 | 0.00 | 0.65 | 0.51 | 0.02 | 3.14 | 0.00 | 0.92 |
+| sift1M_large | 0.13 | 0.55 | 0.46 | 0.00 | 1.02 | 0.42 | 0.04 | 4.62 | 0.49 | 0.00 |
+| sift10M_auto | 1.35 | 7.53 | 1.96 | 0.00 | 18.89 | 2.84 | 0.30 | 45.80 | 4.12 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9735 | 0.9664 | 0.9591 | 0.9534 |
+| sift1M_large | 0.9759 | 0.9663 | 0.9596 | 0.9535 |
+| sift10M_auto | 0.9186 | 0.8974 | 0.8828 | 0.8707 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9287 / 2223K | 0.9773 / 1193K | 0.9945 / 561K | 0.9988 / 176K | 0.9997 / 67K |
+| ours sift1M_large | 0.9146 / 1946K | 0.9710 / 838K | 0.9923 / 562K | 0.9981 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8379 / 1873K | 0.9290 / 1012K | 0.9737 / 526K | 0.9917 / 179K | 0.9980 / 68K |
+
+**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +8.2% (104.66 → 96.09 s, **0.78× CAGRA native**; the stored 104.66 s was the slower of #56's two runs, its rerun was 98.64 s), 1M-large 0.0%, 1M-auto −0.3%.
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
