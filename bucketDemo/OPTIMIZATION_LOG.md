@@ -11,7 +11,7 @@ Driver: `/optimize-bucket2` skill (`.claude/skills/optimize-bucket2/`), judged b
 Measured per iteration:
 - **build time**: wall clock of every stage (process start, all I/O included), summed.
   SIFT1M-auto (GPU-resident path) and SIFT1M-large (large-dataset path forced on SIFT1M),
-  1 run each (user decision 2026-10-21; borderline 3–5% gains are re-run once). SIFT10M is not run in the loop for now (user decision 2026-10-21).
+  median of 3 each. SIFT10M is not run in the loop for now (user decision 2026-10-21).
 - **(a) pre-prune index quality**: bucket2's degree-64 `vector_knn` vs the exact KNN graph
   (recall@k on 10K sampled base points).
 - **(b) final search quality**: the final degree-32 graph (original ids) searched with cuVS
