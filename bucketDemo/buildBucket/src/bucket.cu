@@ -17,6 +17,10 @@
 #include <type_traits>
 #include <omp.h>
 #include <optional>
+#include <exception>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <future>
 #include <functional>
@@ -4142,18 +4146,15 @@ void build_vector_knn_with_tensorcore(
     std::vector<int32_t> scatter_new_n(M);
     std::vector<float>   scatter_new_d(M);
 
-    // pool 拼装 (3b) 的 resolve/memcpy 两趟之间传递的 job 描述：resolve 趟顺序
-    // 调 bucket_cache.get()，只记源指针/大小/目标偏移；memcpy 趟再用 OpenMP
-    // 并行做实际搬运。复用同一块 vector (clear() 不释放容量)，避免每个 pool
-    // 都堆分配一次。
+    // pool 拼装 (3b, 生产者线程) 的 resolve/memcpy 两趟之间传递的 job 描述：
+    // resolve 趟顺序调 bucket_cache.get()，只记源指针/大小/目标偏移；memcpy
+    // 趟再用 OpenMP 并行做实际搬运。
     struct CopyJob {
         const int64_t* src_ids;
         const DataT*    src_vecs;
         size_t count;
         size_t dest_ofs;
     };
-    std::vector<CopyJob> copy_jobs;
-    copy_jobs.reserve(static_cast<size_t>(K) + 1);
 
     auto scatter_pending = [&](int slot) {
         if (pending[slot].c < 0) return;
@@ -4205,6 +4206,134 @@ void build_vector_knn_with_tensorcore(
     // "纯数据搬运量大"——先测出来，不再靠估算。跑完可以再删。
     double t_cache_get = 0, t_pool_memcpy = 0;
 
+    // ---- 3b 拆到生产者线程 ----
+    // 原来每个 pos 串行做: sync → scatter (上一轮结果) → pool_build (cache.get
+    // + memcpy, ~0.24 ms/bucket) → submit。pool_build 只依赖 bucket 顺序，跟
+    // scatter/submit 无关，所以交给一个独占 bucket_cache 的生产者线程提前做
+    // (cache 仍然只被一个线程访问, Belady 访问顺序不变)，主线程只做 sync /
+    // scatter / submit —— 跟 cuVS 26.12 cagra_build.cuh::build_knn_graph 里
+    // "后台线程准备下一批、前台提交当前批" 的 double buffer 同一思路。
+    // 暂存区就是原来的 per-slot pinned buffer (h_ids_pool64/h_B_raw/h_ids_pool)，
+    // 生产者最多领先 num_slots 个 pos：写 slot 之前必须等主线程已经提交过
+    // 这个 slot 上一次的 H2D (slot_ready_pos[slot] < 0)，再等那次 H2D 真正
+    // 完成 (ev_h2d[slot])。bucket 自己的 gid 先放 staged_ids_bucket[slot]，主
+    // 线程在 scatter 完旧结果之后才拷进 h_ids_bucket[slot] (scatter 还要读旧值)。
+    struct Staged { int pool_size = 0, bucket_size = 0, actual_M = 0; };
+    Staged staged[MAX_SLOTS]{};
+    std::vector<int32_t> staged_ids_bucket[MAX_SLOTS];
+    cudaEvent_t ev_h2d[MAX_SLOTS] = {nullptr};
+    bool h2d_pending[MAX_SLOTS] = {false};          // guarded by stage_mtx
+    int32_t slot_ready_pos[MAX_SLOTS];              // guarded by stage_mtx; -1 = 空
+    for (int s = 0; s < num_slots; ++s) {
+        staged_ids_bucket[s].resize(max_bucket_size);
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_h2d[s], cudaEventDisableTiming));
+        slot_ready_pos[s] = -1;
+    }
+    std::mutex stage_mtx;
+    std::condition_variable stage_cv;
+    bool stage_abort = false, prod_failed = false;  // guarded by stage_mtx
+    std::exception_ptr prod_exc;
+    double t_wait_producer = 0;
+
+    auto producer = [&]() {
+        try {
+            std::vector<CopyJob> jobs;
+            jobs.reserve(static_cast<size_t>(K) + 1);
+            for (int32_t pos = 0; pos < static_cast<int32_t>(n_centroids); ++pos) {
+                int64_t c = bucket_order_seq[pos];
+                if (bucket_count[c] == 0) continue;
+                int slot = static_cast<int>(pos % num_slots);
+                bool wait_h2d = false;
+                {
+                    std::unique_lock<std::mutex> lk(stage_mtx);
+                    stage_cv.wait(lk, [&] { return slot_ready_pos[slot] < 0 || stage_abort; });
+                    if (stage_abort) return;
+                    wait_h2d = h2d_pending[slot];
+                    h2d_pending[slot] = false;
+                }
+                if (wait_h2d) CUDA_CHECK(cudaEventSynchronize(ev_h2d[slot]));
+                auto pb0 = diag_now();
+
+                // Step 4 已经保证每个非 centroid 点只属于一个 bucket、centroid 必在
+                // 自己 bucket 里 → 各 bucket 互不相交，拼出来的 pool 不会重复。
+                // 先顺序 get() (cache 非线程安全；同一 pos 内的桶彼此不会互相淘汰)，
+                // 只记源指针，再并行 memcpy (见 #6: 线程数封顶 8)。
+                int64_t* ids_pool64 = h_ids_pool64[slot];
+                DataT*   vecs_pool  = h_B_raw[slot];
+                size_t ofs = 0;  // 以"点数"计，不是字节
+                jobs.clear();
+                auto resolve_bucket = [&](int64_t bid) {
+                    if (bucket_count[bid] == 0) return;
+                    auto ga0 = diag_now();
+                    const VecBucket<DataT>& vb = bucket_cache.get(pos, static_cast<int32_t>(bid), bucket_loader);
+                    t_cache_get += diag_secs(ga0, diag_now());
+                    size_t cnt = vb.ids.size();
+                    if (ofs + cnt > max_pool_size_ub)   // bounds check: pool buffer 容量
+                        throw std::runtime_error("VectorKNN: pool overflow at pos " + std::to_string(pos));
+                    jobs.push_back(CopyJob{vb.ids.data(), vb.vecs.data(), cnt, ofs});
+                    ofs += cnt;
+                };
+                resolve_bucket(c);
+                for (uint32_t k = 0; k < K; ++k) {
+                    uint32_t nb_c = centroid_knn_graph[c * K + k];
+                    if (nb_c < static_cast<uint32_t>(n_centroids)) {
+                        resolve_bucket(static_cast<int64_t>(nb_c));
+                    }
+                }
+                {
+                    auto gm0 = diag_now();
+                    // 线程数封顶 8：每个 pool 只有 ~K+1 个小 job (SIFT1M 每个 ~100 行
+                    // ≈ 13 KB)，80 线程 fork/join + 跨 NUMA 抢带宽反而更慢。实测
+                    // (SIFT1M --out-of-core, 每轮 pool_memcpy): 80 线程 2.1–2.9s，
+                    // 32: 1.6s, 16: 1.2–1.6s, 8: 1.3–1.6s, 4: 1.7s, 1: 5.3s。
+                    static const int pool_copy_threads = std::min(8, omp_get_max_threads());
+                    #pragma omp parallel for schedule(dynamic) num_threads(pool_copy_threads)
+                    for (int64_t j = 0; j < static_cast<int64_t>(jobs.size()); ++j) {
+                        const CopyJob& job = jobs[static_cast<size_t>(j)];
+                        std::memcpy(ids_pool64 + job.dest_ofs, job.src_ids, job.count * sizeof(int64_t));
+                        std::memcpy(vecs_pool + job.dest_ofs * D, job.src_vecs,
+                                    job.count * static_cast<size_t>(D) * sizeof(DataT));
+                    }
+                    t_pool_memcpy += diag_secs(gm0, diag_now());
+                }
+                Staged& st = staged[slot];
+                st.pool_size   = static_cast<int>(ofs);
+                st.bucket_size = static_cast<int>(bucket_count[c]);
+                st.actual_M    = std::min(M, st.pool_size - 1);
+                if (st.actual_M > 0) {
+                    // bucket 自己的这部分 (pool 最前面 bucket_size 条) 就是 A；gid 从
+                    // int64 truncate 成 int32 (沿用项目里 N<2^31 的既有假设)。
+                    for (int i = 0; i < st.bucket_size; ++i)
+                        staged_ids_bucket[slot][static_cast<size_t>(i)] = static_cast<int32_t>(ids_pool64[i]);
+                    for (int i = 0; i < st.pool_size; ++i)
+                        h_ids_pool[slot][i] = static_cast<int32_t>(ids_pool64[i]);
+                }
+                t_poolbuild += diag_secs(pb0, diag_now());
+                {
+                    std::lock_guard<std::mutex> lk(stage_mtx);
+                    slot_ready_pos[slot] = pos;
+                }
+                stage_cv.notify_all();
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(stage_mtx);
+                prod_exc = std::current_exception();
+                prod_failed = true;
+            }
+            stage_cv.notify_all();
+        }
+    };
+    std::thread prod_thread(producer);
+    struct ProducerJoin {
+        std::thread& t; std::mutex& m; std::condition_variable& cv; bool& abort;
+        ~ProducerJoin() {
+            { std::lock_guard<std::mutex> lk(m); abort = true; }
+            cv.notify_all();
+            if (t.joinable()) t.join();
+        }
+    } prod_join{prod_thread, stage_mtx, stage_cv, stage_abort};
+
     for (int32_t pos = 0; pos < static_cast<int32_t>(n_centroids); ++pos) {
         int64_t c = bucket_order_seq[pos];
         if (bucket_count[c] == 0) continue;
@@ -4225,79 +4354,29 @@ void build_vector_knn_with_tensorcore(
         auto dt2 = diag_now();
         t_scatter += diag_secs(dt1, dt2);
 
-        // ---- 3b: 按 bucket 顺序取 pool 的 (gid, 原始向量)，经过 Belady 缓存 ----
-        // Step 4 已经保证每个非 centroid 点只属于一个 bucket、centroid 必在
-        // 自己 bucket 里 → 各 bucket 互不相交，拼出来的 pool 不会重复。
-        // cache.get() 命中就是纯内存 memcpy，不命中才真的从 bucket_vecs 读盘；
-        // 因为 bucket_order_seq 让相邻处理的桶尽量共享近邻集合，大部分近邻桶
-        // 应该都能命中。
-        //
-        // 拆成两趟：先顺序把这个 pool 里每个桶的 get() 都做完 —— 不能并行，
-        // BeladyBucketCache 不是线程安全的，且它的使用约定要求取到的引用必须
-        // 在下一次 get() 调用前用掉 —— 这一趟只记源指针/大小/目标偏移，不做
-        // 实际搬运；memcpy 本身再用 OpenMP 并行做 (profiling 显示这是循环里
-        // 真正的大头，H2D 传输反而很便宜)。同一个 pos 内的这些桶在
-        // future_access 里对这个 pos 都记了一条，彼此不会互相淘汰 (现在顺序
-        // 版本能跑对就是证据)，所以只要并行 memcpy 趟不跨到下一个 pos 才开始，
-        // 这里存的源指针在整个并行拷贝期间都还有效；每个 job 写的目标区间也
-        // 互不重叠 (按累加的 ofs 切分)，不需要加锁。
-        int64_t* ids_pool64 = h_ids_pool64[slot];
-        DataT*   vecs_pool   = h_B_raw[slot];
-        size_t ofs = 0;  // 以"点数"计，不是字节
-        copy_jobs.clear();
-        auto resolve_bucket = [&](int64_t bid) {
-            if (bucket_count[bid] == 0) return;
-            auto ga0 = diag_now();
-            const VecBucket<DataT>& vb = bucket_cache.get(pos, static_cast<int32_t>(bid), bucket_loader);
-            auto ga1 = diag_now();
-            t_cache_get += diag_secs(ga0, ga1);
-            size_t cnt = vb.ids.size();
-            copy_jobs.push_back(CopyJob{vb.ids.data(), vb.vecs.data(), cnt, ofs});
-            ofs += cnt;
-        };
-        resolve_bucket(c);
-        for (uint32_t k = 0; k < K; ++k) {
-            uint32_t nb_c = centroid_knn_graph[c * K + k];
-            if (nb_c < static_cast<uint32_t>(n_centroids)) {
-                resolve_bucket(static_cast<int64_t>(nb_c));
-            }
-        }
+        // ---- 3b: 取生产者已经拼好的 pool ----
         {
-            auto gm0 = diag_now();
-            // 线程数封顶 8：每个 pool 只有 ~K+1 个小 job (SIFT1M 每个 ~100 行
-            // ≈ 13 KB)，80 线程 fork/join + 跨 NUMA 抢带宽反而更慢。实测
-            // (SIFT1M --out-of-core, 每轮 pool_memcpy): 80 线程 2.1–2.9s，
-            // 32: 1.6s, 16: 1.2–1.6s, 8: 1.3–1.6s, 4: 1.7s, 1: 5.3s。
-            static const int pool_copy_threads = std::min(8, omp_get_max_threads());
-            #pragma omp parallel for schedule(dynamic) num_threads(pool_copy_threads)
-            for (int64_t j = 0; j < static_cast<int64_t>(copy_jobs.size()); ++j) {
-                const CopyJob& job = copy_jobs[static_cast<size_t>(j)];
-                std::memcpy(ids_pool64 + job.dest_ofs, job.src_ids, job.count * sizeof(int64_t));
-                std::memcpy(vecs_pool + job.dest_ofs * D, job.src_vecs,
-                            job.count * static_cast<size_t>(D) * sizeof(DataT));
-            }
-            t_pool_memcpy += diag_secs(gm0, diag_now());
+            std::unique_lock<std::mutex> lk(stage_mtx);
+            stage_cv.wait(lk, [&] { return slot_ready_pos[slot] == pos || prod_failed; });
+            if (slot_ready_pos[slot] != pos) std::rethrow_exception(prod_exc);
         }
-        int pool_size   = static_cast<int>(ofs);
-        int bucket_size = static_cast<int>(bucket_count[c]);
-        int actual_M    = std::min(M, pool_size - 1);
+        const Staged st = staged[slot];
+        int pool_size   = st.pool_size;
+        int bucket_size = st.bucket_size;
+        int actual_M    = st.actual_M;
         if (actual_M <= 0) {
-            t_poolbuild += diag_secs(dt2, diag_now());
+            {
+                std::lock_guard<std::mutex> lk(stage_mtx);
+                slot_ready_pos[slot] = -1;
+            }
+            stage_cv.notify_all();
+            t_wait_producer += diag_secs(dt2, diag_now());
             continue;
         }
-
-        // bucket 自己的这部分 (pool 最前面 bucket_size 条) 就是 A，不用再单独
-        // 拷一份——GEMM 直接拿 d_B 的前 bucket_size 行当 A 操作数 (下面 3e)。
-        // 顺手把 gid 从 int64 truncate 成 int32 (id 数组沿用项目里 N<2^31 的
-        // 既有假设)。
-        for (int i = 0; i < bucket_size; ++i) {
-            h_ids_bucket[slot][i] = static_cast<int32_t>(ids_pool64[i]);
-        }
-        for (int i = 0; i < pool_size; ++i) {
-            h_ids_pool[slot][i] = static_cast<int32_t>(ids_pool64[i]);
-        }
+        std::memcpy(h_ids_bucket[slot], staged_ids_bucket[slot].data(),
+                    static_cast<size_t>(bucket_size) * sizeof(int32_t));
         auto dt3 = diag_now();
-        t_poolbuild += diag_secs(dt2, dt3);
+        t_wait_producer += diag_secs(dt2, dt3);
 
         // ---- 3c: 上传 id 列表 + 原始向量 (async on slot stream) ----
         CUDA_CHECK(cudaMemcpyAsync(d_ids_bucket[slot], h_ids_bucket[slot],
@@ -4309,6 +4388,14 @@ void build_vector_knn_with_tensorcore(
         CUDA_CHECK(cudaMemcpyAsync(d_B_raw[slot], h_B_raw[slot],
                                    static_cast<size_t>(pool_size) * D * sizeof(DataT),
                                    cudaMemcpyHostToDevice, streams[slot]));
+        // 生产者在 ev_h2d[slot] 完成之后才能再写这个 slot 的 pinned 暂存区
+        CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));
+        {
+            std::lock_guard<std::mutex> lk(stage_mtx);
+            h2d_pending[slot] = true;
+            slot_ready_pos[slot] = -1;
+        }
+        stage_cv.notify_all();
 
         // ---- 3d: 转型/位移 B (identity 索引，不做重排只做逐元素转型) + 现算 norms_pool ----
         // 数据已经是磁盘/缓存按 bucket 顺序读出来的、恰好需要的那些行，不需要
@@ -4439,6 +4526,8 @@ void build_vector_knn_with_tensorcore(
         ++processed_buckets;
     }
 
+    prod_thread.join();   // 已经全部消费完；ProducerJoin 析构时 joinable() 为 false
+
     // ---- Tail flush: 处理两 slot 上的最后未消费结果 ----
     for (int s = 0; s < num_slots; ++s) {
         CUDA_CHECK(cudaStreamSynchronize(streams[s]));
@@ -4459,16 +4548,16 @@ void build_vector_knn_with_tensorcore(
               << "% of loop wall-time\n";
     {
         double loop_s = loop_ms / 1000.0;
-        double sum_s = t_sync + t_scatter + t_poolbuild + t_submit;
+        double sum_s = t_sync + t_scatter + t_wait_producer + t_submit;
         std::cout << "  [VectorKNN] bucket loop breakdown: stream_sync=" << t_sync
                   << "s scatter_pending=" << t_scatter
-                  << "s pool_build=" << t_poolbuild
+                  << "s wait_producer=" << t_wait_producer
                   << "s gpu_submit=" << t_submit
                   << "s (sum=" << sum_s << "s, loop_wall=" << loop_s << "s)\n";
         std::cout << "  [VectorKNN] pool_build breakdown: cache_get="
                   << t_cache_get << "s pool_memcpy=" << t_pool_memcpy
                   << "s (sum=" << (t_cache_get + t_pool_memcpy)
-                  << "s vs pool_build=" << t_poolbuild << "s)\n";
+                  << "s vs pool_build=" << t_poolbuild << "s, on the producer thread)\n";
     }
 
     // ---- 释放 ----
@@ -4492,6 +4581,7 @@ void build_vector_knn_with_tensorcore(
         cudaFreeHost(h_out[s]);
         if (h_out_dists[s])  cudaFreeHost(h_out_dists[s]);
         cudaStreamDestroy(streams[s]);
+        cudaEventDestroy(ev_h2d[s]);
         cudaEventDestroy(ev_gemm_start[s]);
         cudaEventDestroy(ev_gemm_stop[s]);
     }
