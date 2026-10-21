@@ -1,0 +1,500 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index f92ac4e..0c3f498 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -1,3 +1,4 @@
++#include "fused_knn.cuh"
+ #include <iostream>
+ #include <vector>
+ #include <cstdint>
+@@ -3376,6 +3377,10 @@ struct GpuResidentKnn {
+         int32_t* pool_ids   = nullptr;
+         float*   dots       = nullptr;
+         size_t   pool_cap = 0, norms_cap = 0, ids_cap = 0, dots_cap = 0;   // 元素数
++        // 融合 GEMM + top-K kernel 的 partial / 计数器 (见 fused_knn.cuh)
++        float*    part_d = nullptr; int32_t* part_i = nullptr; unsigned* counters = nullptr;
++        unsigned* row_th = nullptr;
++        size_t    part_cap = 0, part_i_cap = 0, counters_cap = 0, row_th_cap = 0;
+     };
+     Slot slots[kStreams];
+ 
+@@ -3421,6 +3426,7 @@ struct GpuResidentKnn {
+     ~GpuResidentKnn() {
+         for (auto& s : slots) {
+             cudaFree(s.pool); cudaFree(s.pool_norms); cudaFree(s.pool_ids); cudaFree(s.dots);
++            cudaFree(s.part_d); cudaFree(s.part_i); cudaFree(s.counters); cudaFree(s.row_th);
+             if (s.cublas) cublasDestroy(s.cublas);
+             if (s.stream) cudaStreamDestroy(s.stream);
+         }
+@@ -3535,11 +3541,27 @@ struct GpuResidentKnn {
+         CUDA_CHECK(cudaMemcpy(d_seg_bucket, seg_bucket.data(), n_centroids * S * sizeof(int32_t), cudaMemcpyHostToDevice));
+         CUDA_CHECK(cudaMemcpy(d_seg_ofs, seg_ofs.data(), n_centroids * S * sizeof(int32_t), cudaMemcpyHostToDevice));
+ 
++        // 融合 kernel: fp16 GEMM 输入 + D%16==0 + M≤64 时整轮都走它，dots 不再落显存
++        const bool use_fused = kHalf && fused_knn::enabled() && fused_knn::supported(D, M);
+         for (auto& s : slots) {
+-            ensure_device(s.pool, s.pool_cap, static_cast<size_t>(max_pool) * D);
++            ensure_device(s.pool, s.pool_cap, fused_knn::padded_rows(static_cast<size_t>(max_pool)) * D);
+             ensure_device(s.pool_norms, s.norms_cap, static_cast<size_t>(max_pool));
+             ensure_device(s.pool_ids, s.ids_cap, static_cast<size_t>(max_pool));
+-            ensure_device(s.dots, s.dots_cap, static_cast<size_t>(max_bucket) * ((max_pool + 3) / 4 * 4));
++            if (use_fused) {
++                ensure_device(s.part_d, s.part_cap, fused_knn::partial_elems(static_cast<size_t>(max_bucket)));
++                ensure_device(s.part_i, s.part_i_cap, fused_knn::partial_elems(static_cast<size_t>(max_bucket)));
++                const size_t nc = fused_knn::counter_elems(static_cast<size_t>(max_bucket));
++                if (nc > s.counters_cap) {
++                    ensure_device(s.counters, s.counters_cap, nc);
++                    CUDA_CHECK(cudaMemset(s.counters, 0, nc * sizeof(unsigned)));
++                }
++                if (static_cast<size_t>(max_bucket) > s.row_th_cap) {
++                    ensure_device(s.row_th, s.row_th_cap, static_cast<size_t>(max_bucket));
++                    CUDA_CHECK(cudaMemset(s.row_th, 0xFF, static_cast<size_t>(max_bucket) * sizeof(unsigned)));
++                }
++            } else {
++                ensure_device(s.dots, s.dots_cap, static_cast<size_t>(max_bucket) * ((max_pool + 3) / 4 * 4));
++            }
+         }
+ 
+         size_t nm = static_cast<size_t>(N) * M;
+@@ -3566,6 +3588,16 @@ struct GpuResidentKnn {
+                 s.pool, s.pool_norms, s.pool_ids, D);
+             CUDA_CHECK(cudaGetLastError());
+ 
++            if constexpr (kHalf) {
++                if (use_fused) {
++                    fused_knn::launch<false>(s.stream, s.pool, s.pool_norms, s.pool_ids,
++                                             bucket_size, ps, D, actual_M,
++                                             fused_knn::Scratch{s.part_d, s.part_i, s.counters, s.row_th},
++                                             d_cur_n, d_cur_d, /*out_ld=*/M);
++                    CUDA_CHECK(cudaGetLastError());
++                    continue;
++                }
++            }
+             // dots (bucket_size, ps) row-major = pool[0:bucket_size] · pool^T
+             float alpha = 1.0f, beta = 0.0f;
+             cublasStatus_t stat;
+@@ -3608,7 +3640,7 @@ struct GpuResidentKnn {
+         double t_merge = std::chrono::duration<double>(Clock::now() - t2).count();
+ 
+         std::cout << "  [GpuResidentKNN] buckets=" << launched << " max_pool=" << max_pool
+-                  << " max_bucket=" << max_bucket << " gemm=" << (kHalf ? "FP16-TC" : "FP32")
++                  << " max_bucket=" << max_bucket << " gemm=" << (use_fused ? "fused-FP16-TC" : (kHalf ? "FP16-TC" : "FP32"))
+                   << " | setup=" << std::fixed << std::setprecision(3) << t_setup
+                   << "s loop=" << t_loop << "s (host launch " << t_launch
+                   << "s) merge=" << t_merge << "s\n";
+diff --git a/bucketDemo/buildBucket/src/fused_knn.cuh b/bucketDemo/buildBucket/src/fused_knn.cuh
+new file mode 100644
+index 0000000..ab1fa5c
+--- /dev/null
++++ b/bucketDemo/buildBucket/src/fused_knn.cuh
+@@ -0,0 +1,410 @@
++#pragma once
++// Step 6 融合 kernel: bucket × pool 的 fp16 Tensor Core GEMM + 每行 top-K 选择
++// 合成一个 kernel，(bucket_size × pool_size) 的 dots 矩阵不再写回显存。
++//
++// 思路跟 cuVS 26.12 detail/fused_l2_knn.cuh (fusedL2kNN: 距离 tile 留在
++// shared memory 里直接做选择) 和 raft select_k 的 warp_sort_filtered (先按当前
++// 第 K 小阈值过滤、过阈值的候选攒一批再 bitonic 归并) 一样，GEMM 用 WMMA fp16：
++//   - 一个 block (8 warp) 负责 QT=32 个 query 行 × pool 的一部分列；query 行就是
++//     pool 的前 bucket_size 行 (bucket 自己)，先搬进 shared memory
++//   - pool 按 PT=64 列切 tile，第 ch 个 block 取 tile ch, ch+CS, ... (轮转：pool
++//     前几个 tile 是 bucket 自己和最近的桶，每个 block 一开始就看到好候选，
++//     阈值收紧得快)。每个 tile: 256 线程合并读 B tile (寄存器预取下一个 tile)
++//     → shared memory → WMMA 算 32×64 dot tile → 每个 warp 对自己的 4 行
++//     算距离、跟该行阈值比较，过阈值的 ballot 压缩写进该行的 shared memory
++//     候选缓冲 (CAP=64)；缓冲满了才把 "当前 top-K 列表 + 缓冲" 做一次 128 元素
++//     bitonic 排序，留前 K 个、更新阈值。寄存器里每行只有阈值和计数。
++//   - 每行每段的 top-K 列表放在 partial buffer (L2)；同一行 tile 的最后一个
++//     完成的 block (原子计数) 把 CS 段归并成最终 top-K 写出，不需要第二次 launch
++// 8-bit 数据存成 fp16 是精确的，乘积/累加在 fp32 里也精确 (≤ 2^24)，所以距离
++// 跟 cuBLAS GEMM + block_topK 路径逐位一致；只有并列距离的先后可能不同。
++//
++// 要求: D == 128 (编译期特化)、K ≤ 64；pool buffer 至少有 padded_rows(pool_size)
++// 行可读 (尾部行的数据不参与结果)。
++#include <cuda_fp16.h>
++#include <mma.h>
++#include <raft/util/bitonic_sort.cuh>
++#include <cstdint>
++#include <cstdlib>
++#include <algorithm>
++
++namespace fused_knn {
++
++constexpr int QT = 32;               // 每 block 的 query 行
++constexpr int PT = 64;               // 每个 tile 的 pool 列
++constexpr int WARPS = 8;
++constexpr int ROWS_PER_WARP = QT / WARPS;
++constexpr int LDC = PT + 4;          // dot tile 的 shared memory 行宽 (float，错开 bank)
++constexpr int CAP = 64;              // 每行候选缓冲
++constexpr int CS_MAX = 16;           // 一行 pool 最多切几段
++constexpr int KMAX = 64;
++constexpr int DT = 128;              // 目前只特化 D=128 (SIFT)；其它维度走 cuBLAS + block top-M
++constexpr int LDA = DT + 8;          // sA / sB 行宽 (half)，错开 bank
++
++// sA (QT×LDA half) + max(sB (PT×LDA half), sC (QT×LDC float)) + 候选缓冲
++inline size_t smem_bytes(int /*D*/) {
++    const size_t a = static_cast<size_t>(QT) * LDA * sizeof(__half);
++    const size_t b = static_cast<size_t>(PT) * LDA * sizeof(__half);
++    const size_t c = static_cast<size_t>(QT) * LDC * sizeof(float);
++    const size_t buf = static_cast<size_t>(QT) * CAP * (sizeof(float) + sizeof(int32_t));
++    return a + (b > c ? b : c) + buf;
++}
++inline bool supported(int D, int K) { return D == DT && K <= KMAX; }
++// pool buffer 需要的行数 (尾部 tile 按整 tile 读)
++inline size_t padded_rows(size_t pool_rows) { return (pool_rows + PT - 1) / PT * PT; }
++// partial buffer 元素数 (dist / idx 各一份)
++inline size_t partial_elems(size_t max_bucket) { return max_bucket * CS_MAX * KMAX; }
++inline size_t counter_elems(size_t max_bucket) { return (max_bucket + QT - 1) / QT; }
++
++// 每段至少多少列: 默认 1280，环境变量 BUCKET2_FUSED_CHUNK 可调
++inline int chunk_cols() {
++    static const int v = [] {
++        const char* e = std::getenv("BUCKET2_FUSED_CHUNK");
++        int c = e ? std::atoi(e) : 1280;
++        return std::max(PT, c / PT * PT);
++    }();
++    return v;
++}
++
++// 把 (寄存器里的当前列表 KPL 个 + shared memory 候选缓冲 cnt 个) 排序，前 K_OUT 个
++// 留在寄存器。布局 (raft::util::bitonic): 第 i 个寄存器 / lane l = 第 i*32+l 小。
++template <int K_OUT>
++__device__ __forceinline__ void merge_list(float (&ld)[K_OUT / 32], int32_t (&li)[K_OUT / 32],
++                                           const float* __restrict__ bd, const int32_t* __restrict__ bi, int cnt,
++                                           int lane)
++{
++    // 跟 raft warp_sort::merge_in 一样: 缓冲降序排好，跟升序列表逐位取小得到一个
++    // bitonic 序列 (含两者合起来的前 K_OUT 小)，再一次 bitonic merge 成升序——
++    // 比把列表 + 缓冲 128 个整体排序便宜一半多。
++    constexpr int KPL = K_OUT / 32;
++    constexpr int NB = CAP / 32;
++    float a[NB]; int32_t b[NB];
++    #pragma unroll
++    for (int i = 0; i < NB; ++i) {
++        const int idx = i * 32 + lane;
++        a[i] = (idx < cnt) ? bd[idx] : INFINITY;
++        b[i] = (idx < cnt) ? bi[idx] : -1;
++    }
++    raft::util::bitonic<NB>(false).sort(a, b);
++    #pragma unroll
++    for (int i = (KPL < NB ? KPL : NB); i > 0; --i) {
++        if (a[NB - i] < ld[KPL - i]) { ld[KPL - i] = a[NB - i]; li[KPL - i] = b[NB - i]; }
++    }
++    raft::util::bitonic<KPL>(true).merge(ld, li);
++}
++
++#ifdef FUSED_COUNT
++__device__ unsigned long long g_flush_count = 0;
++#endif
++// grid = (CS, ceil(bucket_size / QT))，block = 256。
++// kRowByQuery: 输出第 q 行 (out-of-core 每 bucket 本地输出)；否则第 ids_pool[q] 行。
++template <int K_OUT, bool kRowByQuery>
++__global__ void __launch_bounds__(WARPS * 32, 2) fused_gemm_topk_kernel(
++    const __half*  __restrict__ pool,        // (≥ padded_rows(ps), DT)，前 bucket_size 行 = query
++    const float*   __restrict__ norms_pool,  // (ps,)
++    const int32_t* __restrict__ ids_pool,    // (ps,)
++    int bucket_size, int ps, int CS,
++    float*   __restrict__ part_d,            // (bucket_size, CS, K_OUT): 每行每段的 top-K 列表
++    int32_t* __restrict__ part_i,
++    unsigned* __restrict__ counters,         // (row tiles,) 初值 0，最后一个 block 复位
++    unsigned* __restrict__ row_th,           // (bucket_size,) 各段当前第 K 小的最小值 (float 位), 初值 ~0u
++    int32_t* __restrict__ out_n, float* __restrict__ out_d, int K, int out_ld)
++{
++    using namespace nvcuda;
++    constexpr int KPL = K_OUT / 32;
++    constexpr int D = DT;
++    constexpr int V8 = D / 8;                         // 每行几个 16 B
++    constexpr int PF = PT * V8 / (WARPS * 32);        // 每线程预取几个 16 B (=4)
++    extern __shared__ __align__(16) unsigned char smem[];
++    __half* sA = reinterpret_cast<__half*>(smem);
++    unsigned char* sBC = smem + static_cast<size_t>(QT) * LDA * sizeof(__half);
++    __half* sB = reinterpret_cast<__half*>(sBC);      // B tile (PT×LDA)，MMA 完之后
++    float*  sC = reinterpret_cast<float*>(sBC);       // 同一块拿来放 dot tile (QT×LDC)
++    constexpr size_t kBC = (static_cast<size_t>(PT) * LDA * 2 > static_cast<size_t>(QT) * LDC * 4)
++                         ? static_cast<size_t>(PT) * LDA * 2 : static_cast<size_t>(QT) * LDC * 4;
++    float*   sBufD = reinterpret_cast<float*>(sBC + kBC);              // (QT, CAP)
++    int32_t* sBufI = reinterpret_cast<int32_t*>(sBufD + QT * CAP);     // (QT, CAP)
++    __shared__ bool s_last;
++
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int ch = blockIdx.x, rt = blockIdx.y;
++    const int q0 = rt * QT;
++    const int nq = min(QT, bucket_size - q0);
++
++    // ---- query 行进 shared memory (不足 QT 行补 0) ----
++    for (int idx = threadIdx.x; idx < QT * V8; idx += blockDim.x) {
++        int r = idx / V8, c = idx - r * V8;
++        uint4 v = make_uint4(0u, 0u, 0u, 0u);
++        if (r < nq) v = reinterpret_cast<const uint4*>(pool + static_cast<int64_t>(q0 + r) * D)[c];
++        reinterpret_cast<uint4*>(sA + static_cast<size_t>(r) * LDA)[c] = v;
++    }
++
++    // 每行: 寄存器里的有序 top-K 列表、过滤阈值、缓冲计数、‖q‖²。
++    // 距离含 ‖q‖² (真实 L2²，8-bit 数据在 fp32 里精确且 ≥ 0)，所以 float 位当
++    // unsigned 比较跟数值比较一致，各段可以用 atomicMin 共享阈值：任何一段
++    // 当前的第 K 小都是整行第 K 小的上界，比它大的候选不可能进最终 top-K。
++    float   ld[ROWS_PER_WARP][KPL];
++    int32_t li[ROWS_PER_WARP][KPL];
++    float kth[ROWS_PER_WARP];
++    int   cnt[ROWS_PER_WARP];
++    float qn[ROWS_PER_WARP];
++    #pragma unroll
++    for (int r = 0; r < ROWS_PER_WARP; ++r) {
++        const int lr = warp * ROWS_PER_WARP + r;
++        kth[r] = INFINITY; cnt[r] = 0;
++        qn[r] = (lr < nq) ? norms_pool[q0 + lr] : 0.0f;
++        #pragma unroll
++        for (int i = 0; i < KPL; ++i) { ld[r][i] = INFINITY; li[r][i] = -1; }
++    }
++    auto share_th = [&](int r) {   // 本段阈值发布到全局、取各段最小
++        if (CS == 1) return;
++        const int lr = warp * ROWS_PER_WARP + r;
++        unsigned old = 0xFFFFFFFFu;
++        if (lane == 0) old = atomicMin(&row_th[q0 + lr], __float_as_uint(kth[r]));
++        old = __shfl_sync(0xFFFFFFFFu, old, 0);
++        if (old != 0xFFFFFFFFu) kth[r] = fminf(kth[r], __uint_as_float(old));
++    };
++    auto flush = [&](int r) {
++        const int lr = warp * ROWS_PER_WARP + r;
++#ifdef FUSED_COUNT
++        if (lane == 0) atomicAdd(&g_flush_count, 1ull);
++#endif
++        __syncwarp();
++        merge_list<K_OUT>(ld[r], li[r], sBufD + lr * CAP, sBufI + lr * CAP, cnt[r], lane);
++        kth[r] = fminf(kth[r], __shfl_sync(0xFFFFFFFFu, ld[r][KPL - 1], 31));
++        cnt[r] = 0;
++        share_th(r);
++        __syncwarp();
++    };
++
++    // B tile 的全局读: PT 行连续 (16 KB)，256 线程各取 PF 个 16 B，合并访存；
++    // 下一个 tile 的读在当前 tile 的 MMA + 选择期间在途 (寄存器双缓冲)
++    uint4 pf[PF];
++    auto prefetch = [&](int t) {
++        const uint4* src = reinterpret_cast<const uint4*>(pool + static_cast<int64_t>(t) * PT * D);
++        #pragma unroll
++        for (int i = 0; i < PF; ++i) pf[i] = src[threadIdx.x + i * WARPS * 32];
++    };
++    const int n_tiles = (ps + PT - 1) / PT;
++    // 预热: CS > 1 时每个 block 先扫 tile 0、1 (bucket 自己 + 最近的桶，127 个候选)，
++    // 只为了拿到一个紧的初始阈值 (任意候选子集的第 K 小都是整行第 K 小的上界)，
++    // 然后除 block 0 外丢掉这两个 tile 的候选 (block 0 保留：它们归 block 0)，
++    // 再按轮转扫自己的 tile (跳过 tile 0、1)。否则每段都要从 inf 阈值开始，
++    // 前几百个候选全部过阈值、反复 bitonic 归并。
++    const int n_warm = (CS > 1) ? min(2, n_tiles) : 0;
++    const int t_main = (ch < n_warm) ? ch + CS : ch;   // 轮转序列里第一个 ≥ n_warm 的 tile
++    auto tile_at = [&](int s) { return s < n_warm ? s : t_main + (s - n_warm) * CS; };
++    if (tile_at(0) < n_tiles) prefetch(tile_at(0));
++    // WMMA 分工: 32×64 tile = 2×4 个 16×16 块，warp w 算第 (w/4, w%4) 块
++    const int fr = warp >> 2, fc = warp & 3;
++    for (int si = 0; tile_at(si) < n_tiles; ++si) {
++        const int t = tile_at(si);
++        const int j0 = t * PT;
++        #pragma unroll
++        for (int i = 0; i < PF; ++i) {
++            const int idx = threadIdx.x + i * WARPS * 32;
++            const int r = idx / V8, c = idx - r * V8;
++            reinterpret_cast<uint4*>(sB + static_cast<size_t>(r) * LDA)[c] = pf[i];
++        }
++        __syncthreads();
++        if (tile_at(si + 1) < n_tiles) prefetch(tile_at(si + 1));
++        // 其它段可能已经收紧了阈值: 读请求在 MMA 前发出，选择时才用
++        unsigned gth = 0xFFFFFFFFu;
++        if (CS > 1 && lane < ROWS_PER_WARP && warp * ROWS_PER_WARP + lane < nq)
++            gth = __ldcg(row_th + q0 + warp * ROWS_PER_WARP + lane);
++
++        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
++        wmma::fill_fragment(acc, 0.0f);
++#ifndef FUSED_SKIP_MMA
++        #pragma unroll
++        for (int k = 0; k < D; k += 16) {
++            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
++            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
++            wmma::load_matrix_sync(fb, sB + static_cast<size_t>(fc * 16) * LDA + k, LDA);
++            wmma::load_matrix_sync(fa, sA + static_cast<size_t>(fr * 16) * LDA + k, LDA);
++            wmma::mma_sync(acc, fa, fb, acc);
++        }
++#endif
++        __syncthreads();   // 所有 warp 读完 sB 才能写 sC (同一块 shared memory)
++        wmma::store_matrix_sync(sC + fr * 16 * LDC + fc * 16, acc, LDC, wmma::mem_row_major);
++        __syncthreads();
++
++#ifndef FUSED_SKIP_SELECT
++        // ---- 选择: warp 负责第 warp*4 .. +3 行；pool norms 每 tile 只读一次 ----
++        float nv[PT / 32];
++        #pragma unroll
++        for (int e = 0; e < PT / 32; ++e) {
++            const int j = j0 + lane + 32 * e;
++            nv[e] = (j < ps) ? norms_pool[j] : INFINITY;
++        }
++        #pragma unroll
++        for (int r = 0; r < ROWS_PER_WARP; ++r) {
++            const int lr = warp * ROWS_PER_WARP + r;
++            if (lr < nq) {   // warp 内一致
++                const int q = q0 + lr;
++                const unsigned g = __shfl_sync(0xFFFFFFFFu, gth, r);
++                if (g != 0xFFFFFFFFu) kth[r] = fminf(kth[r], __uint_as_float(g));
++                // 过滤只比 ‖p‖² - 2·dot 跟 (阈值 - ‖q‖²)：每个候选一条 FFMA + 一次比较；
++                // 自己 (pool 下标 q < bucket_size) 只可能出现在前面几个 tile
++                const float lim = kth[r] - qn[r];
++                const bool self_tile = (q >= j0) && (q < j0 + PT);
++                #pragma unroll
++                for (int e = 0; e < PT / 32; ++e) {
++                    const int col = lane + 32 * e;
++                    const int j = j0 + col;
++                    float pd = fmaf(-2.0f, sC[lr * LDC + col], nv[e]);
++                    if (self_tile && j == q) pd = INFINITY;   // (nv 对 j ≥ ps 已是 inf)
++                    unsigned m = __ballot_sync(0xFFFFFFFFu, pd < lim);
++                    if (m) {
++                        float dd = qn[r] + pd;
++                        bool pass = dd < kth[r];
++                        m = __ballot_sync(0xFFFFFFFFu, pass);
++                    }
++                    if (m) {
++                        float dd = qn[r] + pd;
++                        bool pass = dd < kth[r];
++                        int n = __popc(m);
++                        if (cnt[r] + n > CAP) {
++                            flush(r);
++                            pass = dd < kth[r];
++                            m = __ballot_sync(0xFFFFFFFFu, pass);
++                            n = __popc(m);
++                        }
++                        if (pass) {
++                            const int pos = cnt[r] + __popc(m & ((1u << lane) - 1u));
++                            sBufD[lr * CAP + pos] = dd;
++                            sBufI[lr * CAP + pos] = j;
++                        }
++                        cnt[r] += n;
++                    }
++                }
++            }
++        }
++#endif
++        if (si == n_warm - 1) {   // 预热结束: 定下初始阈值，非 block 0 清空列表
++            #pragma unroll
++            for (int r = 0; r < ROWS_PER_WARP; ++r) {
++                if (warp * ROWS_PER_WARP + r < nq) {
++                    if (__any_sync(0xFFFFFFFFu, cnt[r] > 0)) flush(r);
++                    if (ch != 0) {
++                        #pragma unroll
++                        for (int i = 0; i < KPL; ++i) { ld[r][i] = INFINITY; li[r][i] = -1; }
++                    }
++                }
++            }
++        }
++        __syncthreads();   // 选择读完 sC，下一轮才能往同一块写 sB
++    }
++
++    // 结果布局: od[i] / lane l = 第 i*32+l 小
++    auto write_final = [&](const float (&od)[KPL], const int32_t (&oi)[KPL], int q) {
++        const int64_t orow = static_cast<int64_t>(kRowByQuery ? q : ids_pool[q]) * out_ld;
++        #pragma unroll
++        for (int i = 0; i < KPL; ++i) {
++            const int k = i * 32 + lane;
++            if (k < K) {
++                const int32_t local = oi[i];
++                const bool ok = local >= 0 && local < ps && od[i] < INFINITY;   // bounds check
++                out_n[orow + k] = ok ? ids_pool[local] : -1;
++                out_d[orow + k] = ok ? od[i] : INFINITY;
++            }
++        }
++    };
++
++    // ---- 每行最后一次 flush: 本段 top-K 列表落 partial ----
++    #pragma unroll
++    for (int r = 0; r < ROWS_PER_WARP; ++r) {
++        const int lr = warp * ROWS_PER_WARP + r;
++        if (lr < nq) {
++            if (__any_sync(0xFFFFFFFFu, cnt[r] > 0)) flush(r);
++            if (CS == 1) {
++                write_final(ld[r], li[r], q0 + lr);
++            } else {
++                const int64_t base = (static_cast<int64_t>(q0 + lr) * CS + ch) * K_OUT;
++                #pragma unroll
++                for (int i = 0; i < KPL; ++i) {
++                    part_d[base + i * 32 + lane] = ld[r][i];
++                    part_i[base + i * 32 + lane] = li[r][i];
++                }
++            }
++        }
++    }
++    if (CS == 1) return;
++
++    __threadfence();
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        unsigned ticket = atomicAdd(&counters[rt], 1u);
++        s_last = (ticket == static_cast<unsigned>(CS - 1));
++    }
++    __syncthreads();
++    if (!s_last) return;
++    __threadfence();
++
++    // ---- 最后完成的 block: CS 段列表依次 bitonic 归并 ----
++    #pragma unroll
++    for (int r = 0; r < ROWS_PER_WARP; ++r) {
++        const int lr = warp * ROWS_PER_WARP + r;
++        if (lr < nq) {
++            const int q = q0 + lr;
++            float a[4]; int32_t b[4];
++            const int64_t b0 = static_cast<int64_t>(q) * CS * K_OUT;
++            #pragma unroll
++            for (int i = 0; i < 4; ++i) { a[i] = INFINITY; b[i] = -1; }
++            #pragma unroll
++            for (int i = 0; i < KPL; ++i) { a[i] = __ldcg(part_d + b0 + i * 32 + lane); b[i] = __ldcg(part_i + b0 + i * 32 + lane); }
++            for (int c = 1; c < CS; ++c) {
++                const int64_t bc = b0 + static_cast<int64_t>(c) * K_OUT;
++                #pragma unroll
++                for (int i = KPL; i < 4; ++i) { a[i] = INFINITY; b[i] = -1; }   // 只留前 K_OUT
++                #pragma unroll
++                for (int i = 0; i < KPL; ++i) { a[2 + i] = __ldcg(part_d + bc + i * 32 + lane); b[2 + i] = __ldcg(part_i + bc + i * 32 + lane); }
++                raft::util::bitonic<4>(true).sort(a, b);
++            }
++            float od[KPL]; int32_t oi[KPL];
++            #pragma unroll
++            for (int i = 0; i < KPL; ++i) { od[i] = a[i]; oi[i] = b[i]; }
++            write_final(od, oi, q);
++            if (lane == 0) row_th[q] = 0xFFFFFFFFu;   // 复位给下一个 bucket
++        }
++    }
++    if (threadIdx.x == 0) counters[rt] = 0u;   // 同一 stream 上下一个 bucket 复用
++}
++
++struct Scratch {
++    float*    part_d = nullptr;
++    int32_t*  part_i = nullptr;
++    unsigned* counters = nullptr;   // counter_elems 个，初值 0
++    unsigned* row_th = nullptr;     // max_bucket 个，初值 0xFF 字节 (cudaMemset 0xFF)
++};
++
++// 返回 false = 不支持 (调用方走 cuBLAS GEMM + block top-M)
++template <bool kRowByQuery>
++inline bool launch(cudaStream_t stream, const __half* pool, const float* norms_pool, const int32_t* ids_pool,
++                   int bucket_size, int ps, int D, int K, const Scratch& sc,
++                   int32_t* out_n, float* out_d, int out_ld)
++{
++    if (!supported(D, K) || bucket_size <= 0 || ps <= 0) return false;
++    const int n_tiles = (ps + PT - 1) / PT;
++    // 每个 block 至少 chunk_cols()/PT 个 tile
++    int CS = std::min(CS_MAX, std::max(1, n_tiles / std::max(1, chunk_cols() / PT)));
++    dim3 grid(static_cast<unsigned>(CS), static_cast<unsigned>((bucket_size + QT - 1) / QT));
++    const size_t sm = smem_bytes(D);
++    if (K <= 32)
++        fused_gemm_topk_kernel<32, kRowByQuery><<<grid, WARPS * 32, sm, stream>>>(
++            pool, norms_pool, ids_pool, bucket_size, ps, CS,
++            sc.part_d, sc.part_i, sc.counters, sc.row_th, out_n, out_d, K, out_ld);
++    else
++        fused_gemm_topk_kernel<64, kRowByQuery><<<grid, WARPS * 32, sm, stream>>>(
++            pool, norms_pool, ids_pool, bucket_size, ps, CS,
++            sc.part_d, sc.part_i, sc.counters, sc.row_th, out_n, out_d, K, out_ld);
++    return true;
++}
++
++// 环境变量 BUCKET2_FUSED=0 关掉 (A/B 对比、回退)
++inline bool enabled() {
++    static const bool v = [] { const char* e = std::getenv("BUCKET2_FUSED"); return !(e && e[0] == '0'); }();
++    return v;
++}
++
++}  // namespace fused_knn
