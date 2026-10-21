@@ -136,6 +136,10 @@ struct LoadConfig {
     bool save_dists;               // 写 vector_dists.bin (default true)；流水线后续阶段不读它
     bool save_npy;                 // 额外写 neighbors.npy (int64, 给 Python 端评测用), default true;
                                    // 构建流水线本身不读它
+    // > 0: GPU-resident 路径在 bucket2 进程内接着做 prune + 反向边 (cuVS
+    // helpers::optimize，跟独立的 optimize 一样) + id 翻译，直接写 final_graph.bin
+    // (= optimize + translate_ids 两个阶段的输出)；out-of-core 路径忽略。default 0
+    int fused_optimize_degree;
 
     static constexpr uint32_t MAX_KNN_K = 1000;
 
@@ -158,7 +162,8 @@ struct LoadConfig {
         kmeans_train_fraction(1.0f),
         gpu_bucket_cache_mb(2048),
         save_dists(true),
-        save_npy(true)
+        save_npy(true),
+        fused_optimize_degree(0)
     {}
 };
 
@@ -582,6 +587,11 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
     }
     if (vm.count("skip-npy")) {
         config.save_npy = !vm["skip-npy"].as<bool>();
+    }
+    if (vm.count("fused-optimize-degree")) {
+        config.fused_optimize_degree = vm["fused-optimize-degree"].as<int>();
+        if (config.fused_optimize_degree < 0)
+            throw std::runtime_error("--fused-optimize-degree must be >= 0");
     }
     if (vm.count("pq-bits-start")) {
         config.pq_bits_start = vm["pq-bits-start"].as<uint32_t>();
@@ -3615,8 +3625,12 @@ struct GpuResidentKnn {
     }
 
     // 最终结果只下载一次，三个文件并行写 (npy_path 为空则不写 .npy)
+    // after_download (可选): D2H 完成、写盘线程已经起来之后在主线程上调用，拿到
+    // host 上的 (N, M) 邻居表——GPU-resident 收尾 (prune/反向边/id 翻译) 跟
+    // vector_knn.bin 的写盘重叠。回调里可以释放本对象的显存 (之后不再访问显存)。
     void write_outputs(const std::string& knn_path, const std::string& dist_path,
-                       const std::string& npy_path) const {
+                       const std::string& npy_path,
+                       const std::function<void(const std::vector<int32_t>&)>& after_download = {}) const {
         size_t nm = static_cast<size_t>(N) * M;
         std::vector<int32_t> h_n(nm);
         std::vector<float>   h_d(dist_path.empty() ? 0 : nm);   // dist_path 为空 = 不写 vector_dists
@@ -3646,8 +3660,26 @@ struct GpuResidentKnn {
             out.write(reinterpret_cast<const char*>(h64.data()), static_cast<std::streamsize>(nm * sizeof(int64_t)));
             if (!out.good()) throw std::runtime_error("GpuResidentKnn: write failed: " + npy_path);
         }
+        if (after_download) after_download(h_n);
         f_knn.get();
         f_dist.get();
+    }
+
+    // 释放全部显存 (收尾阶段把显存让给 cuVS optimize)；之后对象只能析构
+    void release_device() {
+        for (auto& s : slots) {
+            cudaFree(s.pool); cudaFree(s.pool_norms); cudaFree(s.pool_ids); cudaFree(s.dots);
+            s.pool = nullptr; s.pool_norms = nullptr; s.pool_ids = nullptr; s.dots = nullptr;
+            s.pool_cap = s.norms_cap = s.ids_cap = s.dots_cap = 0;
+        }
+        cudaFree(d_members); cudaFree(d_member_offsets); cudaFree(d_seg_bucket); cudaFree(d_seg_ofs);
+        d_members = nullptr; d_member_offsets = nullptr; d_seg_bucket = nullptr; d_seg_ofs = nullptr;
+        members_cap = offsets_cap = seg_bucket_cap = seg_ofs_cap = 0;
+        cudaFree(d_data); cudaFree(d_norms);
+        cudaFree(d_run_n); cudaFree(d_run_d); cudaFree(d_cur_n); cudaFree(d_cur_d);
+        cudaFree(d_tmp_n); cudaFree(d_tmp_d);
+        d_data = nullptr; d_norms = nullptr;
+        d_run_n = d_cur_n = d_tmp_n = nullptr; d_run_d = d_cur_d = d_tmp_d = nullptr;
     }
 };
 
@@ -5605,6 +5637,101 @@ static ReorderInfo compute_bucket_reorder(
 // iterations > 1: 重复跑 Step 2-6 (centroid 选取/分桶/邻居), 每次 seed 不同;
 //                 把 T 次 per-vector KNN 结果按距离 dedupe-merge 输出。
 //                 Bucket 文件 (Step 5) 仅保留最后一次 iteration 的结果。
+// GPU-resident 路径的收尾 (--fused-optimize-degree，用户 2026-10-21 同意把
+// optimize + translate_ids 合进 bucket2 进程)：跟独立的 optimize / translate_ids
+// 做的事完全一样——(N, M) 候选表 sanitize 成 uint32 → cuVS
+// cagra::helpers::optimize (CAGRA rank-based prune + 反向边 + merge，跟 optimize.cu
+// 同一个调用) → 按 inverse_perm 把行和邻居 id 翻回原始顺序 → 写 final_graph.bin
+// (跟 translate_ids 的输出格式相同: int64 N, int32 K, uint32 [N, K])。省掉的是
+// 两个进程的启动 (CUDA context)、256 MB 候选表和 128 MB 中间图的写盘/读盘。
+static void fused_optimize_translate(const std::vector<int32_t>& knn, int64_t N, int M, int K_out,
+                                     const std::vector<uint32_t>& inverse_perm, const std::string& out_path)
+{
+    using Clock = std::chrono::high_resolution_clock;
+    auto t0 = Clock::now();
+    if (K_out <= 0 || K_out > M)
+        throw std::runtime_error("fused optimize: --fused-optimize-degree must be in [1, " + std::to_string(M) + "]");
+    if (static_cast<int64_t>(knn.size()) != N * M || static_cast<int64_t>(inverse_perm.size()) != N)
+        throw std::runtime_error("fused optimize: size mismatch (knn / inverse_perm vs N)");
+
+    // ---- sanitize (同 optimize.cu sanitize_to_uint32_inplace): padding (-1) / 越界 /
+    //      自环换成该行第一个合法邻居，没有则 (i+1)%N；knn 还在被写盘线程读，另开一份 ----
+    // 不清零的 buffer: 缺页由下面的并行循环 first-touch (std::vector 会单线程清零 256 MB)
+    std::unique_ptr<uint32_t[]> g(new uint32_t[static_cast<size_t>(N) * M]);
+    int64_t n_pad = 0;
+    #pragma omp parallel for reduction(+:n_pad) schedule(static)
+    for (int64_t i = 0; i < N; ++i) {
+        const int32_t* row = knn.data() + i * M;
+        uint32_t* out = g.get() + i * M;
+        uint32_t fallback = static_cast<uint32_t>((i + 1) % N);
+        for (int j = 0; j < M; ++j) {
+            const int32_t v = row[j];
+            if (v >= 0 && v < N && v != i) { fallback = static_cast<uint32_t>(v); break; }
+        }
+        for (int j = 0; j < M; ++j) {
+            const int32_t v = row[j];
+            if (v < 0 || v >= N || v == i) { out[j] = fallback; if (v < 0) ++n_pad; }
+            else out[j] = static_cast<uint32_t>(v);
+        }
+    }
+    auto t1 = Clock::now();
+
+    // ---- prune + 反向边 (cuVS 26.10 public API，跟 optimize.cu 相同) ----
+    auto pruned = raft::make_host_matrix<uint32_t, int64_t>(N, K_out);
+    {
+        raft::resources res;
+        cuvs::neighbors::cagra::helpers::optimize(
+            res, raft::make_host_matrix_view<uint32_t, int64_t>(g.get(), N, M), pruned.view());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    g.reset();
+    auto t2 = Clock::now();
+
+    // ---- id 翻译 (同 translate_graph_ids.hpp): final[inv[i]][k] = inv[pruned[i][k]] ----
+    std::unique_ptr<uint32_t[]> fin(new uint32_t[static_cast<size_t>(N) * K_out]);
+    std::vector<uint8_t> hit(static_cast<size_t>(N), 0);
+    int64_t n_bad = 0;
+    const uint32_t* pr = pruned.data_handle();
+    #pragma omp parallel for reduction(+:n_bad) schedule(static)
+    for (int64_t i = 0; i < N; ++i) {
+        const uint32_t old_row = inverse_perm[static_cast<size_t>(i)];
+        if (old_row >= static_cast<uint64_t>(N)) { ++n_bad; continue; }   // bounds check
+        hit[old_row] = 1;
+        uint32_t* dst = fin.get() + static_cast<size_t>(old_row) * K_out;
+        const uint32_t* src = pr + static_cast<size_t>(i) * K_out;
+        for (int k = 0; k < K_out; ++k) {
+            uint32_t v = src[k];
+            if (v >= static_cast<uint64_t>(N)) { ++n_bad; v = 0; }   // bounds check
+            dst[k] = inverse_perm[v];
+        }
+    }
+    if (n_bad > 0)
+        throw std::runtime_error("fused optimize: " + std::to_string(n_bad) + " out-of-range ids during translation");
+    int64_t n_hit = 0;
+    #pragma omp parallel for reduction(+:n_hit) schedule(static)
+    for (int64_t i = 0; i < N; ++i) n_hit += hit[static_cast<size_t>(i)];
+    if (n_hit != N)   // inverse_perm 是置换 ⇔ 每个目标行恰好写到一次
+        throw std::runtime_error("fused optimize: inverse_perm is not a permutation (" +
+                                 std::to_string(n_hit) + " of " + std::to_string(N) + " rows hit)");
+    auto t3 = Clock::now();
+
+    {
+        std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+        const int32_t K32 = K_out;
+        out.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
+        out.write(reinterpret_cast<const char*>(&K32), sizeof(int32_t));
+        out.write(reinterpret_cast<const char*>(fin.get()),
+                  static_cast<std::streamsize>(static_cast<size_t>(N) * K_out * sizeof(uint32_t)));
+        if (!out.good()) throw std::runtime_error("fused optimize: write failed: " + out_path);
+    }
+    auto t4 = Clock::now();
+    auto sec = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+    std::cout << "  [FusedOptimize] K_out=" << K_out << " padding=" << n_pad
+              << " sanitize=" << std::fixed << std::setprecision(3) << sec(t0, t1)
+              << "s optimize=" << sec(t1, t2) << "s translate=" << sec(t2, t3)
+              << "s write=" << sec(t3, t4) << "s -> " << out_path << "\n";
+}
+
 template <typename DataT>
 int run_pipeline_impl(
     const std::string& input_path,
@@ -5772,6 +5899,8 @@ int run_pipeline_impl(
         // (见 GpuResidentKnn 的说明)：Step 4 的 query、Step 6 的 pool、跨轮合并
         // 都不再经过 CPU/磁盘。raw_host 留到 round 1 重排写 data_reordered 时用。
         std::unique_ptr<GpuResidentKnn<DataT>> gres;
+        // --fused-optimize-degree: round 1 重排的 inverse_perm 留到最后做 id 翻译
+        std::vector<uint32_t> fused_inv_perm;
         const bool raw_preloaded = !raw_host.empty();
         if (neighbors_m > 0 && neighbors_m <= 256 && mem_est.fits_in_gpu && !force_out_of_core) {
             size_t need = GpuResidentKnn<DataT>::bytes_needed(N, D, neighbors_m);
@@ -6218,6 +6347,7 @@ int run_pipeline_impl(
                 reorder_pos_of[static_cast<size_t>(bucket_process_order[static_cast<size_t>(pos)])] =
                     static_cast<int32_t>(pos);
             reorder_offsets_new = reorder_info.bucket_offsets;
+            if (gres && config.fused_optimize_degree > 0) fused_inv_perm = reorder_info.inverse_perm;
 
             // assignments 的新 ID 版本（只有 iterations==1 时 Step5 会用得上，
             // 见下面）不需要经过 assignments[old_id]/perm 这层逐点查找——重排
@@ -6598,9 +6728,24 @@ int run_pipeline_impl(
         // 结果) 按 chunk 顺序拼接成 vector_knn.bin / vector_dists.bin。
         if (gres) {
             auto t_write = Clock::now();
+            // --fused-optimize-degree: 下载完就在写盘的同时做 prune/反向边/id 翻译
+            std::function<void(const std::vector<int32_t>&)> tail;
+            double fused_s = 0.0;
+            if (config.fused_optimize_degree > 0) {
+                tail = [&](const std::vector<int32_t>& h_n) {
+                    auto tf = Clock::now();
+                    gres->release_device();   // 显存让给 cuVS optimize
+                    fused_optimize_translate(h_n, N, static_cast<int>(neighbors_m), config.fused_optimize_degree,
+                                             fused_inv_perm, output_dir + "/final_graph.bin");
+                    fused_s = std::chrono::duration<double>(Clock::now() - tf).count();
+                };
+            }
             gres->write_outputs(output_dir + "/vector_knn.bin",
                                 config.save_dists ? output_dir + "/vector_dists.bin" : std::string(),
-                                config.save_npy ? output_dir + "/neighbors.npy" : std::string());
+                                config.save_npy ? output_dir + "/neighbors.npy" : std::string(), tail);
+            if (tail)
+                std::cout << "[FusedOptimize] prune + reverse edges + id translation in-process: "
+                          << std::fixed << std::setprecision(3) << fused_s << "s (overlapped with the vector_knn.bin write)\n";
             std::cout << "[WriteVectorKNN] Saved vector_knn.bin / vector_dists.bin"
                       << (config.save_npy ? " / neighbors.npy" : " (--skip-npy)") << "\n";
             elapsed_write_knn = std::chrono::duration<double>(Clock::now() - t_write).count();
@@ -6756,6 +6901,11 @@ int main(int argc, char** argv) {
             ("skip-npy",      po::bool_switch()->default_value(false),
                 "Don't write neighbors.npy (vector_knn.bin as int64 NumPy, only for Python-side eval; "
                 "the build pipeline never reads it)")
+            ("fused-optimize-degree", po::value<int>(),
+                "GPU-resident path only: after the last round, prune + add reverse edges (cuVS "
+                "helpers::optimize) to this degree and translate ids back to the original order in this "
+                "process, writing final_graph.bin (replaces the separate optimize + translate_ids stages; "
+                "default 0 = off; the out-of-core path ignores it)")
             ("pq-bits-start", po::value<uint32_t>(),   "PQ starting bits (default 8)")
             ("pq-bits-min",   po::value<uint32_t>(),   "PQ minimum bits (default 4)")
             ("seed",          po::value<uint32_t>(),   "Random seed (default 42)")

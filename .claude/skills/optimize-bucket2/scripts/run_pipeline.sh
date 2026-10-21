@@ -58,12 +58,18 @@ for ((R = 0; R < REPS; R++)); do
   B2_FLAGS=(-i "$BASE" -o "$W" --centroid-ratio "$CENTROID_RATIO" --seed "$SEED"
             --knn-k "$KNN_K" --nprobe "$NPROBE" --neighbors-m "$NEIGHBORS_M" -t "$ITERATIONS")
   [[ $MODE == large ]] && B2_FLAGS+=(--out-of-core)
+  # GPU-resident path: bucket2 does prune + reverse edges + id translation in-process
+  # and writes final_graph.bin itself (user decision 2026-10-21); out-of-core ignores it
+  [[ $MODE == auto ]] && B2_FLAGS+=(--fused-optimize-degree "$OUTPUT_DEGREE")
   # shellcheck disable=SC2086
   timed bucket2 "$BIN/bucket2" "${B2_FLAGS[@]}" $BUCKET2_EXTRA || { echo "bucket2 FAILED"; kill $SMI; exit 3; }
   O=$W/$TAG
 
   PATH_USED=resident
-  if [[ $MODE == auto ]]; then
+  FUSED=0
+  if [[ $MODE == auto && -f $O/final_graph.bin ]]; then
+    FUSED=1   # resident path finished inside bucket2 (optimize + translate_ids folded in)
+  elif [[ $MODE == auto ]]; then
     # shellcheck disable=SC2086
     timed optimize "$BIN/optimize" -i "$O/data_reordered.u8bin" -g "$O/vector_knn.bin" \
       -o "$O/graph_new_ids.bin" --output-degree "$OUTPUT_DEGREE" $OPTIMIZE_EXTRA
@@ -87,8 +93,10 @@ for ((R = 0; R < REPS; R++)); do
       --tmp-dir "$W/tmp" $CHUNKED_EXTRA \
       || { echo "optimize_chunked FAILED"; kill $SMI; exit 3; }
   fi
-  timed translate "$BIN/translate_ids" -g "$O/graph_new_ids.bin" -p "$O/inverse_perm.bin" \
-    -o "$O/final_graph.bin" || { echo "translate FAILED"; kill $SMI; exit 3; }
+  if [[ $FUSED -eq 0 ]]; then
+    timed translate "$BIN/translate_ids" -g "$O/graph_new_ids.bin" -p "$O/inverse_perm.bin" \
+      -o "$O/final_graph.bin" || { echo "translate FAILED"; kill $SMI; exit 3; }
+  fi
   kill $SMI; wait $SMI 2>/dev/null
   echo "$PATH_USED" > "$RD/path.txt"
 
