@@ -1911,6 +1911,90 @@ static void min_cluster_distance(
     }
 }
 
+// KMeans|| 的 d(x, C) (8-bit 数据): 跟 Step 4 一样的精确 fp16 Tensor Core GEMM
+// (见 step4_f32_to_f16_kernel 处的论证: 8-bit 值在 fp16 精确，乘积和 < 2^24 在
+// fp32 累加里精确) + 一 warp 一行求 min。L2 值跟 cuVS fp32 brute_force
+// (L2Expanded: ‖x‖² + ‖c‖² − 2x·c, 负数截到 0) 逐位相同，所以 D² 采样结果不变，
+// 只是 GEMM 走 Tensor Core (V100 fp32 brute force 是 CUDA core)。
+__global__ void kmeans_row_min_kernel(const float* __restrict__ dots, const float* __restrict__ cnorm,
+                                      const float* __restrict__ xnorm, int64_t rows, int n,
+                                      float* __restrict__ out)
+{
+    const int64_t r = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (r >= rows) return;
+    const float* row = dots + r * n;
+    float m = INFINITY;
+    for (int j = lane; j < n; j += 32) m = fminf(m, cnorm[j] - 2.0f * row[j]);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) m = fminf(m, __shfl_xor_sync(0xFFFFFFFFu, m, off));
+    if (lane == 0) out[r] = fmaxf(xnorm[r] + m, 0.0f);
+}
+
+struct KmeansMinDistF16 {
+    static constexpr int64_t kTile = 4096;
+    cublasHandle_t h = nullptr;
+    cudaStream_t stream = nullptr;
+    int64_t N = 0; int D = 0;
+    __half* d_xh = nullptr; float* d_xn = nullptr;
+    __half* d_ch = nullptr; float* d_cn = nullptr; int64_t c_cap = 0;
+    float* d_dots = nullptr; int64_t dots_cap = 0;   // 元素数
+
+    KmeansMinDistF16(const float* d_x, int64_t N_, int D_, cudaStream_t st) : stream(st), N(N_), D(D_) {
+        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("KmeansMinDistF16: cublasCreate failed");
+        cublasSetStream(h, stream);
+        cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH);
+        const int64_t nd = N * D;
+        CUDA_CHECK(cudaMalloc(&d_xh, nd * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_xn, N * sizeof(float)));
+        step4_f32_to_f16_kernel<<<static_cast<unsigned>((nd + 255) / 256), 256, 0, stream>>>(d_x, d_xh, nd);
+        step4_row_norms_kernel<<<static_cast<unsigned>((N + 255) / 256), 256, 0, stream>>>(d_x, d_xn, N, D);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ~KmeansMinDistF16() {
+        cudaFree(d_xh); cudaFree(d_xn); cudaFree(d_ch); cudaFree(d_cn); cudaFree(d_dots);
+        if (h) cublasDestroy(h);
+    }
+    KmeansMinDistF16(const KmeansMinDistF16&) = delete;
+    KmeansMinDistF16& operator=(const KmeansMinDistF16&) = delete;
+
+    // d_min[i] = min_j ‖x_i − c_j‖²，C 是 (n, D) 的 device float
+    void run(const float* d_c, int64_t n, float* d_min) {
+        if (n <= 0) throw std::runtime_error("KmeansMinDistF16: empty candidate set");
+        if (n > c_cap) {
+            cudaFree(d_ch); cudaFree(d_cn);
+            CUDA_CHECK(cudaMalloc(&d_ch, n * D * sizeof(__half)));
+            CUDA_CHECK(cudaMalloc(&d_cn, n * sizeof(float)));
+            c_cap = n;
+        }
+        const int64_t tile = std::min<int64_t>(kTile, N);
+        if (tile * n > dots_cap) {
+            cudaFree(d_dots);
+            CUDA_CHECK(cudaMalloc(&d_dots, tile * n * sizeof(float)));
+            dots_cap = tile * n;
+        }
+        step4_f32_to_f16_kernel<<<static_cast<unsigned>((n * D + 255) / 256), 256, 0, stream>>>(d_c, d_ch, n * D);
+        step4_row_norms_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(d_c, d_cn, n, D);
+        CUDA_CHECK(cudaGetLastError());
+        const float alpha = 1.0f, beta = 0.0f;
+        for (int64_t t0 = 0; t0 < N; t0 += tile) {
+            const int64_t tn = std::min(tile, N - t0);
+            // dots (tn, n) row-major = x_tile · Cᵀ
+            cublasStatus_t st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N,
+                static_cast<int>(n), static_cast<int>(tn), D, &alpha,
+                d_ch, CUDA_R_16F, D, d_xh + t0 * D, CUDA_R_16F, D, &beta,
+                d_dots, CUDA_R_32F, static_cast<int>(n),
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (st != CUBLAS_STATUS_SUCCESS)
+                throw std::runtime_error("KmeansMinDistF16: fp16 GEMM failed, status=" + std::to_string(st));
+            const int64_t threads = tn * 32;
+            kmeans_row_min_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(
+                d_dots, d_cn, d_xn + t0, tn, static_cast<int>(n), d_min + t0);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+};
+
 // ============== Phase 9b: KMeans|| (Scalable KMeans++) Centroid Selection ==============
 
 /**
@@ -1940,7 +2024,8 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
     const LoadConfig& config,
     const MemoryEstimate& mem_est,
     SimpleQuantizer* out_quantizer,
-    float** d_centroids_f32)
+    float** d_centroids_f32,
+    bool exact8 = false)   // 数据是 8-bit (uint8/int8) 且没 PQ: d(x, C) 走精确 fp16 GEMM
 {
     std::cout << "[GPU Centroid Selection - KMeans|| + KMeans++]\n";
 
@@ -2049,9 +2134,16 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
         auto uniformRands = raft::make_device_vector<float, int64_t>(res, working_N);
         auto d_sel_flags = raft::make_device_vector<uint8_t, int64_t>(res, working_N);
 
+        std::unique_ptr<KmeansMinDistF16> f16_mcd;
+        if (exact8 && !mem_est.need_pq)
+            f16_mcd = std::make_unique<KmeansMinDistF16>(dataset_gpu.data_handle(), working_N, D, stream);
+        auto min_dist = [&](raft::device_matrix_view<const float, int64_t> C, float* out) {
+            if (f16_mcd) f16_mcd->run(C.data_handle(), C.extent(0), out);
+            else min_cluster_distance(res, X_view, C, out);
+        };
+
         // Step 2: Compute initial cost psi = phi_X(C)
-        min_cluster_distance(res, X_view, raft::make_const_mdspan(potentialCentroids),
-                             minClusterDistVec.data_handle());
+        min_dist(raft::make_const_mdspan(potentialCentroids), minClusterDistVec.data_handle());
         float psi = thrust::reduce(
             thrust::cuda::par.on(stream),
             thrust::device_pointer_cast(minClusterDistVec.data_handle()),
@@ -2142,10 +2234,9 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
             // (uniformRands 下一轮开头才重新生成，这里借来当临时 buffer)；最后一轮
             // 之后不再需要
             if (iter + 1 < niter) {
-                min_cluster_distance(res, X_view,
-                    raft::make_device_matrix_view<const float, int64_t>(
-                        CpRaw.data(), n_new, static_cast<int64_t>(D)),
-                    uniformRands.data_handle());
+                min_dist(raft::make_device_matrix_view<const float, int64_t>(
+                             CpRaw.data(), n_new, static_cast<int64_t>(D)),
+                         uniformRands.data_handle());
                 thrust::transform(thrust::cuda::par.on(stream),
                     thrust::device_pointer_cast(minClusterDistVec.data_handle()),
                     thrust::device_pointer_cast(minClusterDistVec.data_handle()) + working_N,
@@ -6183,7 +6274,8 @@ int run_pipeline_impl(
         // 返回 centroid 在训练集里的行号
         std::vector<int64_t> centroid_sample_indices = select_centroids_on_gpu_kmeans_parallel(
             X_train, train_map,
-            train_N, D, iter_config, mem_est, &quantizer, &d_centroids_f32);
+            train_N, D, iter_config, mem_est, &quantizer, &d_centroids_f32,
+            std::is_same<DataT, uint8_t>::value || std::is_same<DataT, int8_t>::value);
         double t2_select_call = std::chrono::duration<double>(Clock::now() - t2).count();
 
         // 训练行号 → raw_idx (bounds check)

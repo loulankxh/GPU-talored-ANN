@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#54 (out-of-core: KMeans|| train subset gathered from the raw u8 dataset, no full float copy)**, 2026-10-21:
+After **#56 (KMeans|| d(x, C) via exact fp16 Tensor Core GEMM for 8-bit data)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **6.82** (0.59x CAGRA) | 0.9284 / 0.9768 / 0.9943 | 2222K / 1184K |
-| SIFT1M large (out-of-core path) | **10.39** (0.90x CAGRA) | 0.9139 / 0.9709 / 0.9922 | 1950K / 1035K |
-| SIFT10M auto (→ large path, 1 run) | **109.02** (0.89x CAGRA) | 0.8383 / 0.9288 / 0.9739 | 1867K / 1011K |
+| SIFT1M auto (GPU-resident) | **6.80** (0.59x CAGRA) | 0.9283 / 0.9771 / 0.9943 | 1947K / 936K |
+| SIFT1M large (out-of-core path) | **10.23** (0.89x CAGRA; rerun) | see #56 | |
+| SIFT10M auto (→ large path, 1 run) | **104.66** (0.85x CAGRA; rerun 98.64 s = 0.80x) | 0.8392 / 0.9287 / 0.9742 | 1872K / 1040K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -1558,6 +1558,49 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8383 / 1867K | 0.9288 / 1011K | 0.9739 / 525K | 0.9920 / 174K | 0.9978 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +3.1% (10.72 → 10.39 s; rerun +3.5%), 10M-auto +1.7% (110.94 → 109.02 s, 0.89× CAGRA native; −5.5 GB RSS), 1M-auto +0.7%.
+
+### #56 — KMeans|| d(x, C) via exact fp16 Tensor Core GEMM (8-bit data)  (2026-10-21, commit TBD)
+**Idea / rationale:** KMeans|| (Step 2) computes d(x, C) for the train subset against each round's new candidates with cuVS fp32 `brute_force` (CUDA cores; SIFT10M: 1M train points × ~50K candidates per call, kmeans_parallel 4.15 s/round). For 8-bit data the same exact fp16 GEMM argument as Step 4 (#22) holds: values exact in fp16, products / sums < 2²⁴ exact in fp32. So `KmeansMinDistF16` converts X once to fp16 (+ ‖x‖²), and per call converts C, runs 4096-row tiles of `cublasGemmEx` fp16→fp32 Tensor Core GEMM and a warp-per-row min of ‖c‖² − 2x·c (+ ‖x‖², clamped at 0 like L2Expanded). The L2 values are bit-identical to brute_force, so D² sampling is unchanged: SIFT10M round-1 candidate counts and psi identical (49770 / 50007 / 50014). Only used when the input is uint8/int8 and PQ is off; other types keep brute_force. Same tiled GEMM + select shape as cuVS 26.12 `detail/knn_brute_force.cuh::tiled_brute_force_knn`, with tensor-core fp16 inputs.
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+**Borderline confirmation:** first run 1M-large +3.2% / 10M +4.0% (Step 6 +3.3 s noise on 10M); reruns 1M-large 10.23 s (+1.5%), 10M 98.64 s (+9.5%) → both judge runs ACCEPT. best.json stores 1M-large from the rerun and 10M from the first run (the slower of each pair).
+**SIFT10M:** kmeans_parallel 4.15 → 1.73 s/round, Step 2 14.6 → 7.4 s.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.80 | +0.3% | +68.7% | 0.59x | bucket2 6.80 | 3980 | 1.72 |
+| sift1M_large | large | 10.23 | +1.5% | +86.4% | 0.89x | bucket2 8.32, prune 0.84, optimize_chunked 0.64, translate 0.38 | 1858 | 2.21 |
+| sift10M_auto | large | 104.66 | +4.0% | +41.4% | 0.85x | bucket2 89.35, prune 7.00, optimize_chunked 4.85, translate 3.46 | 8998 | 14.03 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.63 | 0.26 | 0.17 | 0.00 | 0.61 | 0.50 | 0.02 | 3.14 | 0.00 | 0.91 |
+| sift1M_large | 0.13 | 0.61 | 0.34 | 0.00 | 1.12 | 0.41 | 0.04 | 4.51 | 0.52 | 0.00 |
+| sift10M_auto | 1.36 | 7.37 | 2.11 | 0.00 | 18.49 | 2.81 | 0.94 | 50.94 | 4.19 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9723 | 0.9660 | 0.9595 | 0.9535 |
+| sift1M_large | 0.9751 | 0.9665 | 0.9590 | 0.9529 |
+| sift10M_auto | 0.9193 | 0.8988 | 0.8840 | 0.8724 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9283 / 1947K | 0.9771 / 936K | 0.9943 / 561K | 0.9988 / 181K | 0.9997 / 68K |
+| ours sift1M_large | 0.9135 / 1941K | 0.9704 / 1032K | 0.9921 / 523K | 0.9982 / 187K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8392 / 1872K | 0.9287 / 1040K | 0.9742 / 526K | 0.9923 / 186K | 0.9980 / 68K |
+
+**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +4.0% (109.02 → 104.66 s; rerun +9.5%, 98.64 s = 0.80× CAGRA native), 1M-large +1.5% (rerun) / +3.2%, 1M-auto +0.3%.
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
