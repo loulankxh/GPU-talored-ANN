@@ -129,6 +129,7 @@ struct LoadConfig {
     float kmeans_train_fraction;
 
     // Output
+    bool save_dists;               // 写 vector_dists.bin (default true)；流水线后续阶段不读它
     bool save_npy;                 // 额外写 neighbors.npy (int64, 给 Python 端评测用), default true;
                                    // 构建流水线本身不读它
 
@@ -151,6 +152,7 @@ struct LoadConfig {
         gpu_safety_margin(0.1f),
         knn_k(32),
         kmeans_train_fraction(1.0f),
+        save_dists(true),
         save_npy(true)
     {}
 };
@@ -566,6 +568,9 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
         config.kmeans_train_fraction = vm["kmeans-train-fraction"].as<float>();
         if (!(config.kmeans_train_fraction > 0.0f && config.kmeans_train_fraction <= 1.0f))
             throw std::runtime_error("--kmeans-train-fraction must be in (0, 1]");
+    }
+    if (vm.count("skip-dists")) {
+        config.save_dists = !vm["skip-dists"].as<bool>();
     }
     if (vm.count("skip-npy")) {
         config.save_npy = !vm["skip-npy"].as<bool>();
@@ -2947,24 +2952,50 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
         s_id  [warp][lane * K_PER_LANE + p] = reg_id[p];
     }
     __syncthreads();
-    if (warp != 0) return;
 
-    for (int w = 1; w < G; ++w) {
-        for (int base = 0; base < K_OUT; base += LANES) {
-            float my_dist = s_dist[w][base + lane];
-            int32_t my_id = s_id[w][base + lane];
-            unsigned mask = __ballot_sync(ALL, my_dist < threshold);
-            while (mask) {
-                int src = __ffs(mask) - 1;
-                mask &= mask - 1;
-                float   c_dist = __shfl_sync(ALL, my_dist, src);
-                int32_t c_id   = __shfl_sync(ALL, my_id, src);
-                if (c_dist >= threshold) continue;
-                warp_topk_insert<K_PER_LANE>(reg_dist, reg_id, c_dist, c_id, lane);
-                threshold = __shfl_sync(ALL, reg_dist[K_PER_LANE - 1], LANES - 1);
+    // G 份各自升序的 top-K 列表做树形归并 (G → G/2 → … → 1)：每层每对列表由
+    // 一个 warp 用 merge-path (co-rank 二分) 并行算出合并后的前 K_OUT 个，
+    // 每 lane 负责 K_PER_LANE 个输出位置。原来是 warp 0 把其余 (G-1)*K_OUT 个
+    // 候选逐个 ballot + 移位插入，串行 ~几百次插入，占了这个 kernel 的大头。
+    // 同距离时 A (低编号 warp) 在前，结果集合跟原来一致，只有并列项的先后可能不同。
+    for (int step = 1; step < G; step <<= 1) {
+        float   o_dist[K_PER_LANE];
+        int32_t o_id  [K_PER_LANE];
+        const bool active = (warp % (2 * step) == 0) && (warp + step < G);
+        if (active) {
+            const float*   Ad = s_dist[warp];        const int32_t* Ai = s_id[warp];
+            const float*   Bd = s_dist[warp + step]; const int32_t* Bi = s_id[warp + step];
+            #pragma unroll
+            for (int p = 0; p < K_PER_LANE; ++p) {
+                const int k = lane * K_PER_LANE + p;   // 输出第 k 小 (0-based)
+                // i = 前 k+1 个合并结果里来自 A 的个数
+                int lo = max(0, k + 1 - K_OUT), hi = min(k + 1, K_OUT);
+                while (lo < hi) {
+                    int i = (lo + hi) >> 1;
+                    int j = k + 1 - i;
+                    // A 取 i 个太少 ⇔ B[j-1] 严格大于 A[i] (A 优先)
+                    if (j > 0 && i < K_OUT && Ad[i] <= Bd[j - 1]) lo = i + 1;
+                    else hi = i;
+                }
+                const int i = lo, j = k + 1 - i;
+                // 第 k 个 = A[i-1] 与 B[j-1] 中较晚出现的那个
+                // (相等时 B 在合并序里更靠后，所以取 B)
+                const bool fromA = (j == 0) || (i > 0 && Ad[i - 1] > Bd[j - 1]);
+                o_dist[p] = fromA ? Ad[i - 1] : Bd[j - 1];
+                o_id[p]   = fromA ? Ai[i - 1] : Bi[j - 1];
             }
         }
+        __syncthreads();
+        if (active) {
+            #pragma unroll
+            for (int p = 0; p < K_PER_LANE; ++p) {
+                s_dist[warp][lane * K_PER_LANE + p] = o_dist[p];
+                s_id  [warp][lane * K_PER_LANE + p] = o_id[p];
+            }
+        }
+        __syncthreads();
     }
+    if (warp != 0) return;
 
     const int64_t out_row = static_cast<int64_t>(ids_pool[q]) * out_ld;
     const float q_norm = norms_pool[q];
@@ -2972,9 +3003,9 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
     #pragma unroll
     for (int p = 0; p < K_PER_LANE; ++p) {
         if (base + p < K) {
-            int32_t local = reg_id[p];
+            int32_t local = s_id[0][base + p];
             out_neighbors[out_row + base + p] = (local >= 0) ? ids_pool[local] : -1;
-            out_dists[out_row + base + p]     = (local >= 0) ? reg_dist[p] + q_norm : INFINITY;
+            out_dists[out_row + base + p]     = (local >= 0) ? s_dist[0][base + p] + q_norm : INFINITY;
         }
     }
 }
@@ -3419,9 +3450,10 @@ struct GpuResidentKnn {
                        const std::string& npy_path) const {
         size_t nm = static_cast<size_t>(N) * M;
         std::vector<int32_t> h_n(nm);
-        std::vector<float>   h_d(nm);
+        std::vector<float>   h_d(dist_path.empty() ? 0 : nm);   // dist_path 为空 = 不写 vector_dists
         CUDA_CHECK(cudaMemcpy(h_n.data(), d_run_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_d.data(), d_run_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+        if (!dist_path.empty())
+            CUDA_CHECK(cudaMemcpy(h_d.data(), d_run_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
 
         int32_t M32 = M;
         auto write_bin = [&](const std::string& path, const void* body, size_t bytes) {
@@ -3432,7 +3464,9 @@ struct GpuResidentKnn {
             if (!out.good()) throw std::runtime_error("GpuResidentKnn: write failed: " + path);
         };
         auto f_knn  = std::async(std::launch::async, [&] { write_bin(knn_path, h_n.data(), nm * sizeof(int32_t)); });
-        auto f_dist = std::async(std::launch::async, [&] { write_bin(dist_path, h_d.data(), nm * sizeof(float)); });
+        auto f_dist = std::async(std::launch::async, [&] {
+            if (!dist_path.empty()) write_bin(dist_path, h_d.data(), nm * sizeof(float));
+        });
         if (!npy_path.empty()) {
             std::vector<int64_t> h64(nm);
             #pragma omp parallel for schedule(static)
@@ -3738,7 +3772,7 @@ struct ChunkedKnnAccumulator {
                 return fd;
             };
             fd_knn = open_out(final_knn_path);
-            fd_dist = open_out(final_dist_path);
+            if (!final_dist_path.empty()) fd_dist = open_out(final_dist_path);   // 空 = 不写 vector_dists
         }
         auto pwrite_all = [](int fd, const void* buf, size_t n, off_t off) {
             const char* p = static_cast<const char*>(buf);
@@ -3852,7 +3886,7 @@ struct ChunkedKnnAccumulator {
                     // chunk c 在最终文件里是第 [chunk_start, chunk_start+chunk_c_size) 行
                     const off_t ofs = hdr + static_cast<off_t>(chunk_start) * M * 4;
                     if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs) ||
-                        !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs))
+                        (fd_dist >= 0 && !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs)))
                         throw std::runtime_error("ChunkedKnnAccumulator: final pwrite failed for chunk " + std::to_string(c));
                     if (iter > 0) { std::filesystem::remove(np); std::filesystem::remove(dp); }
                 } else {
@@ -3874,7 +3908,7 @@ struct ChunkedKnnAccumulator {
         }
 
         if (is_final) {
-            if (::close(fd_knn) != 0 || ::close(fd_dist) != 0)
+            if (::close(fd_knn) != 0 || (fd_dist >= 0 && ::close(fd_dist) != 0))
                 throw std::runtime_error("ChunkedKnnAccumulator: close failed for final outputs");
             final_written = true;
         }
@@ -3935,7 +3969,8 @@ struct ChunkedKnnAccumulator {
             return;
         }
         std::ofstream kout(knn_path, std::ios::binary | std::ios::trunc);
-        std::ofstream dout(dist_path, std::ios::binary | std::ios::trunc);
+        std::ofstream dout(dist_path.empty() ? std::string("/dev/null") : dist_path,   // 空 = 不写 vector_dists
+                           std::ios::binary | std::ios::trunc);
         int32_t M32 = static_cast<int32_t>(M);
         kout.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
         kout.write(reinterpret_cast<const char*>(&M32), sizeof(int32_t));
@@ -5911,7 +5946,7 @@ int run_pipeline_impl(
                 ChunkedKnnAccumulator* acc_ptr = knn_acc.get();
                 if (iter == iterations - 1)
                     acc_ptr->set_final_output(output_dir + "/vector_knn.bin",
-                                              output_dir + "/vector_dists.bin", iter);
+                                              config.save_dists ? output_dir + "/vector_dists.bin" : std::string(), iter);
                 pending_knn_merge = std::async(std::launch::async,
                     [acc_ptr, iter]() { acc_ptr->merge_iteration(iter); });
             }
@@ -5947,7 +5982,8 @@ int run_pipeline_impl(
         // 结果) 按 chunk 顺序拼接成 vector_knn.bin / vector_dists.bin。
         if (gres) {
             auto t_write = Clock::now();
-            gres->write_outputs(output_dir + "/vector_knn.bin", output_dir + "/vector_dists.bin",
+            gres->write_outputs(output_dir + "/vector_knn.bin",
+                                config.save_dists ? output_dir + "/vector_dists.bin" : std::string(),
                                 config.save_npy ? output_dir + "/neighbors.npy" : std::string());
             std::cout << "[WriteVectorKNN] Saved vector_knn.bin / vector_dists.bin"
                       << (config.save_npy ? " / neighbors.npy" : " (--skip-npy)") << "\n";
@@ -5955,7 +5991,8 @@ int run_pipeline_impl(
         } else if (neighbors_m > 0) {
             auto t_write = Clock::now();
             knn_acc->finalize_to_file(
-                output_dir + "/vector_knn.bin", output_dir + "/vector_dists.bin");
+                output_dir + "/vector_knn.bin",
+                config.save_dists ? output_dir + "/vector_dists.bin" : std::string());
             std::filesystem::remove(knn_chunk_tmp_dir);  // 此时应已清空
 
             // 分块把 vector_knn.bin 转成 neighbors.npy，给 Python 端评测用
@@ -6095,6 +6132,8 @@ int main(int argc, char** argv) {
             ("kmeans-train-fraction", po::value<float>(),
                 "Step 2 (dataset fits on GPU): train KMeans|| on this random fraction of the points "
                 "(centroid count stays N*centroid-ratio; default 1.0 = all points)")
+            ("skip-dists",    po::bool_switch()->default_value(false),
+                "Don't write vector_dists.bin (distances of vector_knn.bin; no later pipeline stage reads it)")
             ("skip-npy",      po::bool_switch()->default_value(false),
                 "Don't write neighbors.npy (vector_knn.bin as int64 NumPy, only for Python-side eval; "
                 "the build pipeline never reads it)")

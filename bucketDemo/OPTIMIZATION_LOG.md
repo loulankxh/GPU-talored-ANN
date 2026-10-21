@@ -35,13 +35,15 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#23 (rounds 2..t: gather the KMeans|| subset through inverse_perm instead of re-materialising X)**, 2026-10-21:
+After **#26 (resident trims: top-M tree merge + `--skip-dists`)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **11.19** (0.97x CAGRA) | 0.9294 / 0.9776 / 0.9947 | 1946K / 1035K |
-| SIFT1M large (out-of-core path) | **28.91** | 0.9000 / 0.9640 / 0.9894 | 1947K / 1033K |
+| SIFT1M auto (GPU-resident) | **10.57** (0.92x CAGRA) | 0.9283 / 0.9771 / 0.9943 | 1948K / 1035K |
+| SIFT1M large (out-of-core path) | **29.15** | 0.9000 / 0.9638 / 0.9891 | 2217K / 1190K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
+
+(large 29.15 vs 28.91 after #23: within noise; large path unaffected except the skipped final dists write.)
 
 ## Ideas backlog
 
@@ -786,6 +788,41 @@ First large run (`runs/iter21/sift1M_large`): 31.80 s (−3.3%, just over the 3%
 | ours sift1M_large | 0.9000 / 1947K | 0.9640 / 1033K | 0.9894 / 492K | 0.9971 / 186K | 0.9992 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +5.3% (30.53 → 28.91 s), 1M-auto +3.7% (11.62 → 11.19 s; now below CAGRA native 11.54 s).
+
+### #26 — resident trims: top-M tree merge + `--skip-dists`  (2026-10-21)
+**Idea / rationale:** the two individually-measured small resident-path changes from #24 and #25, each ~0.3 s (≈2.5%) on their own and therefore below the 3% gate alone, benchmarked together (contributions are known from their separate quick tests): (1) #25 — `block_topK_from_dots_kernel` merges the G per-warp sorted top-K lists with a shared-memory merge-path tree instead of warp 0's serial ballot-insert of (G−1)·K_OUT candidates (same top-K set; resident Step 6 loop 0.95 → 0.86 s/round); (2) #24 — new `bucket2 --skip-dists` (default off) doesn't write `vector_dists.bin`, which no later stage reads (resident: no dists D2H/write, Write 0.75 → 0.48 s; out-of-core: final merge skips the dists pwrite); `params.sh` adds it. cuVS 26.12 references: `matrix/detail/select_warpsort.cuh` (warp-sort queues merged across warps in shared memory), CAGRA build only emitting the graph.
+**Files:** `src/bucket.cu`  **Params changed:** `BUCKET2_EXTRA` adds `--skip-dists`
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 10.57 | +5.5% | +51.4% | 0.92x | bucket2 8.89, optimize 1.30, translate 0.38 | 3810 | 1.38 |
+| sift1M_large | large | 29.15 | -0.8% | +61.2% | 2.53x | bucket2 25.75, prune 1.39, optimize_chunked 1.63, translate 0.37 | 1386 | 4.05 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.76 | 1.40 | 0.10 | 0.00 | 0.90 | 0.66 | 0.02 | 4.04 | 0.00 | 0.48 |
+| sift1M_large | 0.57 | 2.73 | 0.20 | 0.00 | 7.06 | 1.40 | 0.03 | 12.04 | 0.93 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9826 | 0.9755 | 0.9689 | 0.9638 |
+| sift1M_large | 0.9801 | 0.9750 | 0.9685 | 0.9635 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9283 / 1948K | 0.9771 / 1035K | 0.9943 / 494K | 0.9988 / 186K | 0.9997 / 68K |
+| ours sift1M_large | 0.9000 / 2217K | 0.9638 / 1190K | 0.9891 / 561K | 0.9974 / 188K | 0.9993 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +5.5% (11.19 → 10.57 s, 0.92× CAGRA native), 1M-large −0.8% (within tolerance).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
