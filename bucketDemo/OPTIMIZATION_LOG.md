@@ -1347,7 +1347,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +8.3% (178.47 → 163.74 s), 1M-auto +2.1% (7.54 → 7.38 s), 1M-large +0.3%.
 
-### #49 — shared per-row threshold in block top-M (#48) + out-of-core per-bucket submit trims and vectorized gather (#44)  (2026-10-21, commit TBD)
+### #49 — shared per-row threshold in block top-M (#48) + out-of-core per-bucket submit trims and vectorized gather (#44)  (2026-10-21, commit 8bf4767)
 **Idea / rationale:** (1) #48: in `block_topK_from_dots_kernel` (resident and out-of-core Step 6) the G=8 warps of a row each kept their own top-K threshold and warmed up from inf. Each warp now publishes its threshold to a shared-memory `atomicMin` (order-preserving float→uint key, since the partial distance ‖p‖² - 2·dot can be negative) and filters with the block minimum: any warp's current K-th is an upper bound of the row's K-th, so fewer serial ballot inserts (raft/faiss block-select filtering, cuVS 26.12 `detail/faiss_select`). Alone: resident loop 0.975 → 0.907 s/round, +2.98% auto. (2) #44 patch: out-of-core Step 6 GEMM timing events only with `BUCKET2_GEMM_TIMING`; job table read by the gather kernel through UVA-mapped pinned memory (no per-bucket H2D; `ev_h2d` recorded after the kernel); `devcache_gather_pool_kernel` with uchar4 loads / half2 stores. #44 alone moved the out-of-core loop from host-bound to GPU-bound; together with #48's cheaper top-M the out-of-core loop drops ~1.4 → ~1.25 s/round.
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
