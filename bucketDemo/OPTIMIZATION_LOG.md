@@ -1186,7 +1186,7 @@ Borderline → large rerun (`runs/iter38/sift1M_large_b`): 13.98 s (+5.6%), reca
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +4.4% (13.26 → 12.67 s, 1.10× CAGRA native; rerun +4.2%), 1M-auto −0.3% (noise, path untouched).
 
-### #42 — out-of-core: raw dataset kept in host memory + parallel bucket write  (2026-10-21, commit TBD)
+### #42 — out-of-core: raw dataset kept in host memory + parallel bucket write  (2026-10-21, commit 7868a6e)
 **Idea / rationale:** when 2·N·D B fits `cpu_limit/4` (the same rule as the in-memory Step 4.5 reorder), the out-of-core path reads the raw u8 dataset once in Step 1. Round 1's reorder permutes that copy instead of re-reading the file, and keeps the reordered copy as the new-coordinate dataset. Step 4 assignment (`batch_assign_with_cagra_anns`, new `host_raw` argument) and round 2..t bucket writes (`write_bucket_vectors_from_assignments`, centroids + chunks) take pointers into it instead of reading the disk 2–3 times per round. The copy is freed after the last round's bucket write; datasets over the budget (SIFT10M+) keep the per-range disk reads. Bundled with the #37 patch: deterministic multi-threaded `add_range_parallel` (in-memory mode, same in-bucket order) + byte-array centroid test. This follows the IVF-PQ build in cuVS 26.12 (`ivf_pq_build.cuh::extend`, `cagra_build.cuh::build_knn_graph`), which streams the host dataset from memory, not from files. Alone (run `iter42`) the change gave large 12.30 s (+2.9%, Step 4 2.22 → 1.55 s), with the bucket write's single-threaded copy left as the remaining cost.
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
