@@ -40,6 +40,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -49,6 +51,9 @@
 #include <omp.h>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <boost/program_options.hpp>
 
@@ -76,6 +81,31 @@ struct BucketWindowBlock {
 
 static size_t block_size_bytes(const BucketWindowBlock& b) {
     return b.candidates.size() * sizeof(int32_t) + b.vectors.size() * sizeof(float);
+}
+
+// 多线程 pread 一段文件到 dst (每线程读自己的子区间；页面首次触碰也随之
+// 并行，而不是一个线程串行 page-fault 几百 MB)。
+static void parallel_pread(const std::string& path, off_t offset, size_t bytes, void* dst)
+{
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) throw std::runtime_error("prune_windowed: cannot open " + path);
+    constexpr size_t kPiece = size_t(8) << 20;
+    const int64_t n_pieces = static_cast<int64_t>((bytes + kPiece - 1) / kPiece);
+    int64_t n_fail = 0;
+    #pragma omp parallel for schedule(dynamic) num_threads(16) reduction(+:n_fail)
+    for (int64_t i = 0; i < n_pieces; ++i) {
+        size_t lo = static_cast<size_t>(i) * kPiece;
+        size_t n = std::min(kPiece, bytes - lo);
+        char* p = static_cast<char*>(dst) + lo;
+        off_t off = offset + static_cast<off_t>(lo);
+        while (n > 0) {
+            ssize_t r = ::pread(fd, p, n, off);
+            if (r <= 0) { ++n_fail; break; }
+            p += r; n -= static_cast<size_t>(r); off += r;
+        }
+    }
+    ::close(fd);
+    if (n_fail > 0) throw std::runtime_error("prune_windowed: short read from " + path);
 }
 
 static void read_dataset_chunk(const std::string& path, const std::string& ext,
@@ -181,6 +211,7 @@ int main(int argc, char** argv)
                                      ") > input degree (" + std::to_string(M_in) + ")");
 
         const std::string dataset_ext = fs::path(dataset_path).extension().string();
+        const int32_t dataset_D_peek = load::read_fbin_header(dataset_path).second;   // BIGANN header: (N, D)
 
         // Belady bucket cache over (candidates, vectors) blocks, still part
         // of Step 2's setup -- no separate print, this is cheap.
@@ -244,7 +275,133 @@ int main(int argc, char** argv)
         double t_fetch = 0, t_window_build = 0, t_compute = 0, t_write = 0;
         int64_t min_center_count = std::numeric_limits<int64_t>::max(), max_center_count = 0;
 
-        for (int32_t pos = 0; pos < n_buckets; ++pos) {
+        // Batched fast path: 每个 bucket 只有 ~100 行 (SIFT1M)，逐 position
+        // 开一个 80 线程的 OpenMP 区域时 fork/join + 负载不均占了 compute 的
+        // 大头。整个窗口数据集 (candidates + vectors) 放得进 cache 预算时，
+        // 一次取 kBatch 个 position 的窗口 (每个 position 仍是自己的
+        // BucketWindow，剪枝语义不变)，再用一个并行区域处理这一批的全部行。放不进预算时走下面原来
+        // 的逐 position 路径 (可能淘汰，需要防御性拷贝)。
+        constexpr int32_t kBatch = 64;
+        const size_t total_window_bytes = static_cast<size_t>(N) *
+            (static_cast<size_t>(M_in) * sizeof(int32_t) + static_cast<size_t>(dataset_D_peek) * sizeof(float));
+        const bool batched = total_window_bytes <= (cache_mb << 20);
+        std::cout << "  mode=" << (batched ? "batched" : "per-position")
+                  << " (window data " << total_window_bytes / 1e6 << " MB, cache budget " << cache_mb << " MB)\n";
+        if (batched) {
+            // 整份窗口数据都放得进 cache 预算 → 不再经过 Belady cache 逐 bucket
+            // 读 (每个 bucket 两次 seek+read、数据集文件每次重新打开、再拷进
+            // BucketWindowBlock)：两次大块顺序读把 candidates / vectors 整份读进
+            // 来，每个窗口直接指向其中的切片 (bucket 在新 id 空间里连续)。
+            // 内存占用 = total_window_bytes ≤ --cache-mb，跟 cache 装满时一样。
+            auto tl0 = Clock::now();
+            const int32_t D_all = dataset_D_peek;
+            const size_t n_cand = static_cast<size_t>(N) * M_in;
+            const size_t n_vec  = static_cast<size_t>(N) * D_all;
+            std::unique_ptr<int32_t[]> all_cand_buf(new int32_t[n_cand]);   // 不初始化，pread 直接填
+            std::unique_ptr<float[]>   all_vec_buf(new float[n_vec]);
+            // vector_knn.bin: int64 N + int32 M header (12 B)，之后 (N, M) int32
+            parallel_pread(vknn_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
+                           n_cand * sizeof(int32_t), all_cand_buf.get());
+            if (dataset_ext == ".u8bin" || dataset_ext == ".i8bin") {
+                // 跟 load::read_u8bin_chunk_to_f32 同样的转换 (按 uint8 读)，并行做
+                std::unique_ptr<uint8_t[]> raw(new uint8_t[n_vec]);
+                parallel_pread(dataset_path, static_cast<off_t>(2 * sizeof(int32_t)), n_vec, raw.get());
+                float* out = all_vec_buf.get();
+                #pragma omp parallel for schedule(static)
+                for (int64_t i = 0; i < static_cast<int64_t>(n_vec); ++i)
+                    out[i] = static_cast<float>(raw[static_cast<size_t>(i)]);
+            } else {
+                std::vector<float> tmp;
+                int32_t D_tmp = 0;
+                read_dataset_chunk(dataset_path, dataset_ext, 0, N, tmp, D_tmp);
+                if (D_tmp != D_all || tmp.size() != n_vec)
+                    throw std::runtime_error("prune_windowed: bulk load size mismatch");
+                std::memcpy(all_vec_buf.get(), tmp.data(), n_vec * sizeof(float));
+            }
+            const int32_t* all_cand = all_cand_buf.get();
+            const float*   all_vec  = all_vec_buf.get();
+            t_fetch += std::chrono::duration<double>(Clock::now() - tl0).count();
+            struct Slice { int32_t pos; int64_t first, count; const int32_t* cand; const float* vec; };
+            auto slice_of = [&](int32_t bucket) {
+                const int32_t pos = pos_of[static_cast<size_t>(bucket)];
+                const int64_t lo = offsets_new[static_cast<size_t>(pos)];
+                const int64_t hi = offsets_new[static_cast<size_t>(pos) + 1];
+                return Slice{pos, lo, hi - lo,
+                             all_cand + static_cast<size_t>(lo) * M_in,
+                             all_vec + static_cast<size_t>(lo) * D_all};
+            };
+            std::vector<prune_windowed::BucketWindow> windows(
+                static_cast<size_t>(kBatch), prune_windowed::BucketWindow(offsets_new.data(), n_buckets));
+            std::vector<Slice> centers(static_cast<size_t>(kBatch));
+            std::vector<int64_t> row_start(static_cast<size_t>(kBatch) + 1);
+            std::vector<uint32_t> row_block;
+            for (int32_t pos0 = 0; pos0 < n_buckets; pos0 += kBatch) {
+                const int32_t nb = std::min(kBatch, n_buckets - pos0);
+
+                auto tf0 = Clock::now();
+                for (int32_t j = 0; j < nb; ++j) {
+                    const int32_t pos = pos0 + j;
+                    const int32_t b = order[static_cast<size_t>(pos)];
+                    auto& w = windows[static_cast<size_t>(j)];
+                    w.clear();
+                    (void)pos;
+                    auto add = [&](int32_t id) {
+                        Slice sl = slice_of(id);
+                        w.add_bucket(sl.pos, sl.cand, M_in, sl.vec, D_all);
+                        return sl;
+                    };
+                    centers[static_cast<size_t>(j)] = add(b);   // center
+                    for (int32_t nbk : adj[static_cast<size_t>(b)]) {
+                        if (nbk < 0 || nbk >= n_buckets) continue;
+                        add(nbk);
+                    }
+                }
+                t_fetch += std::chrono::duration<double>(Clock::now() - tf0).count();   // fetch + window build
+
+                row_start[0] = 0;
+                for (int32_t j = 0; j < nb; ++j) {
+                    const Slice& c = centers[static_cast<size_t>(j)];
+                    // 各 position 的 center bucket 在新 id 空间里首尾相接
+                    if (c.first != static_cast<int64_t>(offsets_new[static_cast<size_t>(pos0 + j)]))
+                        throw std::runtime_error("prune_windowed: center bucket not at its offset");
+                    min_center_count = std::min(min_center_count, c.count);
+                    max_center_count = std::max(max_center_count, c.count);
+                    row_start[static_cast<size_t>(j) + 1] = row_start[static_cast<size_t>(j)] + c.count;
+                }
+                const int64_t total_rows = row_start[static_cast<size_t>(nb)];
+                row_block.resize(static_cast<size_t>(total_rows) * output_degree);
+
+                auto tc0 = Clock::now();
+                #pragma omp parallel for schedule(dynamic, 16) reduction(+:total_lookups,total_hits)
+                for (int64_t r = 0; r < total_rows; ++r) {
+                    const int32_t j = static_cast<int32_t>(
+                        std::upper_bound(row_start.begin(), row_start.begin() + nb + 1, r) - row_start.begin()) - 1;
+                    const Slice& center = centers[static_cast<size_t>(j)];
+                    const prune_windowed::BucketWindow& w = windows[static_cast<size_t>(j)];
+                    const int64_t lk = r - row_start[static_cast<size_t>(j)];
+                    uint32_t a_id = static_cast<uint32_t>(center.first + lk);
+                    const int32_t* raw = center.cand + lk * M_in;
+
+                    for (int32_t k = 0; k < M_in; ++k) {
+                        if (raw[k] < 0) continue;
+                        total_lookups++;
+                        prune_windowed::PointData pd;
+                        if (w.get(static_cast<uint32_t>(raw[k]), pd)) total_hits++;
+                    }
+
+                    prune_windowed::prune_one_point(
+                        a_id, raw, M_in, D_all, w, output_degree,
+                        row_block.data() + static_cast<size_t>(r) * output_degree);
+                }
+                t_compute += std::chrono::duration<double>(Clock::now() - tc0).count();
+
+                auto tr0 = Clock::now();
+                writer.write_rows(row_block.data(), offsets_new[static_cast<size_t>(pos0)], total_rows);
+                t_write += std::chrono::duration<double>(Clock::now() - tr0).count();
+            }
+        }
+
+        for (int32_t pos = 0; !batched && pos < n_buckets; ++pos) {
             int32_t b = order[static_cast<size_t>(pos)];
 
             // Once the cache holds every bucket (resident_count() ==
