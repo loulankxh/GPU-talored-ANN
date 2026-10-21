@@ -1,0 +1,42 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index c25711c..223cf5a 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -2057,9 +2057,11 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
+ 
+         // Step 3-6: Oversampling rounds
+         for (int iter = 0; iter < niter; ++iter) {
+-            // Recompute min distances to ALL accumulated candidates (batched GEMM)
+-            min_cluster_distance(res, X_view, raft::make_const_mdspan(potentialCentroids),
+-                                 minClusterDistVec.data_handle());
++            // d(x, C) 是增量维护的 (cuVS 26.12 cluster/detail/kmeans.cuh::
++            // initScalableKMeansPlusPlus 同样只对新候选算距离再逐点取 min)：进入
++            // 本轮时 minClusterDistVec 已经是到全部已有候选的最小距离 (第 0 轮 =
++            // 上面对初始点算的那份，之后每轮末尾对新候选更新)，不再每轮对全部
++            // 候选 (1 → ~5K → ~10K) 重算。
+ 
+             // 子采样估计 psi: 仅对 ~1% 的点求和，再放大回估计值
+             // strided iterator 访问 min_dist[0], min_dist[stride], min_dist[2*stride], ...
+@@ -2120,6 +2122,22 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
+             potentialCentroids = raft::make_device_matrix_view<float, int64_t>(
+                 centroidsBuf.data(), tot, static_cast<int64_t>(D));
+ 
++            // 下一轮要用的 d(x, C): 只对本轮新候选算一遍，跟已有的逐点取 min
++            // (uniformRands 下一轮开头才重新生成，这里借来当临时 buffer)；最后一轮
++            // 之后不再需要
++            if (iter + 1 < niter) {
++                min_cluster_distance(res, X_view,
++                    raft::make_device_matrix_view<const float, int64_t>(
++                        CpRaw.data(), n_new, static_cast<int64_t>(D)),
++                    uniformRands.data_handle());
++                thrust::transform(thrust::cuda::par.on(stream),
++                    thrust::device_pointer_cast(minClusterDistVec.data_handle()),
++                    thrust::device_pointer_cast(minClusterDistVec.data_handle()) + working_N,
++                    thrust::device_pointer_cast(uniformRands.data_handle()),
++                    thrust::device_pointer_cast(minClusterDistVec.data_handle()),
++                    thrust::minimum<float>());
++            }
++
+             // GPU-side flag diff + ordered compact — 避免 working_N 字节 D2H
+             // sampleCentroids 标记新点 → isSampleCentroid; CUB 保序
+             {
