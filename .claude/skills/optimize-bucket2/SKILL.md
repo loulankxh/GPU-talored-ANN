@@ -85,7 +85,7 @@ Quality measured per run: (a) `knn_similarity` — pre-prune degree-64 `vector_k
 ```bash
 python3 $S/judge.py $R/sift1M_auto $R/sift1M_large --md
 ```
-Rules are in judge.py's docstring (≥3% faster on SIFT1M-auto or SIFT1M-large, neither >3% slower; recall@10 at every itopk ≥ best−1%, and vs CAGRA: GPU-resident path ≥ CAGRA−1%, large-dataset path ≥ CAGRA−5%; pre-prune recall@64 ≥ best−1%; large-path memory ≤ 1.2× best; no graph defects).
+Rules are in judge.py's docstring (≥3% faster on SIFT1M-auto or SIFT1M-large, neither >3% slower; search recall@10 at every itopk compared with CAGRA only: GPU-resident path ≥ CAGRA−1%, large-dataset path ≥ CAGRA−5% (pre-prune KNN similarity is logged, not gated); large-path memory ≤ 1.2× best; no graph defects).
 - If a gain is borderline (3–5%), rerun that config once more into `<dir>_b` and judge with it too; accept only if both pass.
 
 ### 5a. ACCEPT

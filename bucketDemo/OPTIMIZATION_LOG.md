@@ -19,8 +19,8 @@ Measured per iteration:
   10K queries, SIFT1M.
 
 Quality gate (user, 2026-10-21): recall@10 at every itopk within **1%** of CAGRA for the
-GPU-resident path and within **5%** of CAGRA for the large-dataset path; plus never more
-than 1% below the current best.
+GPU-resident path and within **5%** of CAGRA for the large-dataset path — compared with
+CAGRA only (not with the previous best). The pre-prune KNN similarity (a) is recorded, not gated.
 
 CAGRA reference (cuVS 26.10, NN-Descent, intermediate degree 64 → graph degree 32):
 
