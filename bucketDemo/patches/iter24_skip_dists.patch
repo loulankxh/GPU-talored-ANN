@@ -1,0 +1,143 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index e7458b4..d9e694e 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -129,6 +129,7 @@ struct LoadConfig {
+     float kmeans_train_fraction;
+ 
+     // Output
++    bool save_dists;               // 写 vector_dists.bin (default true)；流水线后续阶段不读它
+     bool save_npy;                 // 额外写 neighbors.npy (int64, 给 Python 端评测用), default true;
+                                    // 构建流水线本身不读它
+ 
+@@ -151,6 +152,7 @@ struct LoadConfig {
+         gpu_safety_margin(0.1f),
+         knn_k(32),
+         kmeans_train_fraction(1.0f),
++        save_dists(true),
+         save_npy(true)
+     {}
+ };
+@@ -567,6 +569,9 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
+         if (!(config.kmeans_train_fraction > 0.0f && config.kmeans_train_fraction <= 1.0f))
+             throw std::runtime_error("--kmeans-train-fraction must be in (0, 1]");
+     }
++    if (vm.count("skip-dists")) {
++        config.save_dists = !vm["skip-dists"].as<bool>();
++    }
+     if (vm.count("skip-npy")) {
+         config.save_npy = !vm["skip-npy"].as<bool>();
+     }
+@@ -3419,9 +3424,10 @@ struct GpuResidentKnn {
+                        const std::string& npy_path) const {
+         size_t nm = static_cast<size_t>(N) * M;
+         std::vector<int32_t> h_n(nm);
+-        std::vector<float>   h_d(nm);
++        std::vector<float>   h_d(dist_path.empty() ? 0 : nm);   // dist_path 为空 = 不写 vector_dists
+         CUDA_CHECK(cudaMemcpy(h_n.data(), d_run_n, nm * sizeof(int32_t), cudaMemcpyDeviceToHost));
+-        CUDA_CHECK(cudaMemcpy(h_d.data(), d_run_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
++        if (!dist_path.empty())
++            CUDA_CHECK(cudaMemcpy(h_d.data(), d_run_d, nm * sizeof(float), cudaMemcpyDeviceToHost));
+ 
+         int32_t M32 = M;
+         auto write_bin = [&](const std::string& path, const void* body, size_t bytes) {
+@@ -3432,7 +3438,9 @@ struct GpuResidentKnn {
+             if (!out.good()) throw std::runtime_error("GpuResidentKnn: write failed: " + path);
+         };
+         auto f_knn  = std::async(std::launch::async, [&] { write_bin(knn_path, h_n.data(), nm * sizeof(int32_t)); });
+-        auto f_dist = std::async(std::launch::async, [&] { write_bin(dist_path, h_d.data(), nm * sizeof(float)); });
++        auto f_dist = std::async(std::launch::async, [&] {
++            if (!dist_path.empty()) write_bin(dist_path, h_d.data(), nm * sizeof(float));
++        });
+         if (!npy_path.empty()) {
+             std::vector<int64_t> h64(nm);
+             #pragma omp parallel for schedule(static)
+@@ -3738,7 +3746,7 @@ struct ChunkedKnnAccumulator {
+                 return fd;
+             };
+             fd_knn = open_out(final_knn_path);
+-            fd_dist = open_out(final_dist_path);
++            if (!final_dist_path.empty()) fd_dist = open_out(final_dist_path);   // 空 = 不写 vector_dists
+         }
+         auto pwrite_all = [](int fd, const void* buf, size_t n, off_t off) {
+             const char* p = static_cast<const char*>(buf);
+@@ -3852,7 +3860,7 @@ struct ChunkedKnnAccumulator {
+                     // chunk c 在最终文件里是第 [chunk_start, chunk_start+chunk_c_size) 行
+                     const off_t ofs = hdr + static_cast<off_t>(chunk_start) * M * 4;
+                     if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs) ||
+-                        !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs))
++                        (fd_dist >= 0 && !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs)))
+                         throw std::runtime_error("ChunkedKnnAccumulator: final pwrite failed for chunk " + std::to_string(c));
+                     if (iter > 0) { std::filesystem::remove(np); std::filesystem::remove(dp); }
+                 } else {
+@@ -3874,7 +3882,7 @@ struct ChunkedKnnAccumulator {
+         }
+ 
+         if (is_final) {
+-            if (::close(fd_knn) != 0 || ::close(fd_dist) != 0)
++            if (::close(fd_knn) != 0 || (fd_dist >= 0 && ::close(fd_dist) != 0))
+                 throw std::runtime_error("ChunkedKnnAccumulator: close failed for final outputs");
+             final_written = true;
+         }
+@@ -3935,7 +3943,8 @@ struct ChunkedKnnAccumulator {
+             return;
+         }
+         std::ofstream kout(knn_path, std::ios::binary | std::ios::trunc);
+-        std::ofstream dout(dist_path, std::ios::binary | std::ios::trunc);
++        std::ofstream dout(dist_path.empty() ? std::string("/dev/null") : dist_path,   // 空 = 不写 vector_dists
++                           std::ios::binary | std::ios::trunc);
+         int32_t M32 = static_cast<int32_t>(M);
+         kout.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
+         kout.write(reinterpret_cast<const char*>(&M32), sizeof(int32_t));
+@@ -5911,7 +5920,7 @@ int run_pipeline_impl(
+                 ChunkedKnnAccumulator* acc_ptr = knn_acc.get();
+                 if (iter == iterations - 1)
+                     acc_ptr->set_final_output(output_dir + "/vector_knn.bin",
+-                                              output_dir + "/vector_dists.bin", iter);
++                                              config.save_dists ? output_dir + "/vector_dists.bin" : std::string(), iter);
+                 pending_knn_merge = std::async(std::launch::async,
+                     [acc_ptr, iter]() { acc_ptr->merge_iteration(iter); });
+             }
+@@ -5947,7 +5956,8 @@ int run_pipeline_impl(
+         // 结果) 按 chunk 顺序拼接成 vector_knn.bin / vector_dists.bin。
+         if (gres) {
+             auto t_write = Clock::now();
+-            gres->write_outputs(output_dir + "/vector_knn.bin", output_dir + "/vector_dists.bin",
++            gres->write_outputs(output_dir + "/vector_knn.bin",
++                                config.save_dists ? output_dir + "/vector_dists.bin" : std::string(),
+                                 config.save_npy ? output_dir + "/neighbors.npy" : std::string());
+             std::cout << "[WriteVectorKNN] Saved vector_knn.bin / vector_dists.bin"
+                       << (config.save_npy ? " / neighbors.npy" : " (--skip-npy)") << "\n";
+@@ -5955,7 +5965,8 @@ int run_pipeline_impl(
+         } else if (neighbors_m > 0) {
+             auto t_write = Clock::now();
+             knn_acc->finalize_to_file(
+-                output_dir + "/vector_knn.bin", output_dir + "/vector_dists.bin");
++                output_dir + "/vector_knn.bin",
++                config.save_dists ? output_dir + "/vector_dists.bin" : std::string());
+             std::filesystem::remove(knn_chunk_tmp_dir);  // 此时应已清空
+ 
+             // 分块把 vector_knn.bin 转成 neighbors.npy，给 Python 端评测用
+@@ -6095,6 +6106,8 @@ int main(int argc, char** argv) {
+             ("kmeans-train-fraction", po::value<float>(),
+                 "Step 2 (dataset fits on GPU): train KMeans|| on this random fraction of the points "
+                 "(centroid count stays N*centroid-ratio; default 1.0 = all points)")
++            ("skip-dists",    po::bool_switch()->default_value(false),
++                "Don't write vector_dists.bin (distances of vector_knn.bin; no later pipeline stage reads it)")
+             ("skip-npy",      po::bool_switch()->default_value(false),
+                 "Don't write neighbors.npy (vector_knn.bin as int64 NumPy, only for Python-side eval; "
+                 "the build pipeline never reads it)")
+diff --git a/bucketDemo/buildBucket/src/load.hpp b/bucketDemo/buildBucket/src/load.hpp
+index e17cba6..a7b51a9 100644
+--- a/bucketDemo/buildBucket/src/load.hpp
++++ b/bucketDemo/buildBucket/src/load.hpp
+@@ -80,7 +80,8 @@ inline void read_u8bin_to_f32(const std::string& path,
+     require(in.good(), "Failed to read uint8 payload from: " + path);
+ 
+     out.resize(cnt);
+-    for (uint64_t i = 0; i < cnt; ++i) out[i] = static_cast<float>(tmp[i]);
++    #pragma omp parallel for schedule(static)
++    for (int64_t i = 0; i < static_cast<int64_t>(cnt); ++i) out[static_cast<size_t>(i)] = static_cast<float>(tmp[static_cast<size_t>(i)]);
+ }
+ 
+ // .ibin: header int32 N,D then N*D int32
