@@ -20,7 +20,9 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_ARCHITECTURES 70 80 86)
 # set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fopenmp -Xcompiler=-mavx2 -Xcompiler=-mfma -Xcompiler=-msse4.2")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma -msse2 -ftree-vectorize -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free -fopenmp -fopenmp-simd -funroll-loops -Wfatal-errors -DUSE_AVX2 -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE --extended-lambda --expt-relaxed-constexpr")
+# -Xcompiler=-fopenmp: OpenMP::OpenMP_CXX 只作用于 CXX，不加的话 .cu 里 raft 的 host 端
+# #pragma omp（NN-Descent / optimize / refine）全部单线程，NN-Descent 建图慢 6 倍
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fopenmp -DLIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE --extended-lambda --expt-relaxed-constexpr")
 
 find_package(Boost REQUIRED COMPONENTS program_options)
 find_package(OpenMP REQUIRED)
@@ -101,6 +103,8 @@ add_executable(nnbuild_exact ${BUILD_SRC_PATH}/build_exact.cu)
 target_link_libraries(nnbuild_exact
     PRIVATE
     CUDA::cudart
+    CUDA::cublasLt
+    CUDA::cusolver
     OpenMP::OpenMP_CXX
     raft::raft
     fmt
@@ -125,4 +129,23 @@ set_target_properties(nnbuild_exact PROPERTIES
 set_target_properties(nnbuild PROPERTIES
     BUILD_RPATH ${CONDA_LIB}
     # BUILD_RPATH ${RAFT_LIB}
+)
+# CAGRA build-time benchmark (IVF-PQ vs NN-Descent), driven by run_build_bench.sh
+add_executable(build_bench ${BUILD_SRC_PATH}/build_bench.cu)
+
+target_link_libraries(build_bench
+    PRIVATE
+    CUDA::cudart
+    CUDA::cublas
+    CUDA::cublasLt
+    CUDA::curand
+    CUDA::cusolver
+    CUDA::cusparse
+    OpenMP::OpenMP_CXX
+    raft::raft
+    fmt
+)
+
+set_target_properties(build_bench PROPERTIES
+    BUILD_RPATH ${CONDA_LIB}
 )
