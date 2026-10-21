@@ -1,0 +1,121 @@
+diff --git a/.claude/skills/optimize-bucket2/scripts/run_pipeline.sh b/.claude/skills/optimize-bucket2/scripts/run_pipeline.sh
+index f79616c..6cb185c 100755
+--- a/.claude/skills/optimize-bucket2/scripts/run_pipeline.sh
++++ b/.claude/skills/optimize-bucket2/scripts/run_pipeline.sh
+@@ -90,10 +90,12 @@ for ((R = 0; R < REPS; R++)); do
+     timed optimize_chunked "$BIN/optimize_chunked" -g "$O/forward_graph_reordered.bin" \
+       -o "$O/graph_new_ids.bin" -m E --bucket-offsets "$O/bucket_offsets.bin" \
+       --gpu-budget-mb "$CHUNKED_GPU_BUDGET_MB" --edge-buffer-mb "$CHUNKED_EDGE_BUFFER_MB" \
+-      --tmp-dir "$W/tmp" $CHUNKED_EXTRA \
++      --tmp-dir "$W/tmp" --inverse-perm "$O/inverse_perm.bin" --final-output "$O/final_graph.bin" $CHUNKED_EXTRA \
+       || { echo "optimize_chunked FAILED"; kill $SMI; exit 3; }
+   fi
+-  if [[ $FUSED -eq 0 ]]; then
++  # final_graph.bin already there: id translation was done in-process (bucket2 resident
++  # path, or optimize_chunked when its phase 2 ran on the GPU)
++  if [[ ! -f $O/final_graph.bin ]]; then
+     timed translate "$BIN/translate_ids" -g "$O/graph_new_ids.bin" -p "$O/inverse_perm.bin" \
+       -o "$O/final_graph.bin" || { echo "translate FAILED"; kill $SMI; exit 3; }
+   fi
+diff --git a/bucketDemo/buildBucket/src/optimize_chunked.cu b/bucketDemo/buildBucket/src/optimize_chunked.cu
+index 0956490..2f50cac 100644
+--- a/bucketDemo/buildBucket/src/optimize_chunked.cu
++++ b/bucketDemo/buildBucket/src/optimize_chunked.cu
+@@ -54,6 +54,7 @@
+ #include "load.hpp"
+ #include "graph_io.hpp"
+ #include "edge_chunk_accumulator.hpp"
++#include "translate_graph_ids.hpp"
+ 
+ namespace po = boost::program_options;
+ 
+@@ -1380,6 +1381,8 @@ static void run_method_E(
+     const std::string& out_path,
+     int64_t N, int32_t K_out,
+     const ChunkPlan& plan,
++    const std::string& inv_perm_path,   // 跟 final_path 一起给: GPU phase 2 时进程内做 id 翻译
++    const std::string& final_path,
+     size_t gpu_budget_bytes,
+     size_t edge_buffer_bytes,
+     const std::string& tmp_dir)
+@@ -1716,8 +1719,44 @@ static void run_method_E(
+             throw std::runtime_error("Method E: cannot reopen " + fwd_path);
+         fwd_in2.seekg(sizeof(int64_t) + sizeof(int32_t), std::ios::beg);
+ 
+-        graph_io::StreamingGraphWriter writer(out_path, N, K_out);
+-        if (gpu_phase2) {
++        // GPU phase 2 时合并好的整张图已经在 host 内存: 给了 --final-output 就在这里
++        // 直接按 inverse_perm 翻回原始 id 顺序 (同 translate_graph_ids.hpp，带越界 /
++        // 置换检查) 写 final_graph.bin，省掉 translate_ids 进程把 N*K_out 的中间图
++        // 写盘再整份读回；否则照旧写 out_path，由 translate_ids 翻译。
++        const bool fused_final = gpu_phase2 && !final_path.empty();
++        graph_io::StreamingGraphWriter writer(fused_final ? final_path : out_path, N, K_out);
++        if (gpu_phase2 && fused_final) {
++            auto tt0 = Clock::now();
++            const std::vector<uint32_t> inv = translate_ids::read_inverse_perm(inv_perm_path, N);
++            std::unique_ptr<uint32_t[]> fin(new uint32_t[static_cast<size_t>(N) * K_out]);
++            std::vector<uint8_t> hit(static_cast<size_t>(N), 0);
++            int64_t n_bad = 0;
++            #pragma omp parallel for reduction(+:n_bad) schedule(static)
++            for (int64_t i = 0; i < N; ++i) {
++                const uint32_t old_row = inv[static_cast<size_t>(i)];
++                if (old_row >= static_cast<uint64_t>(N)) { ++n_bad; continue; }   // bounds check
++                hit[old_row] = 1;
++                const uint32_t* src = gpu_merged_rows.data() + static_cast<size_t>(i) * K_out;
++                uint32_t* dst = fin.get() + static_cast<size_t>(old_row) * K_out;
++                for (int32_t k = 0; k < K_out; ++k) {
++                    uint32_t v = src[k];
++                    if (v >= static_cast<uint64_t>(N)) { ++n_bad; v = 0; }   // bounds check
++                    dst[k] = inv[v];
++                }
++            }
++            if (n_bad > 0)
++                throw std::runtime_error("Method E: " + std::to_string(n_bad) + " out-of-range ids during id translation");
++            int64_t n_hit = 0;
++            #pragma omp parallel for reduction(+:n_hit) schedule(static)
++            for (int64_t i = 0; i < N; ++i) n_hit += hit[static_cast<size_t>(i)];
++            if (n_hit != N)
++                throw std::runtime_error("Method E: inverse_perm is not a permutation (" + std::to_string(n_hit) +
++                                         " of " + std::to_string(N) + " rows hit)");
++            { auto _drop = std::move(gpu_merged_rows); }
++            writer.write_rows(fin.get(), 0, N);
++            std::cout << "  [Method E] phase 2 on GPU; ids translated in-process -> " << final_path << " ["
++                      << std::chrono::duration<double>(Clock::now() - tt0).count() << "s]\n";
++        } else if (gpu_phase2) {
+             writer.write_rows(gpu_merged_rows.data(), 0, N);
+             std::cout << "  [Method E] phase 2 on GPU\n";
+         }
+@@ -1778,6 +1817,12 @@ int main(int argc, char** argv)
+                 "Input pruned forward graph (cagra_graph.bin format)")
+             ("output,o", po::value<std::string>()->required(),
+                 "Output graph after reverse-edge merge")
++            ("inverse-perm", po::value<std::string>()->default_value(""),
++                "Method E: inverse_perm.bin (bucket2's reorder). With --final-output, when phase 2 runs on the "
++                "GPU the merged graph is translated back to the original id order in-process and written to "
++                "--final-output instead of --output (same result as translate_ids)")
++            ("final-output", po::value<std::string>()->default_value(""),
++                "Method E: translated graph path (see --inverse-perm); not written when phase 2 runs on the CPU")
+             ("method,m", po::value<std::string>()->default_value("A"),
+                 "Method: A (kernel-filter, multi-pass PCIe), "
+                 "B (pre-shuffle pairs), "
+@@ -1812,6 +1857,10 @@ int main(int argc, char** argv)
+ 
+         const std::string fwd_path  = vm["forward-graph"].as<std::string>();
+         const std::string out_path  = vm["output"].as<std::string>();
++        const std::string inv_perm_path = vm["inverse-perm"].as<std::string>();
++        const std::string final_path    = vm["final-output"].as<std::string>();
++        if (inv_perm_path.empty() != final_path.empty())
++            throw std::runtime_error("--inverse-perm and --final-output must be given together");
+         const std::string method    = vm["method"].as<std::string>();
+         const size_t gpu_budget_mb  = vm["gpu-budget-mb"].as<size_t>();
+         const size_t gpu_budget_b   = gpu_budget_mb << 20;
+@@ -1866,7 +1915,8 @@ int main(int argc, char** argv)
+ 
+             std::cout << "=== Step 3: Reverse graph + merge (method E) ===\n";
+             auto t2 = Clock::now();
+-            run_method_E(fwd_path, out_path, N, K_out, plan, gpu_budget_b, edge_buffer_b, tmp_dir);
++            run_method_E(fwd_path, out_path, N, K_out, plan, inv_perm_path, final_path,
++                         gpu_budget_b, edge_buffer_b, tmp_dir);
+             std::cout << "  Done [" << std::chrono::duration<double>(Clock::now() - t2).count()
+                       << "s]\n";
+ 
