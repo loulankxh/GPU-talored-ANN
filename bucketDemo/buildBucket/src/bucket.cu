@@ -16,6 +16,7 @@
 #include <cstring>
 #include <type_traits>
 #include <omp.h>
+#include <optional>
 #include <chrono>
 #include <future>
 #include <functional>
@@ -1168,6 +1169,27 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
 
     std::vector<uint32_t> h_top2(Nv * TOP_K);
 
+    // GPU-resident 路径 (非 PQ, queries 直接从显存 gather): 用 exact brute-force
+    // top-2 (cuVS brute_force = 分块 GEMM + select_k，对应 cuVS 26.12
+    // detail/knn_brute_force.cuh::tiled_brute_force_knn) 代替近似的 CAGRA 图
+    // 搜索——10K centroids × 990K 点的 GEMM 在 V100 上比 CAGRA single-CTA
+    // 搜索 (~0.7s/轮) 快，而且结果是精确 top-2。out-of-core / PQ 路径不变。
+    const bool use_bf = !is_pq && static_cast<bool>(gpu_query_loader);
+    std::optional<cuvs::neighbors::brute_force::index<float, float>> bf_idx;
+    int64_t* d_top2_i64 = nullptr;
+    std::vector<int64_t> h_top2_i64;
+    if constexpr (!is_pq) {
+        if (use_bf) {
+            cuvs::neighbors::brute_force::index_params bp;
+            bp.metric = cuvs::distance::DistanceType::L2Expanded;
+            bf_idx.emplace(cuvs::neighbors::brute_force::build(res, bp,
+                raft::make_device_matrix_view<const float, int64_t>(
+                    d_centroids, n_centroids, static_cast<int64_t>(D))));
+            CUDA_CHECK(cudaMalloc(&d_top2_i64, Nv * TOP_K * sizeof(int64_t)));
+            h_top2_i64.resize(static_cast<size_t>(Nv) * TOP_K);
+        }
+    }
+
     t_setup = std::chrono::duration<double>(Clock::now() - t_setup0).count();
 
     for (int64_t batch_start = 0; batch_start < N_nc; batch_start += Nv) {
@@ -1236,17 +1258,48 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         auto distances_view = raft::make_device_matrix_view<float, int64_t>(
             d_distances, batch_size, static_cast<int64_t>(TOP_K));
 
-        cuvs::neighbors::cagra::search(res, sp, cagra_idx,
-            queries_view, neighbors_view, distances_view);
+        bool searched_bf = false;
+        if constexpr (!is_pq) {
+            if (use_bf) {
+                cuvs::neighbors::brute_force::search(res, *bf_idx,
+                    raft::make_device_matrix_view<const float, int64_t>(
+                        d_queries, batch_size, static_cast<int64_t>(D)),
+                    raft::make_device_matrix_view<int64_t, int64_t>(
+                        d_top2_i64, batch_size, static_cast<int64_t>(TOP_K)),
+                    distances_view);
+                searched_bf = true;
+            }
+        }
+        if (!searched_bf) {
+            cuvs::neighbors::cagra::search(res, sp, cagra_idx,
+                queries_view, neighbors_view, distances_view);
+        }
 
         CUDA_CHECK(cudaDeviceSynchronize());
         auto tb3 = Clock::now();
         t_search += std::chrono::duration<double>(tb3 - tb2).count();
 
         // ---- 4c: 下载 top-2 local centroid indices ----
-        CUDA_CHECK(cudaMemcpy(h_top2.data(), d_top2,
-                              batch_size * TOP_K * sizeof(uint32_t),
-                              cudaMemcpyDeviceToHost));
+        if (searched_bf) {
+            CUDA_CHECK(cudaMemcpy(h_top2_i64.data(), d_top2_i64,
+                                  batch_size * TOP_K * sizeof(int64_t),
+                                  cudaMemcpyDeviceToHost));
+            // bounds check: brute-force 结果必须是 [0, n_centroids) 内的 local idx
+            int64_t n_bad = 0;
+            #pragma omp parallel for schedule(static) reduction(+:n_bad)
+            for (int64_t i = 0; i < batch_size * static_cast<int64_t>(TOP_K); ++i) {
+                int64_t v = h_top2_i64[static_cast<size_t>(i)];
+                if (v < 0 || v >= n_centroids) { ++n_bad; v = 0; }
+                h_top2[static_cast<size_t>(i)] = static_cast<uint32_t>(v);
+            }
+            if (n_bad > 0)
+                throw std::runtime_error("batch_assign: brute-force top-2 returned " +
+                                         std::to_string(n_bad) + " out-of-range centroid ids");
+        } else {
+            CUDA_CHECK(cudaMemcpy(h_top2.data(), d_top2,
+                                  batch_size * TOP_K * sizeof(uint32_t),
+                                  cudaMemcpyDeviceToHost));
+        }
         auto tb4 = Clock::now();
         t_download += std::chrono::duration<double>(tb4 - tb3).count();
 
@@ -1287,6 +1340,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     if (d_queries)    CUDA_CHECK(cudaFree(d_queries));
     if (d_top2)       CUDA_CHECK(cudaFree(d_top2));
     if (d_distances)  CUDA_CHECK(cudaFree(d_distances));
+    if (d_top2_i64)   CUDA_CHECK(cudaFree(d_top2_i64));
     // NOTE: d_centroids 和 d_graph 由 caller 管理，本函数不释放
 
     // 聚类大小统计

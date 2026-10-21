@@ -35,20 +35,18 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#6 (out-of-core Step 6: cap pool memcpy at 8 OpenMP threads)**, 2026-10-21:
+After **#7 (resident Step 4: exact brute-force top-2 instead of CAGRA search)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **18.53** | 0.9303 / 0.9778 / 0.9948 | 1945K / 1035K |
-| SIFT1M large (out-of-core path) | **51.92** | 0.8977 / 0.9618 / 0.9886 | 1943K / 1032K |
+| SIFT1M auto (GPU-resident) | **17.19** | 0.9295 / 0.9779 / 0.9947 | 1946K / 1035K |
+| SIFT1M large (out-of-core path) | **51.93** | 0.8975 / 0.9619 / 0.9888 | 2000K / 945K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
-
-(auto 18.53 vs 18.08 after #5: same code path, run-to-run noise of bucket2 — judge `--update` stores the whole candidate.)
 
 ## Ideas backlog
 
 Priority (from the user, 2026-10-21):
-- **Step 4 (resident path):** replace the per-round CAGRA centroid search (~0.63s/round) with an exact fp16 GEMM + top-2 kernel (the queries are already resident as fp16). Expected ≈ −2s on SIFT1M. Must stay exact and keep `--out-of-core` on the old path.
+- **Step 4 (resident path):** done in #7 with fp32 `brute_force` (search 0.70 → 0.42 s/round). Remaining: an fp16/tensor-core GEMM with fp32 accumulation (cuVS half brute force — check it accumulates in fp32: uint8² × 128 overflows fp16) or a fused GEMM + top-2 kernel that never writes the 990K × 10K distance tile.
 - **Step 6:** fuse GEMM + top-64 selection into one kernel so the bucket × pool distance matrix (~100 GB of device memory traffic per round) is never materialized; top-64 selection is still the biggest GPU cost. Reference: cuVS 26.12 `cpp/src/neighbors/detail/knn_brute_force.cuh` / fused L2 kNN (`fused_l2_knn`) and `cpp/src/neighbors/detail/faiss_select/` block select.
 
 From the IVF-PQ CAGRA build (cuVS 26.12 `neighbors/detail/cagra/cagra_build.cuh::build_knn_graph`, `ivf_pq/ivf_pq_build.cuh`):
@@ -340,6 +338,43 @@ Borderline auto gain → rerun (`runs/iter4/sift1M_auto_b`): 19.40 s, +3.05% →
 Borderline large gain → rerun (`runs/iter6/sift1M_large_b`): +4.19% → also ACCEPT. Step 6 (large) 22.0 → 19.9 s.
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +3.35% / +4.19% on rerun (53.72 → 51.92 s); 1M-auto −2.5% (path untouched, within tolerance).
+
+### #7 — resident Step 4: exact brute-force top-2 instead of CAGRA search  (2026-10-21)
+**Idea / rationale:** (user-priority backlog item) Step 4 on the GPU-resident path searched 990K non-centroid points against the 10K centroids with `cagra::search` (k=2, itopk 64, single-CTA), ~0.70 s/round. With queries already on the GPU, exact `cuvs::neighbors::brute_force::search` (L2Expanded; tiled GEMM + select_k — cuVS 26.12 `detail/knn_brute_force.cuh::tiled_brute_force_knn`) is faster: 0.42 s/round, and the top-2 is exact instead of approximate. Index built once per round over `d_centroids` (device view, no copy); int64 ids downloaded and bounds-checked (`[0, n_centroids)`, else error) before the unchanged balanced-assignment logic. Only the resident branch (`gpu_query_loader` set, non-PQ) switches; out-of-core and PQ keep the CAGRA search. fp32 kept on purpose (fp16 accumulation would overflow on uint8 data).
+**Files:** `src/bucket.cu`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 17.19 | +7.2% | +21.0% | 1.49x | bucket2 15.52, optimize 1.27, translate 0.37 | 4184 | 1.61 |
+| sift1M_large | large | 51.93 | -0.0% | +30.9% | 4.50x | bucket2 42.47, prune 3.76, optimize_chunked 5.16, translate 0.49 | 1550 | 4.19 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.74 | 3.31 | 1.31 | 0.00 | 2.18 | 1.11 | 0.02 | 5.63 | 0.00 | 0.75 |
+| sift1M_large | 0.56 | 5.08 | 1.34 | 0.00 | 8.66 | 2.18 | 0.03 | 20.67 | 2.05 | 1.06 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9936 | 0.9895 | 0.9866 | 0.9838 |
+| sift1M_large | 0.9912 | 0.9889 | 0.9860 | 0.9834 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9295 / 1946K | 0.9779 / 1035K | 0.9947 / 533K | 0.9987 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.8975 / 2000K | 0.9619 / 945K | 0.9888 / 560K | 0.9976 / 189K | 0.9995 / 68K |
+
+[exited with code 0]
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +7.2% (18.53 → 17.19 s; Step 4 3.28 → 2.18 s), 1M-large −0.0% (path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
