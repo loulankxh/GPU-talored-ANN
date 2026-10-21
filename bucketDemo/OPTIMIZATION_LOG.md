@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#64 (out-of-core Step 6: whole-round bucket blob on the GPU + non-blocking running-k-th seed)**, 2026-10-21:
+After **#66 (blob mode: no Belady setup + gather issued by the producer thread)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
 | SIFT1M auto (GPU-resident) | **6.31** (0.55x CAGRA; #61) | 0.9272 / 0.9769 / 0.9942 | 2222K / 1192K |
-| SIFT1M large (out-of-core path) | **9.80** (0.85x CAGRA) | 0.9143 / 0.9706 / 0.9920 | 2219K / 1188K |
-| SIFT10M auto (→ large path, 1 run) | **87.75** (0.72x CAGRA) | 0.8381 / 0.9284 / 0.9732 | 1870K / 1001K |
+| SIFT1M large (out-of-core path) | **9.69** (0.84x CAGRA) | 0.9135 / 0.9708 / 0.9919 | 1946K / 1034K |
+| SIFT10M auto (→ large path, 1 run) | **84.76** (0.69x CAGRA; rerun 84.00) | 0.8386 / 0.9280 / 0.9735 | 1870K / 1011K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -81,7 +81,6 @@ Other:
 
 | # | idea | result | reason |
 |---|---|---|---|
-| 65 | Blob mode (#64): skip the Belady future-access table and cache construction (both caches unused; gather jobs built straight from `blob_locate`, bypassing the device cache). Patch: `bucketDemo/patches/iter65_blob_skip_belady_setup.patch` | Step 6 setup/round on 10M 1.3 → 0.4 s, Step 6 37.1 → 35.2 s, but 10M total 86.68 s (+1.2%; Step 5 +1.1 s noise); 1M-auto −1.3%, 1M-large −1.2% (noise) | no config ≥ 3%: real saving ~2 s on 10M — bundle with the next out-of-core Step 6 change |
 | 62 | Out-of-core version of #61: `ChunkedKnnAccumulator::merge_iteration` records each point's running M-th distance (`kth`, N floats) in non-final rounds; Step 6 of rounds 2..t waits for that merge, uploads `kth` and the block top-M seeds its shared row threshold by gid. Patch: `bucketDemo/patches/iter62_ooc_kth_seed.patch` | one-off SIFT10M (t=2): round-2 loop 13.3 → 12.1 s (stream_sync 4.4 → 2.6 s). Benchmark: 1M-large 10.58 s (−4.5%, Step 6 4.46 → 5.16 s), 10M 101.52 s (−5.8%, Step 6 44.5 → 51.2 s), 1M-auto −1.3% | judge: two configs > 3% slower. Waiting for the previous merge before Step 6 (instead of after it) puts the merge on the critical path / makes it compete with Step 6 for CPU and disk; the out-of-core loop is host-bound after the seed. Would need the seed without the extra synchronisation (e.g. seed from round t−2's kth, already complete) |
 | 60 | Block top-M kernel: per-warp batched filtered queue (raft `warp_sort_filtered` style on public `raft::util::bitonic`, 4-slot per-lane buffer, bitonic merge when full) instead of serial `warp_topk_insert`; shared row threshold kept. Motivation: nsys after #49 — top-M 49% of out-of-core Step 6 GPU time (127 µs/bucket), gather 26%, GEMMs ~22%; ncu: one 182-row launch = 22.4M warp instructions (~120K/row, mostly the per-candidate inserts) | quick test (1 run): resident loop 0.907 → 1.14 s/round, out-of-core 1.25 → 1.39 s/round | rejected without the full benchmark: the bitonic merges (sort 128 / merge 64 per flush) cost more than the serial inserts at this K/pool size — same finding as #45. Remaining idea: fewer passing candidates (tighter threshold seeded from the running KNN's K-th distance in rounds 2..t) rather than a cheaper insert |
 | 59 | Out-of-core Step 6 slots after #49: OVERSUB 2.0 / 3.0 / 4.0 (4 / 5 / 7 streams), SIFT1M large quick sweep (1 run each) | loop/round 1.25 1.19 1.10 / 1.17 1.13 1.17 / 1.11 1.16 1.07 s; Step 6 4.33 / 4.32 / 4.15 s | not benchmarked: differences within run-to-run noise — the loop is GPU-throughput-bound since #49, more concurrent small kernels don't help |
@@ -1732,6 +1731,49 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8381 / 1870K | 0.9284 / 1001K | 0.9732 / 536K | 0.9916 / 173K | 0.9979 / 68K |
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +8.5% (95.94 → 87.75 s, **0.72× CAGRA native**), 1M-large +3.2% (10.12 → 9.80 s), 1M-auto −0.8% (noise; path untouched).
+
+### #66 — blob mode: skip Belady setup (#65) + gather kernels issued by the producer thread  (2026-10-21, commit TBD)
+**Idea / rationale:** in #64's blob mode (whole round of bucket data on the GPU), (1) #65 patch: neither Belady cache is used, so the future-access table (0.8 s/round on SIFT10M) and cache construction (0.5 s/round) are skipped (empty tables), and gather jobs are built straight from `blob_locate`, bypassing the device cache; (2) the producer thread, now nearly idle, also launches the gather kernel on the slot's stream right after writing the job table (+ `ev_h2d` record before it may rewrite the table). The main thread frees a slot only after enqueuing that bucket's GEMM / top-M / D2H, so stream order keeps the next gather from overwriting a pool still being read. The main thread is left with GEMM + top-M + D2H: out-of-core submit 6.1 → 4.7 s/round on SIFT10M; the loop is GPU-bound again (stream_sync 3.4–6.0 s). Non-blob paths unchanged.
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+**Borderline confirmation:** 10M first run 84.76 s (+3.4%), rerun `sift10M_auto_b` 84.00 s (+4.3%) → both judge runs ACCEPT; best.json stores the first (slower) run.
+**SIFT10M Step 6:** 37.1 → 34.2 s.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.43 | -1.1% | +70.4% | 0.56x | bucket2 6.43 | 3804 | 1.72 |
+| sift1M_large | large | 9.69 | +1.1% | +87.1% | 0.84x | bucket2 7.86, prune 0.72, optimize_chunked 0.66, translate 0.43 | 1654 | 2.04 |
+| sift10M_auto | large | 84.76 | +3.4% | +52.5% | 0.69x | bucket2 72.29, prune 3.98, optimize_chunked 4.90, translate 3.59 | 8998 | 12.66 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.63 | 0.26 | 0.18 | 0.00 | 0.66 | 0.49 | 0.02 | 2.76 | 0.00 | 0.90 |
+| sift1M_large | 0.13 | 0.57 | 0.34 | 0.00 | 1.03 | 0.42 | 0.04 | 4.16 | 0.48 | 0.00 |
+| sift10M_auto | 1.33 | 7.45 | 2.07 | 0.00 | 18.83 | 2.83 | 0.33 | 34.22 | 4.19 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9749 | 0.9669 | 0.9597 | 0.9539 |
+| sift1M_large | 0.9762 | 0.9654 | 0.9590 | 0.9532 |
+| sift10M_auto | 0.9215 | 0.9008 | 0.8849 | 0.8731 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9278 / 2225K | 0.9773 / 1192K | 0.9945 / 562K | 0.9987 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9135 / 1946K | 0.9708 / 1034K | 0.9919 / 459K | 0.9982 / 186K | 0.9995 / 67K |
+| ours sift10M_auto | 0.8386 / 1870K | 0.9280 / 1011K | 0.9735 / 526K | 0.9918 / 186K | 0.9979 / 68K |
+
+**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +3.4% (87.75 → 84.76 s, 0.69× CAGRA native; rerun +4.3%), 1M-large +1.1%, 1M-auto −1.1% (noise).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
