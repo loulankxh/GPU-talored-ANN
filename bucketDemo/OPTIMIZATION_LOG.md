@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#50 (Step 4: CAGRA graph search with itopk 32 instead of exact GEMM when centroids > 32K)**, 2026-10-21:
+After **#51 (KMeans|| training fraction 0.25 → 0.10)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **7.18** (0.62x CAGRA) | 0.9288 / 0.9770 / 0.9944 | 1948K / 1035K |
-| SIFT1M large (out-of-core path) | **11.11** (0.96x CAGRA; rerun) | see #50 | |
-| SIFT10M auto (→ large path, 1 run) | **138.79** (1.13x CAGRA) | 0.8379 / 0.9283 / 0.9738 | 1870K / 1011K |
+| SIFT1M auto (GPU-resident) | **6.80** (0.59x CAGRA) | 0.9285 / 0.9770 / 0.9944 | 1947K / 1037K |
+| SIFT1M large (out-of-core path) | **10.94** (0.95x CAGRA) | 0.9140 / 0.9705 / 0.9923 | 2217K / 1189K |
+| SIFT10M auto (→ large path, 1 run) | **118.38** (0.97x CAGRA) | 0.8380 / 0.9292 / 0.9738 | 1863K / 1010K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -1430,6 +1430,47 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8379 / 1870K | 0.9283 / 1011K | 0.9738 / 525K | 0.9921 / 187K | 0.9979 / 68K |
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +11.6% (157.00 → 138.79 s, 1.13× CAGRA native), 1M-auto +0.3%, 1M-large −1.8% (rerun; within the 3% tolerance).
+
+### #51 — KMeans|| training subset fraction 0.25 → 0.10  (2026-10-21, commit TBD)
+**Idea / rationale:** Step 2 runs KMeans|| D² oversampling on a Bernoulli(F) subset of the working set (#14; cost ∝ train points × candidates). F=0.25 was picked on SIFT1M only (#14 sweep); at SIFT10M the subset is 2.5M points and Step 2 was 34.8 s (KMeans|| 10.4 s/round). Same as cuVS 26.12 IVF-PQ `kmeans_trainset_fraction` (`ivf_pq/ivf_pq_build.cuh`), which trains on a fixed fraction. The centroid count stays N·centroid_ratio, the centroids are still real data points, and the subset still has > 4× centroids (SIFT1M 100K vs 10K; SIFT10M 1M vs 100K).
+**Files:** none  **Params changed:** `BUCKET2_EXTRA`: `--kmeans-train-fraction 0.25` → `0.10`
+**Effect:** SIFT10M Step 2 34.8 → 15.1 s; SIFT1M auto Step 2 0.66 → 0.36 s; pre-prune KNN recall and final search recall unchanged within noise.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.80 | +5.3% | +68.7% | 0.59x | bucket2 6.80 | 3894 | 1.71 |
+| sift1M_large | large | 10.94 | +1.5% | +85.4% | 0.95x | bucket2 8.92, prune 0.87, optimize_chunked 0.63, translate 0.44 | 1674 | 2.69 |
+| sift10M_auto | large | 118.38 | +14.7% | +33.7% | 0.97x | bucket2 94.76, prune 7.05, optimize_chunked 13.09, translate 3.48 | 7808 | 18.87 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.63 | 0.36 | 0.11 | 0.00 | 0.65 | 0.45 | 0.02 | 3.15 | 0.00 | 0.92 |
+| sift1M_large | 0.57 | 0.73 | 0.25 | 0.00 | 1.29 | 0.39 | 0.04 | 4.42 | 0.54 | 0.00 |
+| sift10M_auto | 5.47 | 15.08 | 1.91 | 0.00 | 19.46 | 2.92 | 0.33 | 43.86 | 4.21 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9750 | 0.9663 | 0.9591 | 0.9533 |
+| sift1M_large | 0.9740 | 0.9661 | 0.9590 | 0.9535 |
+| sift10M_auto | 0.9210 | 0.8976 | 0.8839 | 0.8723 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9285 / 1947K | 0.9770 / 1037K | 0.9944 / 490K | 0.9987 / 170K | 0.9997 / 68K |
+| ours sift1M_large | 0.9140 / 2217K | 0.9705 / 1189K | 0.9923 / 562K | 0.9982 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8380 / 1863K | 0.9292 / 1010K | 0.9738 / 516K | 0.9922 / 178K | 0.9980 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 10M-auto +14.7% (138.79 → 118.38 s, **0.97× CAGRA native**), 1M-auto +5.3% (7.18 → 6.80 s), 1M-large +1.5%.
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
