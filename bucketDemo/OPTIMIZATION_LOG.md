@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#47 (incremental KMeans|| d(x, C); accepted on the SIFT10M rule)**, 2026-10-21:
+After **#49 (shared per-row threshold in block top-M + out-of-core submit trims / vectorized gather)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **7.38** (0.64x CAGRA) | 0.9295 / 0.9774 / 0.9945 | 2219K / 1190K |
-| SIFT1M large (out-of-core path) | **11.66** (1.01x CAGRA) | 0.9137 / 0.9712 / 0.9920 | 1945K / 1035K |
-| SIFT10M auto (→ large path, 1 run) | **163.74** (1.34x CAGRA) | 0.8396 / 0.9280 / 0.9736 | 1870K / 1012K |
+| SIFT1M auto (GPU-resident) | **7.20** (0.62x CAGRA) | 0.9293 / 0.9769 / 0.9945 | 2226K / 1191K |
+| SIFT1M large (out-of-core path) | **10.91** (0.95x CAGRA) | 0.9142 / 0.9710 / 0.9920 | 1946K / 1033K |
+| SIFT10M auto (→ large path, 1 run) | **157.00** (1.28x CAGRA) | 0.8403 / 0.9289 / 0.9736 | 1871K / 1012K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -81,8 +81,8 @@ Other:
 
 | # | idea | result | reason |
 |---|---|---|---|
+| 48 | Block top-M kernel (`block_topK_from_dots_kernel`, both paths): G warps of a row share their K-th threshold via a shared-memory `atomicMin` on an order-preserving float key (any warp's current K-th bounds the row's K-th) | resident Step 6 loop 0.975 → 0.907 s/round; auto 7.16 s (+2.98%), large 11.53 s (+1.1%), 10M 163.24 s (+0.3%) | just under 3% → bundled with the #44 patch into accepted #49 |
 | 45 | **Step 6 fused GEMM + top-64 kernel** (user priority, 2026-10-21): `fused_knn.cuh`, sm_70 WMMA fp16; block = 32 query rows × a set of 64-column pool tiles; B tile staged through shared memory with register prefetch; dot tile kept in shared memory; per-row filtered selection (threshold → ballot-compacted shared-memory candidate buffer → raft `util::bitonic` merge into a register top-64); pool split into ≤16 chunks per row with a last-block (atomic ticket) merge; per-row threshold shared across chunks with `atomicMin` on float bits (distances incl. ‖q‖² are exact non-negative integers for 8-bit data); warm-up on tiles 0–1. Exact vs CPU brute force (`patches/iter45_fused_test.cu`: 7 cases, incl. ties, K=32/64, max chunking). Patch: `bucketDemo/patches/iter45_fused_gemm_topk.patch` (resident path only so far) | resident Step 6 loop per round (SIFT1M, 1 run): baseline cuBLAS GEMM + block top-M **0.975 s**; fused v1 (direct global B fragments, serial ballot insert) 2.40 s; v2 (warp_sort_filtered-style queues) 2.2 s; v3 (smem-staged B, 64-col tiles, smem candidate buffer, no spills) 2.1–2.6 s; + shared per-row threshold 1.27 s; + warm-up / cheaper filter 1.34–1.40 s. Same loop with selection compiled out: 0.73–0.76 s | rejected: slower than baseline. ncu (one bucket, real data): 10.5M warp instr, IPC ≈ 0.8/SM, achieved occupancy 12% (124 regs, 42.5 KB smem → 2 blocks/SM); MMA + skeleton alone (0.73 s) already ≈ cuBLAS GEMM + gather, and per-tile selection behind `__syncthreads` adds ~0.6 s/round. The only saving fusion can deliver here is the dots write + read (~8 MB/bucket ≈ 0.1–0.2 s/round); beating cuBLAS + block top-M on V100 would need a warp-specialized (MMA warps ↔ selection warps, double-buffered tiles) pipeline. Idea kept: shared per-row threshold + warm-up could also cut the existing `block_topK_from_dots_kernel` cost |
-| 44 | Out-of-core Step 6 per-bucket API trims (GEMM timing events only with `BUCKET2_GEMM_TIMING`, job table read through UVA-mapped pinned memory instead of a per-bucket H2D) + vectorized `devcache_gather_pool_kernel` (uchar4 loads, half2 stores). Patch: `bucketDemo/patches/iter44_submit_trim_vec_gather.patch` | quick test: gpu_submit 0.80 → 0.62 s/round but stream_sync 0.26 → 0.43 s (loop now GPU-bound, wall ≈ 1.4 s/round unchanged); gather kernel 85 µs/bucket (nsys) before vectorizing; not benchmarked | interrupted by the user (priority changed to #45 / process merge); untested — re-apply together with a GPU-side Step 6 gain |
 | 40 | Out-of-core Step 6 slots: OVERSUB 1.5 → 2.0 (3 → 4 slots on SIFT1M). Sweep: 3 slots 1.59 s/round, 4: 1.43, 6: 1.38 (+0.8 GB GPU). Patch: `bucketDemo/patches/iter40_ooc_4slots.patch` | large 12.87 s (+2.9%), GPU peak 1674–2052 MiB | just under 3%; bundled into accepted #41 |
 | 37 | Out-of-core Step 4 bucket write (in-memory mode from #36): deterministic multi-threaded `add_range_parallel` (per-thread per-bucket counts → prefix → parallel copy; same in-bucket order) + byte-array centroid test instead of `unordered_set`. Patch: `bucketDemo/patches/iter37_parallel_bucket_write.patch` | write part 0.13 → 0.03–0.06 s, but bucket_write total only 0.35 → 0.29 s/round (input read 0.14 s + sampled centroid read 0.07–0.1 s dominate); KNN recall unchanged | < 1% of the large path — not benchmarked; bundled into accepted #42 |
 | 31 | Out-of-core Step 4.5 inline reorder in memory when 2·N·D B ≤ cpu_limit/4 (read whole input, permute by inverse_perm in parallel, one sequential write — like the resident path; streaming per-bucket writer kept otherwise; output verified == base[inverse_perm]). Patch: `bucketDemo/patches/iter31_ooc_inmemory_reorder.patch` | pass3_write 1.03 → 0.385 s; large 22.09 s (+3.1%) then rerun 22.14 s (+2.9%) | borderline gain not confirmed (rerun just under 3%). Consistent ~0.65 s saving — bundle with the next large-path change |
@@ -1346,6 +1346,47 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8396 / 1870K | 0.9280 / 1012K | 0.9736 / 490K | 0.9919 / 180K | 0.9979 / 68K |
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +8.3% (178.47 → 163.74 s), 1M-auto +2.1% (7.54 → 7.38 s), 1M-large +0.3%.
+
+### #49 — shared per-row threshold in block top-M (#48) + out-of-core per-bucket submit trims and vectorized gather (#44)  (2026-10-21, commit TBD)
+**Idea / rationale:** (1) #48: in `block_topK_from_dots_kernel` (resident and out-of-core Step 6) the G=8 warps of a row each kept their own top-K threshold and warmed up from inf. Each warp now publishes its threshold to a shared-memory `atomicMin` (order-preserving float→uint key, since the partial distance ‖p‖² - 2·dot can be negative) and filters with the block minimum: any warp's current K-th is an upper bound of the row's K-th, so fewer serial ballot inserts (raft/faiss block-select filtering, cuVS 26.12 `detail/faiss_select`). Alone: resident loop 0.975 → 0.907 s/round, +2.98% auto. (2) #44 patch: out-of-core Step 6 GEMM timing events only with `BUCKET2_GEMM_TIMING`; job table read by the gather kernel through UVA-mapped pinned memory (no per-bucket H2D; `ev_h2d` recorded after the kernel); `devcache_gather_pool_kernel` with uchar4 loads / half2 stores. #44 alone moved the out-of-core loop from host-bound to GPU-bound; together with #48's cheaper top-M the out-of-core loop drops ~1.4 → ~1.25 s/round.
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 7.20 | +2.4% | +66.9% | 0.62x | bucket2 7.20 | 3934 | 1.80 |
+| sift1M_large | large | 10.91 | +6.4% | +85.5% | 0.95x | bucket2 8.99, prune 0.86, optimize_chunked 0.63, translate 0.44 | 1828 | 2.76 |
+| sift10M_auto | large | 157.00 | +4.1% | +12.0% | 1.28x | bucket2 133.19, prune 7.10, optimize_chunked 13.32, translate 3.39 | 9454 | 20.30 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.64 | 0.66 | 0.10 | 0.00 | 0.64 | 0.54 | 0.02 | 3.12 | 0.00 | 0.92 |
+| sift1M_large | 0.57 | 0.88 | 0.27 | 0.00 | 1.25 | 0.42 | 0.04 | 4.38 | 0.51 | 0.00 |
+| sift10M_auto | 5.42 | 34.83 | 1.90 | 0.00 | 39.64 | 2.92 | 0.37 | 42.40 | 4.01 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9751 | 0.9666 | 0.9589 | 0.9535 |
+| sift1M_large | 0.9739 | 0.9671 | 0.9595 | 0.9534 |
+| sift10M_auto | 0.9167 | 0.8963 | 0.8825 | 0.8704 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9293 / 2226K | 0.9769 / 1191K | 0.9945 / 563K | 0.9987 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9142 / 1946K | 0.9710 / 1033K | 0.9920 / 516K | 0.9981 / 187K | 0.9995 / 68K |
+| ours sift10M_auto | 0.8403 / 1871K | 0.9289 / 1012K | 0.9736 / 526K | 0.9920 / 186K | 0.9981 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +6.4% (11.66 → 10.91 s, 0.95× CAGRA native), 10M-auto +4.1% (163.74 → 157.00 s), 1M-auto +2.4% (7.38 → 7.20 s).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

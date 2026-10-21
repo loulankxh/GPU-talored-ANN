@@ -3081,10 +3081,27 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
     for (int p = 0; p < K_PER_LANE; ++p) { reg_dist[p] = INFINITY; reg_id[p] = -1; }
     float threshold = INFINITY;
 
+    // G 个 warp 共享阈值: 任何一个 warp 当前的第 K 小都是整行第 K 小的上界，
+    // 比它大的候选不可能进最终 top-K。每个 warp 插入后把自己的阈值 atomicMin
+    // 进 shared memory，每轮外循环取全 block 最小值过滤——其它 warp 不用各自从
+    // inf 开始热身，串行插入次数大减 (同 #45 融合 kernel 里的跨段共享阈值)。
+    // 距离 (‖p‖² - 2·dot) 可能为负，用保序的 float→uint 键比较。
+    __shared__ unsigned s_th;
+    auto f2key = [](float f) {
+        unsigned u = __float_as_uint(f);
+        return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    };
+    auto key2f = [](unsigned k) {
+        return __uint_as_float((k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k);
+    };
+    if (threadIdx.x == 0) s_th = 0xFFFFFFFFu;
+    __syncthreads();
+
     // 每 lane 每次读 4 个候选 (float4)，提高在途访存量——一个 bucket 只有
     // bucket_size 个 block，占用率天然不高，标量读时这个 kernel 是延迟瓶颈。
     const DotT* row = dots + static_cast<int64_t>(q) * ldd;
     for (int jb = warp * LANES * 4; jb < pool_size; jb += G * LANES * 4) {
+        threshold = fminf(threshold, key2f(*reinterpret_cast<volatile unsigned*>(&s_th)));
         int j0 = jb + lane * 4;
         float dd[4];
         if (j0 + 3 < pool_size) {
@@ -3114,7 +3131,11 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
                 float c_dist = __shfl_sync(ALL, dd[e], src);
                 if (c_dist >= threshold) continue;
                 warp_topk_insert<K_PER_LANE>(reg_dist, reg_id, c_dist, jb + src * 4 + e, lane);
-                threshold = __shfl_sync(ALL, reg_dist[K_PER_LANE - 1], LANES - 1);
+                const float own = __shfl_sync(ALL, reg_dist[K_PER_LANE - 1], LANES - 1);
+                if (own < threshold) {
+                    threshold = own;
+                    if (lane == 0) atomicMin(&s_th, f2key(own));
+                }
             }
         }
     }
@@ -4347,12 +4368,31 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
         const DataT* src = v + static_cast<int64_t>(r) * D;
         __half* dst = B + static_cast<int64_t>(jb.dest + r) * D;
         float acc = 0.f;
-        for (int e = lane; e < D; e += 32) {
-            float x = static_cast<float>(src[e]);
-            __half h = __float2half_rn(x);
-            dst[e] = h;
-            float xh = __half2float(h);
-            acc += xh * xh;
+        if (sizeof(DataT) == 1 && (D & 3) == 0) {
+            // 8-bit 且 D%4==0: 每 lane 一次读 4 个字节 (uchar4)、写 2 个 half2，
+            // D=128 一个 warp 一趟读完一行 (原来逐字节读、逐 half 写要 4 趟)。
+            // 对齐: 桶向量区 16B 对齐 (见 DevBucket)、行宽 D 字节是 4 的倍数；
+            // B 的行宽 2D 字节是 8 的倍数。
+            const uchar4* src4 = reinterpret_cast<const uchar4*>(src);
+            __half2* dst2 = reinterpret_cast<__half2*>(dst);
+            for (int q = lane; q < (D >> 2); q += 32) {
+                uchar4 u = src4[q];
+                // 8-bit 值在 fp16 里精确
+                __half2 h01 = __floats2half2_rn(static_cast<float>(u.x), static_cast<float>(u.y));
+                __half2 h23 = __floats2half2_rn(static_cast<float>(u.z), static_cast<float>(u.w));
+                dst2[2 * q]     = h01;
+                dst2[2 * q + 1] = h23;
+                float2 f01 = __half22float2(h01), f23 = __half22float2(h23);
+                acc += f01.x * f01.x + f01.y * f01.y + f23.x * f23.x + f23.y * f23.y;
+            }
+        } else {
+            for (int e = lane; e < D; e += 32) {
+                float x = static_cast<float>(src[e]);
+                __half h = __float2half_rn(x);
+                dst[e] = h;
+                float xh = __half2float(h);
+                acc += xh * xh;
+            }
         }
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -4739,6 +4779,9 @@ void build_vector_knn_with_tensorcore(
     cudaEvent_t ev_gemm_stop[MAX_SLOTS]  = {nullptr};
     bool gemm_evt_valid[MAX_SLOTS] = {false};
     double gemm_total_ms = 0.0;
+    // 纯 GEMM 计时 (每桶 2 次 event record + elapsed 查询) 只在诊断时开:
+    // 主线程每桶的 CUDA API 调用就是 out-of-core 循环的瓶颈 (gpu_submit)
+    const bool gemm_timing = std::getenv("BUCKET2_GEMM_TIMING") != nullptr;
     for (int s = 0; s < num_slots; ++s) {
         CUDA_CHECK(cudaEventCreate(&ev_gemm_start[s]));
         CUDA_CHECK(cudaEventCreate(&ev_gemm_stop[s]));
@@ -4926,7 +4969,15 @@ void build_vector_knn_with_tensorcore(
     cudaEvent_t ev_load[MAX_SLOTS] = {nullptr};
     DevCacheCtx dev_ctx;
     std::unique_ptr<bucket_order::BeladyBucketCache<DevBucket>> dev_cache;
+    // job 表直接放 pinned host 内存让 gather kernel 经 UVA 读 (每桶几十条 × 32 B)，
+    // 省掉主线程每桶一次 cudaMemcpyAsync；不支持映射时退回 H2D 拷贝。
+    bool jobs_mapped = false;
     if (use_dev_cache) {
+        int dev = 0, uva = 0, can_map = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, dev));
+        CUDA_CHECK(cudaDeviceGetAttribute(&can_map, cudaDevAttrCanMapHostMemory, dev));
+        jobs_mapped = uva && can_map;
         CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
         pos_ring.resize(kPosRing);
         for (auto& pe : pos_ring) CUDA_CHECK(cudaEventCreateWithFlags(&pe.ev, cudaEventDisableTiming));
@@ -5175,13 +5226,15 @@ void build_vector_knn_with_tensorcore(
                 CUDA_CHECK(cudaMemcpyAsync(d_ids_bucket[slot], h_ids_bucket[slot],
                                            bucket_size * sizeof(int32_t),
                                            cudaMemcpyHostToDevice, streams[slot]));
-            CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
-                                       cudaMemcpyHostToDevice, streams[slot]));
-            CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));
+            if (!jobs_mapped)
+                CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
+                                           cudaMemcpyHostToDevice, streams[slot]));
             devcache_gather_pool_kernel<DataT><<<nj, 256, 0, streams[slot]>>>(
-                d_jobs[slot], reinterpret_cast<__half*>(d_B[slot]), d_ids_pool[slot],
+                jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<__half*>(d_B[slot]), d_ids_pool[slot],
                 d_norms_pool[slot], static_cast<int>(D));
             CUDA_CHECK(cudaGetLastError());
+            // 生产者等 ev_h2d 之后才重写 h_jobs[slot]: 映射模式下 kernel 读完才算完
+            CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));
             {
                 // gather 完成事件 (淘汰等待用)；环形表覆盖前先确认旧位置已完成
                 PosEvent& pe = pos_ring[static_cast<size_t>(pos % kPosRing)];
@@ -5252,7 +5305,7 @@ void build_vector_knn_with_tensorcore(
 
         // ---- 3e: cuBLAS GEMM 在 slot stream 上 (event 包夹做纯 GEMM 计时) ----
         cublasSetStream(cublas_handle, streams[slot]);
-        CUDA_CHECK(cudaEventRecord(ev_gemm_start[slot], streams[slot]));
+        if (gemm_timing) CUDA_CHECK(cudaEventRecord(ev_gemm_start[slot], streams[slot]));
         {
             cublasStatus_t stat;
             if constexpr (kIsInt8Path) {
@@ -5290,8 +5343,10 @@ void build_vector_knn_with_tensorcore(
                     throw std::runtime_error("cublasSgemm failed, status=" + std::to_string(stat));
             }
         }
-        CUDA_CHECK(cudaEventRecord(ev_gemm_stop[slot], streams[slot]));
-        gemm_evt_valid[slot] = true;
+        if (gemm_timing) {
+            CUDA_CHECK(cudaEventRecord(ev_gemm_stop[slot], streams[slot]));
+            gemm_evt_valid[slot] = true;
+        }
 
         // ---- 3f: top-M ----
         // 切换实现：把下面 USE_RAFT_SELECT_K 改 0 即用自写 warp-cooperative kernel，
@@ -5382,6 +5437,7 @@ void build_vector_knn_with_tensorcore(
               << processed_buckets << " buckets ("
               << (loop_ms / std::max<int64_t>(1, processed_buckets))
               << " ms/bucket avg, slots=" << num_slots << ")\n";
+    if (gemm_timing)
     std::cout << "  [VectorKNN] pure GEMM: " << gemm_total_ms << " ms total, "
               << (gemm_total_ms / std::max<int64_t>(1, processed_buckets))
               << " ms/bucket avg, "
