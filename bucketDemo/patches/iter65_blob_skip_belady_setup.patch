@@ -1,0 +1,65 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 463e864..1689377 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -4745,15 +4745,6 @@ void build_vector_knn_with_tensorcore(
+     double t_setup_order = std::chrono::duration<double>(
+         std::chrono::high_resolution_clock::now() - func_t0).count() - t_setup_bucket_count;
+ 
+-    auto access_adj = bucket_order::adjacency_from_flat_graph(
+-        centroid_knn_graph, n_centroids, static_cast<int32_t>(K));
+-    auto future_access = bucket_order::compute_future_access_lists(bucket_order_seq, access_adj);
+-    double t_setup_future_access = std::chrono::duration<double>(
+-        std::chrono::high_resolution_clock::now() - func_t0).count() - t_setup_bucket_count - t_setup_order;
+-
+-    auto vec_bucket_bytes = [](const VecBucket<DataT>& b) {
+-        return b.ids.size() * sizeof(int64_t) + b.vecs.size() * sizeof(DataT);
+-    };
+     // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (只在 8-bit 数据、预算 > 0 时用)
+     const bool use_dev_cache = kIsInt8Path && gpu_cache_bytes > 0;
+     // blob 模式: 这一轮的桶数据整块就在 host 内存里 (round 1: 重排后的 raw_host；
+@@ -4776,6 +4767,23 @@ void build_vector_knn_with_tensorcore(
+                              std::chrono::high_resolution_clock::now() - tb0).count() << "s\n";
+         }
+     }
++    // blob 模式下两个 Belady 缓存都不用 (job 直接指向 blob，中心桶 gid 也从 host blob
++    // 取)，未来访问表 (SIFT10M 每轮 0.8 s) 和缓存构造 (拷表 0.5 s) 都省掉: 给空表
++    std::vector<std::vector<int32_t>> future_access;
++    if (d_blob) {
++        future_access.assign(static_cast<size_t>(n_centroids), {});
++    } else {
++        auto access_adj = bucket_order::adjacency_from_flat_graph(
++            centroid_knn_graph, n_centroids, static_cast<int32_t>(K));
++        future_access = bucket_order::compute_future_access_lists(bucket_order_seq, access_adj);
++    }
++    double t_setup_future_access = std::chrono::duration<double>(
++        std::chrono::high_resolution_clock::now() - func_t0).count() - t_setup_bucket_count - t_setup_order;
++
++    auto vec_bucket_bytes = [](const VecBucket<DataT>& b) {
++        return b.ids.size() * sizeof(int64_t) + b.vecs.size() * sizeof(DataT);
++    };
++    // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (只在 8-bit 数据、预算 > 0 时用)
+     std::vector<std::vector<int32_t>> future_access_dev;
+     if (use_dev_cache) future_access_dev = future_access;
+     bucket_order::BeladyBucketCache<VecBucket<DataT>> bucket_cache(
+@@ -5313,6 +5321,20 @@ void build_vector_knn_with_tensorcore(
+                     };
+                     auto add_dev = [&](int64_t bid) {
+                         if (bucket_count[bid] == 0) return;
++                        if (d_blob) {   // 直接按偏移出 job，不经过 dev 缓存
++                            size_t off = 0; int64_t gid0 = 0;
++                            bucket_vecs.blob_locate(bid, off, gid0);
++                            const int64_t cnt = bucket_count[bid];
++                            const size_t row_bytes = (blob_mode == 1) ? static_cast<size_t>(blob_stride)
++                                                                      : static_cast<size_t>(D) * sizeof(DataT);
++                            if (off + static_cast<size_t>(cnt) * row_bytes > blob_bytes ||
++                                dofs + static_cast<size_t>(cnt) > max_pool_size_ub)   // bounds check
++                                throw std::runtime_error("VectorKNN: blob bucket / pool out of range at pos " + std::to_string(pos));
++                            h_jobs[slot][nj++] = DevPoolJob{nullptr, d_blob + off, static_cast<int32_t>(cnt),
++                                                            static_cast<int32_t>(dofs), gid0, blob_stride, blob_mode};
++                            dofs += static_cast<size_t>(cnt);
++                            return;
++                        }
+                         auto ga0 = diag_now();
+                         const DevBucket& db = dev_cache->get(pos, static_cast<int32_t>(bid), dev_loader);
+                         t_cache_get += diag_secs(ga0, diag_now());
