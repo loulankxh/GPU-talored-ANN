@@ -260,6 +260,13 @@ struct ChunkCsr {
     std::vector<uint32_t> src;          // size row_offsets.back(), rank-ascending per row
 };
 
+//
+// Parallel (OpenMP; plain serial loops if compiled without -fopenmp):
+// atomic per-row counting + atomic-cursor scatter, then each row's segment
+// is sorted by (rank, src). The src tie-break makes the result independent
+// of the (non-deterministic) scatter order -- previously ties in rank kept
+// the GPU scatter's arrival order. Bounds check: every edge's dst must fall
+// inside [j_lo, j_lo + chunk_size).
 inline ChunkCsr build_rank_ordered_csr(const std::vector<EdgeRecord>& edges,
                                         uint32_t j_lo, uint32_t chunk_size)
 {
@@ -267,31 +274,47 @@ inline ChunkCsr build_rank_ordered_csr(const std::vector<EdgeRecord>& edges,
 
     ChunkCsr csr;
     csr.row_offsets.assign(static_cast<size_t>(chunk_size) + 1, 0);
-    for (const auto& e : edges) {
-        uint32_t local_j = e.dst - j_lo;
-        csr.row_offsets[static_cast<size_t>(local_j) + 1]++;
+    const int64_t n_edges = static_cast<int64_t>(edges.size());
+    int64_t n_bad = 0;
+    uint32_t* cnt = csr.row_offsets.data() + 1;
+    #pragma omp parallel for schedule(static) reduction(+:n_bad)
+    for (int64_t e = 0; e < n_edges; ++e) {
+        uint32_t local_j = edges[static_cast<size_t>(e)].dst - j_lo;
+        if (local_j >= chunk_size) { ++n_bad; continue; }
+        #pragma omp atomic
+        cnt[local_j]++;
     }
+    if (n_bad > 0)
+        throw std::runtime_error("build_rank_ordered_csr: " + std::to_string(n_bad) +
+                                 " edges with dst outside the chunk");
     for (uint32_t i = 0; i < chunk_size; ++i)
         csr.row_offsets[i + 1] += csr.row_offsets[i];
 
     size_t total = csr.row_offsets[chunk_size];
     std::vector<RankSrc> tmp(total);
     std::vector<uint32_t> cursor(csr.row_offsets.begin(), csr.row_offsets.end() - 1);
-    for (const auto& e : edges) {
-        uint32_t local_j = e.dst - j_lo;
-        tmp[cursor[local_j]++] = RankSrc{e.rank, e.src};
-    }
-
-    for (uint32_t i = 0; i < chunk_size; ++i) {
-        uint32_t lo = csr.row_offsets[i], hi = csr.row_offsets[i + 1];
-        if (hi - lo > 1) {
-            std::sort(tmp.begin() + lo, tmp.begin() + hi,
-                      [](const RankSrc& a, const RankSrc& b) { return a.rank < b.rank; });
-        }
+    #pragma omp parallel for schedule(static)
+    for (int64_t e = 0; e < n_edges; ++e) {
+        const EdgeRecord& r = edges[static_cast<size_t>(e)];
+        uint32_t local_j = r.dst - j_lo;
+        uint32_t slot;
+        #pragma omp atomic capture
+        slot = cursor[local_j]++;
+        tmp[slot] = RankSrc{r.rank, r.src};
     }
 
     csr.src.resize(total);
-    for (size_t p = 0; p < total; ++p) csr.src[p] = tmp[p].src;
+    #pragma omp parallel for schedule(dynamic, 1024)
+    for (int64_t i = 0; i < static_cast<int64_t>(chunk_size); ++i) {
+        uint32_t lo = csr.row_offsets[static_cast<size_t>(i)], hi = csr.row_offsets[static_cast<size_t>(i) + 1];
+        if (hi - lo > 1) {
+            std::sort(tmp.begin() + lo, tmp.begin() + hi,
+                      [](const RankSrc& a, const RankSrc& b) {
+                          return a.rank != b.rank ? a.rank < b.rank : a.src < b.src;
+                      });
+        }
+        for (uint32_t p = lo; p < hi; ++p) csr.src[p] = tmp[p].src;
+    }
     return csr;
 }
 

@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#8 (out-of-core Step 4: brute-force top-2 + GPU-side gather/convert)**, 2026-10-21:
+After **#9 (optimize_chunked method E: parallel rank-ordered CSR build)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **17.42** | 0.9301 / 0.9778 / 0.9947 | 1945K / 1036K |
-| SIFT1M large (out-of-core path) | **48.92** | 0.8996 / 0.9629 / 0.9889 | 1943K / 1033K |
+| SIFT1M auto (GPU-resident) | **17.19** | 0.9304 / 0.9784 / 0.9947 | 1942K / 1035K |
+| SIFT1M large (out-of-core path) | **46.90** | 0.8982 / 0.9628 / 0.9891 | 1999K / 1008K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -66,6 +66,8 @@ Other:
 - bucket2 still writes `vector_dists.bin` (256 MB on SIFT1M) that no later stage reads — same treatment as #4 (`--skip-dists`), check `knn_similarity.py` / eval don't need it first.
 - bucket2 Step 6 out-of-core after #6 (~5s/round × 4): pool memcpy ~1.4s, cache_get ~0.65s, scatter_pending ~0.7s (per-point fill + acc.add, serial), gpu_submit ~1.2s (≈10 launches + 3 H2D per bucket of ~100 rows). Batch several buckets per GPU submission (cuVS 26.12 `all_neighbors` batches clusters), or overlap pool build with a producer thread (pinned double buffer, like `cagra_build.cuh::build_knn_graph`). GEMM itself is only 0.6s/round.
 - bucket2 Step 4 out-of-core (8.8s vs 3.3s resident): per round convert_upload ~0.6s + search 0.7s + bucket_write + finish_iteration; ChunkedKNN merge_iteration write_running ~1.1s/chunk in rounds ≥2.
+
+- **Bucket-size outliers break the GPU-memory bound (found in #9):** the balanced assignment (`batch_assign_with_cagra_anns`, CPU step 4d) reads `cluster_sizes` with relaxed atomics from all threads, so bucket sizes differ run to run despite the fixed seed; occasionally a round produces a bucket ~30x the average (SIFT1M large: max 3201 vs avg 100; resident run in #6: 1980). Out-of-core Step 6 sizes its per-slot `dots` buffers from max_pool (0.72 GB/slot × 3 instead of ~0.2 GB) → GPU peak 2708 MiB instead of ~1450. Fix: cap bucket size (spill to the 2nd-nearest centroid when a bucket exceeds e.g. 4–8× avg), or tile the oversized bucket's GEMM; also makes the build deterministic if done per batch in a fixed order.
 
 ## Tried & rejected
 
@@ -412,6 +414,45 @@ Borderline large gain → rerun (`runs/iter6/sift1M_large_b`): +4.19% → also A
 [exited with code 0]
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +5.8% (51.93 → 48.92 s; Step 4 8.66 → 5.32 s), 1M-auto −1.3% (noise; resident Step 4 2.18 → 2.11 s).
+
+### #9 — optimize_chunked method E: parallel rank-ordered CSR build  (2026-10-21)
+**Idea / rationale:** method E's Phase 2 (3.07 s) was dominated by `edge_chunk::build_rank_ordered_csr`, fully serial over 32M reverse-edge records: count per destination, scatter, sort each row's segment by rank (1M small sorts), copy. Now OpenMP: atomic per-row counts, atomic-cursor scatter, per-row sort in a dynamic-scheduled parallel loop with copy-out fused. Rows are sorted by (rank, src): the src tie-break makes the output independent of scatter order (previously equal ranks kept the GPU scatter's arrival order, so two runs could differ; now two runs are byte-identical). Added a bounds check (edge dst must lie inside the chunk). The CSR + per-row merge is the CPU analogue of cuVS 26.12 `detail/cagra/graph_core.cuh` reverse-graph build + `kern_merge_graphs`. `test_edge_chunk_accumulator` passes (serial and -fopenmp). Standalone: Phase 2 3.07 → 1.25 s, optimize_chunked 5.3 → 3.4 s, RSS unchanged.
+**Files:** `src/edge_chunk_accumulator.hpp`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 17.19 | +1.3% | +21.0% | 1.49x | bucket2 15.43, optimize 1.27, translate 0.47 | 4080 | 1.61 |
+| sift1M_large | large | 46.90 | +4.1% | +37.5% | 4.06x | bucket2 39.09, prune 3.89, optimize_chunked 3.47, translate 0.39 | 1530 | 3.95 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.75 | 3.25 | 1.18 | 0.00 | 2.14 | 1.12 | 0.03 | 5.64 | 0.00 | 0.75 |
+| sift1M_large | 0.56 | 4.95 | 1.25 | 0.00 | 5.54 | 2.15 | 0.03 | 20.65 | 2.08 | 1.08 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9932 | 0.9897 | 0.9869 | 0.9840 |
+| sift1M_large | 0.9918 | 0.9892 | 0.9869 | 0.9841 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9304 / 1942K | 0.9784 / 1035K | 0.9947 / 507K | 0.9988 / 187K | 0.9997 / 68K |
+| ours sift1M_large | 0.8982 / 1999K | 0.9628 / 1008K | 0.9891 / 557K | 0.9976 / 189K | 0.9994 / 68K |
+
+[exited with code 0]
+
+Borderline large gain → reruns: `sift1M_large_b` +3.23% but **REJECT on GPU peak 2708 MiB** (one rep; spike in bucket2 Step 6 of round 3, caused by a 3201-point bucket from the nondeterministic balanced assignment — this change touches only optimize_chunked's CPU code; see backlog); `sift1M_large_c` +3.56%, GPU peak 1274–1422 MiB → ACCEPT. Speed passed in all three runs (+4.1 / +3.2 / +3.6%).
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +4.1% (48.92 → 46.90 s; optimize_chunked 5.30 → 3.47 s), 1M-auto +1.3% (path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
