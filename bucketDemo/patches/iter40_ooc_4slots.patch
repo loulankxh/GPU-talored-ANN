@@ -1,0 +1,16 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 462e85c..5caf30d 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -4478,7 +4478,10 @@ void build_vector_knn_with_tensorcore(
+         static_cast<int>((avg_bucket_size + est_wpb - 1) / est_wpb));
+ 
+     constexpr int MAX_SLOTS = 8;
+-    constexpr double OVERSUB = 1.5;  // 1.5× SM 利用率目标，hide launch overhead
++    // 2.0× SM 利用率目标，hide launch overhead。#40 实测 (SIFT1M --out-of-core,
++    // GPU bucket 缓存之后): 3 slot (=1.5x) 1.59 s/轮, 4 slot (=2.0x) 1.43 s/轮,
++    // 6 slot 1.38 s/轮但显存 +0.8 GB。
++    constexpr double OVERSUB = 2.0;
+     int target_streams = std::max(2,
+         static_cast<int>(std::ceil(num_sm * OVERSUB / est_blocks_per_kernel)));
+     target_streams = std::min(target_streams, MAX_SLOTS);
