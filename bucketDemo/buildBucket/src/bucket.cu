@@ -17,6 +17,8 @@
 #include <type_traits>
 #include <omp.h>
 #include <optional>
+#include <fcntl.h>
+#include <unistd.h>
 #include <exception>
 #include <condition_variable>
 #include <mutex>
@@ -3304,6 +3306,18 @@ struct ChunkedKnnAccumulator {
         return dir + "/running_chunk_" + std::to_string(c) + "_dists.bin";
     }
 
+    // 最后一轮的 merge 直接把每个 chunk 的合并结果 pwrite 到最终的
+    // vector_knn.bin / vector_dists.bin (chunk c 的行在文件里就是连续的一段)，
+    // 不再先写 running_chunk_* 再由 finalize_to_file 整份读回、拼接、重写一遍
+    // ——省掉一整遍 N*M*8 B 的写 + 读 + 写 (out-of-core 时 page cache 早已被
+    // dirty 页顶满，这些写都是按磁盘带宽限速的)。
+    std::string final_knn_path, final_dist_path;
+    int final_iter = -1;
+    bool final_written = false;
+    void set_final_output(const std::string& knn_path, const std::string& dist_path, int iter) {
+        final_knn_path = knn_path; final_dist_path = dist_path; final_iter = iter;
+    }
+
     // dir 必须已存在 (调用方负责创建); cpu_mem_budget_bytes 用来限制 merge
     // 阶段并行处理多少个 chunk (每个 chunk 需要 chunk_size*M*4B*2 常驻内存)。
     static ChunkedKnnAccumulator create(const std::string& dir, int64_t N, int M,
@@ -3515,6 +3529,37 @@ struct ChunkedKnnAccumulator {
         std::vector<ChunkTiming> timing(static_cast<size_t>(num_chunks));
         int actual_num_threads = 0;
 
+        const bool is_final = (iter == final_iter);
+        int fd_knn = -1, fd_dist = -1;
+        const off_t hdr = static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t));
+        if (is_final) {
+            auto open_out = [&](const std::string& path) {
+                int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                if (fd < 0) throw std::runtime_error("ChunkedKnnAccumulator: cannot open " + path);
+                char h[sizeof(int64_t) + sizeof(int32_t)];
+                int32_t M32 = static_cast<int32_t>(M);
+                std::memcpy(h, &N, sizeof(int64_t));
+                std::memcpy(h + sizeof(int64_t), &M32, sizeof(int32_t));
+                if (::pwrite(fd, h, sizeof(h), 0) != static_cast<ssize_t>(sizeof(h)) ||
+                    ::ftruncate(fd, hdr + static_cast<off_t>(N) * M * 4) != 0) {
+                    ::close(fd);
+                    throw std::runtime_error("ChunkedKnnAccumulator: header/ftruncate failed for " + path);
+                }
+                return fd;
+            };
+            fd_knn = open_out(final_knn_path);
+            fd_dist = open_out(final_dist_path);
+        }
+        auto pwrite_all = [](int fd, const void* buf, size_t n, off_t off) {
+            const char* p = static_cast<const char*>(buf);
+            while (n > 0) {
+                ssize_t w = ::pwrite(fd, p, n, off);
+                if (w <= 0) return false;
+                p += w; n -= static_cast<size_t>(w); off += w;
+            }
+            return true;
+        };
+
         #pragma omp parallel num_threads(merge_parallelism)
         {
             #pragma omp single
@@ -3613,15 +3658,24 @@ struct ChunkedKnnAccumulator {
                 auto t4 = now();
                 tm.merge_cpu = secs_between(t3, t4);
 
-                std::ofstream nout(np, std::ios::binary | std::ios::trunc);
-                std::ofstream dout(dp, std::ios::binary | std::ios::trunc);
-                nout.write(reinterpret_cast<const char*>(run_nbrs.data()),
-                          static_cast<std::streamsize>(run_nbrs.size() * sizeof(int32_t)));
-                dout.write(reinterpret_cast<const char*>(run_dists.data()),
-                          static_cast<std::streamsize>(run_dists.size() * sizeof(float)));
-                if (!nout.good() || !dout.good())
-                    throw std::runtime_error("ChunkedKnnAccumulator: write failed for running chunk " + std::to_string(c));
-                nout.close(); dout.close();
+                if (is_final) {
+                    // chunk c 在最终文件里是第 [chunk_start, chunk_start+chunk_c_size) 行
+                    const off_t ofs = hdr + static_cast<off_t>(chunk_start) * M * 4;
+                    if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs) ||
+                        !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs))
+                        throw std::runtime_error("ChunkedKnnAccumulator: final pwrite failed for chunk " + std::to_string(c));
+                    if (iter > 0) { std::filesystem::remove(np); std::filesystem::remove(dp); }
+                } else {
+                    std::ofstream nout(np, std::ios::binary | std::ios::trunc);
+                    std::ofstream dout(dp, std::ios::binary | std::ios::trunc);
+                    nout.write(reinterpret_cast<const char*>(run_nbrs.data()),
+                              static_cast<std::streamsize>(run_nbrs.size() * sizeof(int32_t)));
+                    dout.write(reinterpret_cast<const char*>(run_dists.data()),
+                              static_cast<std::streamsize>(run_dists.size() * sizeof(float)));
+                    if (!nout.good() || !dout.good())
+                        throw std::runtime_error("ChunkedKnnAccumulator: write failed for running chunk " + std::to_string(c));
+                    nout.close(); dout.close();
+                }
                 auto t5 = now();
                 tm.write_running = secs_between(t4, t5);
                 tm.total = secs_between(t0, t5);
@@ -3629,6 +3683,11 @@ struct ChunkedKnnAccumulator {
             }
         }
 
+        if (is_final) {
+            if (::close(fd_knn) != 0 || ::close(fd_dist) != 0)
+                throw std::runtime_error("ChunkedKnnAccumulator: close failed for final outputs");
+            final_written = true;
+        }
         double secs = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t_merge_start).count();
         size_t running_rw_bytes = static_cast<size_t>(M) * sizeof(int32_t) * 2;  // nbrs+dists 各 M*4B
@@ -3680,6 +3739,11 @@ struct ChunkedKnnAccumulator {
     // 接成最终的 vector_knn.bin / vector_dists.bin (格式跟原来 RunningKnnFile
     // 的输出完全一致: int64 N + int32 M header，后面跟 (N,M) flat body)。
     void finalize_to_file(const std::string& knn_path, const std::string& dist_path) {
+        if (final_written) {   // 最后一轮 merge 已经直接写好了
+            if (knn_path != final_knn_path || dist_path != final_dist_path)
+                throw std::runtime_error("ChunkedKnnAccumulator: finalize path differs from set_final_output");
+            return;
+        }
         std::ofstream kout(knn_path, std::ios::binary | std::ios::trunc);
         std::ofstream dout(dist_path, std::ios::binary | std::ios::trunc);
         int32_t M32 = static_cast<int32_t>(M);
@@ -5573,6 +5637,9 @@ int run_pipeline_impl(
             }
             {
                 ChunkedKnnAccumulator* acc_ptr = knn_acc.get();
+                if (iter == iterations - 1)
+                    acc_ptr->set_final_output(output_dir + "/vector_knn.bin",
+                                              output_dir + "/vector_dists.bin", iter);
                 pending_knn_merge = std::async(std::launch::async,
                     [acc_ptr, iter]() { acc_ptr->merge_iteration(iter); });
             }
