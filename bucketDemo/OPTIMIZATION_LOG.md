@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#1 (prune_windowed hot path: bucket-slot window + O(M²) detour count)**, 2026-10-21:
+After **#2 (prune_windowed: optimistic pointer handoff from the Belady cache)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **21.36** | 0.9297 / 0.9779 / 0.9947 | 1945K / 1035K |
-| SIFT1M large (out-of-core path) | **59.83** | 0.8971 / 0.9626 / 0.9888 | 1994K / 1065K |
+| SIFT1M auto (GPU-resident) | **21.30** | 0.9298 / 0.9785 / 0.9947 | 1946K / 1036K |
+| SIFT1M large (out-of-core path) | **57.14** | 0.8984 / 0.9628 / 0.9893 | 1995K / 1066K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -62,7 +62,8 @@ Other:
 - Step 4.5 inline reorder and Step 6 `pool_build` / `scatter_pending` dominate the SIFT10M out-of-core loop — overlap host gather with GPU work (pinned staging, double buffering).
 - Large path quality gap (prune_windowed vs cuVS optimize): SIFT1M recall@10 at itopk 32 is ~3 points below CAGRA — study `cpp/src/neighbors/detail/cagra/graph_core.cuh` (`optimize`: detour counting / rank-based pruning / reverse-edge merge) and align `prune_windowed_core.hpp` + `optimize_chunked` method E with it.
 - `optimize` (resident) spends most of its time in file load + sanitize, not in the cuVS call.
-- `prune_windowed` after #1: fetch (Belady cache load: per-bucket `read_rows` + u8→f32 dataset chunk, file reopened per call) = 3.7s of 6.3s, now the biggest part — keep handles open / read the whole bucket range in big sequential chunks, store vectors as u8 (4x less memory, also lets the cache hold 4x more on SIFT10M). Compute (2.2s) still forks an OMP region per bucket of ~100 rows on 80 threads.
+- `prune_windowed` after #2 (3.9s): compute 2.6s forks an OMP region per bucket of ~100 rows on 80 threads — process several positions per parallel region, or move the detour count to GPU (cuVS `kern_fused_prune`). Store cached vectors as u8 (4x less cache memory → fewer evictions on SIFT10M); keep the dataset handle open in the loader.
+- `translate_ids` (2.1s for 1M) and resident `optimize` (2.1s) are now ~20% of the auto path outside bucket2 — check for plain I/O inefficiency.
 - bucket2 Step 6 (large path, 22–26s) is the largest single step of the large path.
 
 ## Tried & rejected
@@ -145,6 +146,45 @@ Other:
 prune_windowed breakdown (rep1): fetch 3.74s, window_build 0.04s (was 4.36), compute 2.24s (was 4.46), write 0.22s, wall 6.27s (was 18.0).
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-auto +1.8% (untouched path, noise), 1M-large +20.3% (75.10 → 59.83 s).
+
+### #2 — prune_windowed: optimistic pointer handoff from the Belady cache  (2026-10-21)
+**Idea / rationale:** after #1 the prune fetch phase was 3.7–4.0s even with warm files. Cause: `prune_windowed` only handed out cache references once *every* bucket was resident (`safe_ref`), which happens near the last position, so nearly every position deep-copied all K+1 window blocks (~25 GB memcpy on SIFT1M although the cache never evicted anything). A reference from `BeladyBucketCache::get` is only invalidated by an eviction, so: the cache now exposes a monotonic `evictions()` counter; the window is fetched as pointers and re-fetched with defensive copies only if the counter moved during that position. Eviction policy unchanged. Same "don't copy, reference the resident buffer unless it can move" idea as cuVS 26.12 `detail/cagra/cagra_build.cuh` (host batches staged by view, copies only into pinned staging). Output verified byte-identical to the previous binary (cache 16000 MB: 0 evictions / 0 copy positions; cache 100 MB: 73645 evictions, 9166 copy positions, still byte-identical).
+**Files:** `src/bucket_order.hpp`, `src/prune_windowed.cpp`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 21.30 | +0.3% | +2.1% | 1.85x | bucket2 17.14, optimize 2.09, translate 2.07 | 5544 | 2.06 |
+| sift1M_large | large | 57.14 | +4.5% | +23.9% | 4.95x | bucket2 45.85, prune 3.95, optimize_chunked 5.23, translate 2.16 | 1482 | 4.29 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.73 | 3.21 | 1.14 | 0.00 | 3.35 | 1.13 | 0.02 | 5.64 | 0.00 | 1.44 |
+| sift1M_large | 0.56 | 5.03 | 1.85 | 0.00 | 8.80 | 1.73 | 0.03 | 22.67 | 2.12 | 2.22 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9921 | 0.9895 | 0.9865 | 0.9841 |
+| sift1M_large | 0.9933 | 0.9897 | 0.9867 | 0.9840 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9298 / 1946K | 0.9785 / 1036K | 0.9947 / 524K | 0.9989 / 188K | 0.9997 / 68K |
+| ours sift1M_large | 0.8984 / 1995K | 0.9628 / 1066K | 0.9893 / 507K | 0.9974 / 188K | 0.9994 / 68K |
+
+[exited with code 0]
+
+prune_windowed breakdown: fetch 0.98s (was 3.74), compute 2.60s, wall 3.88s (was 6.27). Borderline gain → large config rerun (`runs/iter2/sift1M_large_b`): 56.79 s, +5.1% → also ACCEPT.
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +0.3% (untouched path), 1M-large +4.5% / +5.1% on rerun (59.83 → 57.14 s).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

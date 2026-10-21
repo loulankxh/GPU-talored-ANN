@@ -369,6 +369,10 @@ public:
 
     size_t used_bytes() const { return used_bytes_; }
     size_t resident_count() const { return resident_count_; }
+    // Monotonic count of evictions so far. A caller holding references from
+    // get() can check it is unchanged to know none of them was invalidated
+    // (only an eviction ever releases a slot).
+    uint64_t evictions() const { return evictions_; }
 
 private:
     void advance_pointer(int32_t bucket_id, int32_t position) {
@@ -400,6 +404,7 @@ private:
             slot_[victim] = BucketT();  // release its heap memory, not just the accounting
             resident_[victim] = 0;
             --resident_count_;
+            ++evictions_;
         }
         // If a single bucket's bytes alone exceed capacity_bytes_, the loop
         // above empties the cache and still can't make room - we insert it
@@ -420,6 +425,7 @@ private:
     std::vector<int64_t> next_use_;   // bucket id -> current next-use position
     IndexedMaxHeap next_use_heap_;    // max-heap over next_use_, by bucket id
     size_t resident_count_ = 0;
+    uint64_t evictions_ = 0;
 };
 
 }  // namespace bucket_order

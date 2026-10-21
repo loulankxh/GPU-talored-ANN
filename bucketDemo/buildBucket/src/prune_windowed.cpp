@@ -240,6 +240,7 @@ int main(int argc, char** argv)
         // because it's the only parallel part.
         prune_windowed::BucketWindow window(offsets_new.data(), n_buckets);
 
+        int64_t n_copy_positions = 0;
         double t_fetch = 0, t_window_build = 0, t_compute = 0, t_write = 0;
         int64_t min_center_count = std::numeric_limits<int64_t>::max(), max_center_count = 0;
 
@@ -260,25 +261,36 @@ int main(int argc, char** argv)
             // and turns ~768MB of redundant copying (every bucket gets
             // copied once per window that references it, i.e. ~(1+K)x
             // over the whole run) into plain pointer handoffs.
-            const bool safe_ref = (cache.resident_count() == static_cast<size_t>(n_buckets));
-
+            // Optimistic pointer handoff: a reference from get() can only be
+            // invalidated by an eviction (a later miss at the same position).
+            // Fetch the whole window as pointers first; only if the cache's
+            // eviction counter moved during this position redo it with
+            // defensive copies. Previously copies were made whenever the cache
+            // wasn't *fully* resident -- i.e. for almost every position, since
+            // the last bucket only becomes resident near the end -- ~(K+1)x
+            // the dataset in memcpy even when nothing was ever evicted.
             auto tf0 = Clock::now();
-            position_scratch.clear();
-            auto fetch_one = [&](int32_t id) {
-                const BucketWindowBlock& blk = cache.get(pos, id, loader);
-                if (safe_ref) {
-                    position_scratch.push_back(&blk);
-                } else {
-                    position_scratch_owned.push_back(blk);  // defensive copy
-                    position_scratch.push_back(&position_scratch_owned.back());
+            auto fetch_window = [&](bool copy) {
+                position_scratch.clear();
+                position_scratch_owned.clear();
+                auto fetch_one = [&](int32_t id) {
+                    const BucketWindowBlock& blk = cache.get(pos, id, loader);
+                    if (!copy) {
+                        position_scratch.push_back(&blk);
+                    } else {
+                        position_scratch_owned.push_back(blk);  // defensive copy
+                        position_scratch.push_back(&position_scratch_owned.back());
+                    }
+                };
+                fetch_one(b);   // index 0 = center
+                for (int32_t nb : adj[static_cast<size_t>(b)]) {
+                    if (nb < 0 || nb >= n_buckets) continue;
+                    fetch_one(nb);
                 }
             };
-            if (!safe_ref) position_scratch_owned.clear();
-            fetch_one(b);   // index 0 = center
-            for (int32_t nb : adj[static_cast<size_t>(b)]) {
-                if (nb < 0 || nb >= n_buckets) continue;
-                fetch_one(nb);
-            }
+            const uint64_t ev0 = cache.evictions();
+            fetch_window(false);
+            if (cache.evictions() != ev0) { fetch_window(true); ++n_copy_positions; }
             t_fetch += std::chrono::duration<double>(Clock::now() - tf0).count();
 
             // Bucket-granular window (one slot per bucket, reused across
@@ -339,7 +351,9 @@ int main(int argc, char** argv)
                   << ", in-window hits: " << total_hits
                   << " (" << std::fixed << std::setprecision(2) << pct_hit << "%)\n";
         std::cout << "  [Stats] cache: resident_count=" << cache.resident_count()
-                  << " used_bytes=" << cache.used_bytes() / 1e6 << " MB\n";
+                  << " used_bytes=" << cache.used_bytes() / 1e6 << " MB"
+                  << " evictions=" << cache.evictions()
+                  << " copy_positions=" << n_copy_positions << "\n";
         std::cout << "  [Stats] bucket size: min=" << min_center_count
                   << " max=" << max_center_count
                   << " avg=" << (n_buckets ? static_cast<double>(N) / n_buckets : 0.0) << "\n";
