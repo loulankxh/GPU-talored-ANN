@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#51 (KMeans|| training fraction 0.25 → 0.10)**, 2026-10-21:
+After **#52 (optimize_chunked GPU phase 2 with staged memory → fits SIFT10M)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **6.80** (0.59x CAGRA) | 0.9285 / 0.9770 / 0.9944 | 1947K / 1037K |
-| SIFT1M large (out-of-core path) | **10.94** (0.95x CAGRA) | 0.9140 / 0.9705 / 0.9923 | 2217K / 1189K |
-| SIFT10M auto (→ large path, 1 run) | **118.38** (0.97x CAGRA) | 0.8380 / 0.9292 / 0.9738 | 1863K / 1010K |
+| SIFT1M auto (GPU-resident) | **6.87** (0.60x CAGRA) | 0.9287 / 0.9776 / 0.9947 | 1948K / 1034K |
+| SIFT1M large (out-of-core path) | **10.72** (0.93x CAGRA) | 0.9135 / 0.9708 / 0.9922 | 2181K / 1189K |
+| SIFT10M auto (→ large path, 1 run) | **110.94** (0.90x CAGRA) | 0.8368 / 0.9288 / 0.9733 | 1864K / 1010K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -1471,6 +1471,48 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8380 / 1863K | 0.9292 / 1010K | 0.9738 / 516K | 0.9922 / 178K | 0.9980 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 10M-auto +14.7% (138.79 → 118.38 s, **0.97× CAGRA native**), 1M-auto +5.3% (7.18 → 6.80 s), 1M-large +1.5%.
+
+### #52 — optimize_chunked method E: GPU phase 2 with staged device memory (fits SIFT10M)  (2026-10-21, commit TBD)
+**Idea / rationale:** the GPU phase 2 from #39 allocated everything at once (dst/src/rank/64-bit idx/key2 + output, ~14.8 GB at 3.2 × 10⁸ edges) next to the 3.2 GB scatter buffer, so on SIFT10M it fell back to the 8 s CPU phase 2 (fallback added after the SIFT10M OOM). Now: (1) unpack the edges, then free the scatter buffer (single chunk, single drain: never used again); (2) 32-bit sort index instead of 64-bit (E < 2³², checked); (3) after building the (dst, rank) key, free dst / rank / idx before the second radix sort; (4) allocate the output only after freeing key2. Peak ≈ 24 B/edge + forward graph + output. The fit check now tests both phases: unpack with the scatter buffer resident, and sort after releasing it. CPU phase 2 is still the fallback. Same sort / merge rules as before (output byte-identical to the CPU path, verified in #39).
+**Files:** `bucketDemo/buildBucket/src/optimize_chunked.cu`
+**Params changed:** none
+**SIFT10M:** optimize_chunked 13.09 → 4.88 s (phase 2 7.98 → 1.16 s); GPU peak 8998 MiB (within the 1.2× guard).
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.87 | -1.0% | +68.4% | 0.60x | bucket2 6.87 | 3910 | 1.71 |
+| sift1M_large | large | 10.72 | +2.0% | +85.7% | 0.93x | bucket2 8.86, prune 0.84, optimize_chunked 0.64, translate 0.46 | 1602 | 2.68 |
+| sift10M_auto | large | 110.94 | +6.3% | +37.8% | 0.90x | bucket2 95.51, prune 7.01, optimize_chunked 4.88, translate 3.54 | 8998 | 18.80 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.63 | 0.35 | 0.12 | 0.00 | 0.67 | 0.47 | 0.02 | 3.13 | 0.00 | 0.91 |
+| sift1M_large | 0.57 | 0.62 | 0.36 | 0.00 | 1.19 | 0.39 | 0.04 | 4.48 | 0.53 | 0.00 |
+| sift10M_auto | 5.44 | 14.95 | 1.96 | 0.00 | 19.92 | 2.91 | 0.33 | 44.50 | 4.09 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9740 | 0.9665 | 0.9594 | 0.9536 |
+| sift1M_large | 0.9743 | 0.9658 | 0.9590 | 0.9536 |
+| sift10M_auto | 0.9169 | 0.8987 | 0.8834 | 0.8715 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9287 / 1948K | 0.9776 / 1034K | 0.9947 / 533K | 0.9987 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9135 / 2181K | 0.9708 / 1189K | 0.9922 / 562K | 0.9981 / 189K | 0.9995 / 66K |
+| ours sift10M_auto | 0.8368 / 1864K | 0.9288 / 1010K | 0.9733 / 480K | 0.9918 / 184K | 0.9980 / 68K |
+
+**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +6.3% (118.38 → 110.94 s, **0.90× CAGRA native**), 1M-large +2.0%, 1M-auto −1.0% (noise, path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

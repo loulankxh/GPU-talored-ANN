@@ -1328,12 +1328,12 @@ __global__ void kern_e_extract(const edge_chunk::EdgeRecord* __restrict__ recs, 
     atomicAdd(&row_cnt[r.dst], 1u);
 }
 
-__global__ void kern_e_key2(const uint64_t* __restrict__ idx, const uint32_t* __restrict__ dst,
+__global__ void kern_e_key2(const uint32_t* __restrict__ idx, const uint32_t* __restrict__ dst,
                             const uint16_t* __restrict__ rank, uint64_t E, uint64_t* __restrict__ key2)
 {
     uint64_t i = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= E) return;
-    const uint64_t j = idx[i];
+    const uint32_t j = idx[i];
     key2[i] = (static_cast<uint64_t>(dst[j]) << 16) | rank[j];
 }
 
@@ -1582,33 +1582,37 @@ static void run_method_E(
             if (cnt == 0) continue;
             uint32_t take = std::min(cnt, static_cast<uint32_t>(capacity_per_chunk));
             if (single_drain && gpu_phase2) {
-                // GPU Phase 2 的工作区: dst/src (4+4 B) + rank (2 B) + idx/key2 (8+8 B) 每条边，
-                // 两次 stable_sort_by_key 的临时空间 (按 key+value ≈ 12 B/边 估)，加 cnt (N+1)
-                // 和输出 (N*K_out)，再留 10% 余量。SIFT10M (3.2 亿条边) 要 ~13 GB，在 chunk
-                // buffer + 前向图已经占着显存时放不下 → 走下面的 CPU Phase 2。
+                // GPU Phase 2 的显存按阶段申请/释放 (SIFT10M 3.2 亿条边原来一次性要 ~14.8 GB，
+                // 放不下)：
+                //   (1) 解包: chunk buffer (已占) + dst/src (4+4 B) + rank (2 B) + cnt
+                //   (2) 释放 chunk buffer；第 1 遍排序 (src 键 + 32 位 idx: 8 B + 临时 8 B)
+                //   (3) key2 (8 B) 算完释放 dst/rank/idx；第 2 遍排序 (8+4 B + 临时 12 B)
+                //   (4) 释放 key2，申请输出 (N*K_out) 做 merge
+                // 峰值 ≈ 24 B/边 + 前向图 + 输出。放不下就退回 CPU Phase 2。
                 size_t free_b = 0, total_b = 0;
                 CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
-                const double need = (static_cast<double>(take) * (4 + 4 + 2 + 8 + 8 + 12)
-                                     + (static_cast<double>(N) + 1) * 4
-                                     + static_cast<double>(N) * K_out * 4) * 1.10;
-                if (need > static_cast<double>(free_b)) {
-                    std::cout << "  [Method E] GPU phase 2 needs " << need / 1e9 << " GB, only "
-                              << free_b / 1e9 << " GB free -> CPU phase 2\n";
+                const double E_d = static_cast<double>(take);
+                const double small = (static_cast<double>(N) + 1) * 4 + static_cast<double>(N) * K_out * 4;
+                const double need_extract = (E_d * 10 + (static_cast<double>(N) + 1) * 4) * 1.10;
+                const double need_sort = (E_d * 24 + small) * 1.10;
+                const double chunk_bytes = static_cast<double>(capacity_per_chunk) * sizeof(edge_chunk::EdgeRecord);
+                if (need_extract > static_cast<double>(free_b) || need_sort > static_cast<double>(free_b) + chunk_bytes) {
+                    std::cout << "  [Method E] GPU phase 2 needs " << need_sort / 1e9 << " GB (with the "
+                              << chunk_bytes / 1e9 << " GB chunk buffer released), only " << free_b / 1e9
+                              << " GB free -> CPU phase 2\n";
                     gpu_phase2 = false;
                 }
             }
             if (single_drain && gpu_phase2) {
                 // Phase 2 直接在 GPU 上做 (边和整张前向图都已经在显存)
                 const uint64_t E = take;
-                uint32_t *d_dst = nullptr, *d_src = nullptr, *d_cnt = nullptr, *d_out = nullptr;
-                uint16_t* d_rank = nullptr; uint64_t *d_idx = nullptr, *d_key2 = nullptr; int* d_err = nullptr;
+                if (E >= (1ULL << 32)) throw std::runtime_error("Method E (GPU phase 2): too many edges for 32-bit idx");
+                uint32_t *d_dst = nullptr, *d_src = nullptr, *d_cnt = nullptr, *d_out = nullptr, *d_idx = nullptr;
+                uint16_t* d_rank = nullptr; uint64_t* d_key2 = nullptr; int* d_err = nullptr;
                 CUDA_CHECK(cudaMalloc(&d_dst,  E * sizeof(uint32_t)));
                 CUDA_CHECK(cudaMalloc(&d_src,  E * sizeof(uint32_t)));
                 CUDA_CHECK(cudaMalloc(&d_rank, E * sizeof(uint16_t)));
-                CUDA_CHECK(cudaMalloc(&d_idx,  E * sizeof(uint64_t)));
-                CUDA_CHECK(cudaMalloc(&d_key2, E * sizeof(uint64_t)));
                 CUDA_CHECK(cudaMalloc(&d_cnt,  (static_cast<size_t>(N) + 1) * sizeof(uint32_t)));
-                CUDA_CHECK(cudaMalloc(&d_out,  static_cast<size_t>(N) * K_out * sizeof(uint32_t)));
                 CUDA_CHECK(cudaMalloc(&d_err,  sizeof(int)));
                 CUDA_CHECK(cudaMemset(d_cnt, 0, (static_cast<size_t>(N) + 1) * sizeof(uint32_t)));
                 CUDA_CHECK(cudaMemset(d_err, 0, sizeof(int)));
@@ -1616,19 +1620,31 @@ static void run_method_E(
                 kern_e_extract<<<eb, 256>>>(d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk, E,
                                             static_cast<uint64_t>(N), d_dst, d_rank, d_src, d_cnt, d_err);
                 CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                // 单 chunk、唯一一次 drain: chunk buffer 之后不再用
+                CUDA_CHECK(cudaFree(d_chunk_buf));
+                d_chunk_buf = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_idx, E * sizeof(uint32_t)));
                 auto pol = thrust::cuda::par;
                 thrust::sequence(pol, thrust::device_pointer_cast(d_idx), thrust::device_pointer_cast(d_idx) + E);
                 {   // 第 1 遍: 按 src 稳定排序 (src 键排完即为排好序的 src)
                     thrust::stable_sort_by_key(pol, thrust::device_pointer_cast(d_src), thrust::device_pointer_cast(d_src) + E,
                                                thrust::device_pointer_cast(d_idx));
                 }
+                CUDA_CHECK(cudaMalloc(&d_key2, E * sizeof(uint64_t)));
                 kern_e_key2<<<eb, 256>>>(d_idx, d_dst, d_rank, E, d_key2);
                 CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaDeviceSynchronize());
+                cudaFree(d_idx); cudaFree(d_dst); cudaFree(d_rank);
+                d_idx = nullptr; d_dst = nullptr; d_rank = nullptr;
                 // 第 2 遍: 按 (dst, rank) 稳定排序，src 跟着走 → (dst, rank, src) 序
                 thrust::stable_sort_by_key(pol, thrust::device_pointer_cast(d_key2), thrust::device_pointer_cast(d_key2) + E,
                                            thrust::device_pointer_cast(d_src));
+                CUDA_CHECK(cudaDeviceSynchronize());
+                cudaFree(d_key2); d_key2 = nullptr;
                 thrust::exclusive_scan(pol, thrust::device_pointer_cast(d_cnt),
                                        thrust::device_pointer_cast(d_cnt) + N + 1, thrust::device_pointer_cast(d_cnt));
+                CUDA_CHECK(cudaMalloc(&d_out,  static_cast<size_t>(N) * K_out * sizeof(uint32_t)));
                 const unsigned nb = static_cast<unsigned>((N + 127) / 128);
                 if (K_out <= 32) kern_e_merge<32><<<nb, 128>>>(d_fwd_batch, d_cnt, d_src, static_cast<uint64_t>(N), K_out, d_out);
                 else             kern_e_merge<64><<<nb, 128>>>(d_fwd_batch, d_cnt, d_src, static_cast<uint64_t>(N), K_out, d_out);
@@ -1640,8 +1656,7 @@ static void run_method_E(
                 gpu_merged_rows.resize(static_cast<size_t>(N) * K_out);
                 CUDA_CHECK(cudaMemcpy(gpu_merged_rows.data(), d_out, gpu_merged_rows.size() * sizeof(uint32_t),
                                       cudaMemcpyDeviceToHost));
-                cudaFree(d_dst); cudaFree(d_src); cudaFree(d_rank); cudaFree(d_idx); cudaFree(d_key2);
-                cudaFree(d_cnt); cudaFree(d_out); cudaFree(d_err);
+                cudaFree(d_src); cudaFree(d_cnt); cudaFree(d_out); cudaFree(d_err);
                 total_in_chunk += take;
                 continue;
             }
