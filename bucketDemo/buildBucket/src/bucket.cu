@@ -1958,6 +1958,55 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
 // ============== Phase 10: GPU-Resident KNN Graph Building ==============
 
 /**
+ * 精确的 centroid 自 KNN (非 PQ 路径用): brute-force (分块 GEMM + select_k，
+ * cuVS 26.12 detail/knn_brute_force.cuh) 一次算出每个 centroid 最近的 k_out
+ * 个其它 centroid (去掉自己)。10K centroids 只要几十 ms；原来 Step 3 每轮
+ * 跑一次完整的 cagra::build (NN-Descent + sort + prune, 还要先拷回 host)
+ * ~0.2–0.5 s，Step 6 再对那张剪过枝的导航图做一次 CAGRA self-search 才得到
+ * nprobe 近邻。这里一次拿到前 max(K, nprobe) 个精确近邻，前 K 列当 centroid
+ * KNN 图 (bucket 顺序 / 重排 / 窗口)，前 nprobe 列直接当 Step 6 的近邻表。
+ * 返回 host (n_centroids, k_out) row-major, 按距离升序; 越界 id 直接报错。
+ */
+std::vector<uint32_t> centroid_self_knn_bf(const float* d_centroids_f32, int64_t n_centroids,
+                                           int64_t D, uint32_t k_out)
+{
+    if (static_cast<int64_t>(k_out) >= n_centroids)
+        throw std::runtime_error("centroid_self_knn_bf: k_out must be < n_centroids");
+    const int64_t ks = static_cast<int64_t>(k_out) + 1;   // 多取 1 个，剥掉自己
+    raft::resources res;
+    auto cview = raft::make_device_matrix_view<const float, int64_t>(d_centroids_f32, n_centroids, D);
+    cuvs::neighbors::brute_force::index_params bp;
+    bp.metric = cuvs::distance::DistanceType::L2Expanded;
+    auto bf = cuvs::neighbors::brute_force::build(res, bp, cview);
+    auto nb = raft::make_device_matrix<int64_t, int64_t>(res, n_centroids, ks);
+    auto ds = raft::make_device_matrix<float, int64_t>(res, n_centroids, ks);
+    cuvs::neighbors::brute_force::search(res, bf, cview, nb.view(), ds.view());
+    std::vector<int64_t> h_nb(static_cast<size_t>(n_centroids * ks));
+    raft::copy(h_nb.data(), nb.data_handle(), h_nb.size(), raft::resource::get_cuda_stream(res));
+    raft::resource::sync_stream(res);
+
+    std::vector<uint32_t> out(static_cast<size_t>(n_centroids) * k_out);
+    int64_t n_bad = 0;
+    #pragma omp parallel for schedule(static) reduction(+:n_bad)
+    for (int64_t c = 0; c < n_centroids; ++c) {
+        const int64_t* row = h_nb.data() + c * ks;
+        uint32_t* o = out.data() + static_cast<size_t>(c) * k_out;
+        uint32_t w = 0;
+        bool self_seen = false;
+        for (int64_t j = 0; j < ks && w < k_out; ++j) {
+            int64_t v = row[j];
+            if (v < 0 || v >= n_centroids) { ++n_bad; continue; }
+            if (v == c && !self_seen) { self_seen = true; continue; }   // 自己 (距离相同的重复向量时不一定在第 0 位)
+            o[w++] = static_cast<uint32_t>(v);
+        }
+        if (w < k_out) ++n_bad;
+    }
+    if (n_bad > 0)
+        throw std::runtime_error("centroid_self_knn_bf: " + std::to_string(n_bad) + " bad rows");
+    return out;
+}
+
+/**
  * 在 GPU 上构建 centroid KNN 图，结果直接保留在 GPU 上。
  *
  * @param d_centroids_f32   centroid 数据 (已在 GPU, float32, n_centroids*D)
@@ -5152,8 +5201,25 @@ int run_pipeline_impl(
         uint32_t* d_graph = nullptr;
         K = config.knn_k;
 
-        build_centroid_knn_on_gpu(
-            d_centroids_f32, n_centroids, D, K, &d_graph);
+        // 非 PQ: 精确 brute-force 自 KNN，一次取 max(K, nprobe) 列 (见
+        // centroid_self_knn_bf)；PQ 路径 Step 4 仍要在 centroid 图上做 CAGRA
+        // 搜索，保留原来的 cagra::build 导航图。
+        std::vector<uint32_t> centroid_exact_knn;   // (n_centroids, exact_knn_k)，非 PQ 时有效
+        uint32_t exact_knn_k = 0;
+        if (!mem_est.need_pq) {
+            exact_knn_k = std::max<uint32_t>(K, (nprobe > 0) ? nprobe : K);
+            centroid_exact_knn = centroid_self_knn_bf(d_centroids_f32, n_centroids, D, exact_knn_k);
+            std::vector<uint32_t> g(static_cast<size_t>(n_centroids) * K);
+            for (int64_t c = 0; c < n_centroids; ++c)
+                std::memcpy(g.data() + static_cast<size_t>(c) * K,
+                            centroid_exact_knn.data() + static_cast<size_t>(c) * exact_knn_k,
+                            K * sizeof(uint32_t));
+            CUDA_CHECK(cudaMalloc(&d_graph, g.size() * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemcpy(d_graph, g.data(), g.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        } else {
+            build_centroid_knn_on_gpu(
+                d_centroids_f32, n_centroids, D, K, &d_graph);
+        }
 
         size_t centroid_gpu_bytes = static_cast<size_t>(n_centroids) * D * sizeof(float);
         size_t graph_bytes = static_cast<size_t>(n_centroids) * K * sizeof(uint32_t);
@@ -5568,13 +5634,23 @@ int run_pipeline_impl(
             // 解析 nprobe: 若用户没指定 (=0)，回退到图度数 K
             uint32_t effective_nprobe = (nprobe > 0) ? nprobe : K;
 
-            // CAGRA-pruned graph 不是 sorted KNN, 必须用 greedy graph search
-            // 在导航图上为每个 centroid 找真实的 top-nprobe 近邻 (含 nprobe == K)
-            std::vector<uint32_t> centroid_topK = expand_centroid_neighbors_gpu(
-                centroids_host_for_step6,
-                centroid_knn_graph_host,
-                n_centroids, D, K, effective_nprobe,
-                search_max_iters);
+            // 非 PQ: Step 3 的精确自 KNN 已经算好前 max(K, nprobe) 个近邻，
+            // 直接取前 nprobe 列。PQ: CAGRA-pruned graph 不是 sorted KNN, 必须用
+            // greedy graph search 在导航图上为每个 centroid 找 top-nprobe 近邻。
+            std::vector<uint32_t> centroid_topK;
+            if (!centroid_exact_knn.empty() && effective_nprobe <= exact_knn_k) {
+                centroid_topK.resize(static_cast<size_t>(n_centroids) * effective_nprobe);
+                for (int64_t c = 0; c < n_centroids; ++c)
+                    std::memcpy(centroid_topK.data() + static_cast<size_t>(c) * effective_nprobe,
+                                centroid_exact_knn.data() + static_cast<size_t>(c) * exact_knn_k,
+                                effective_nprobe * sizeof(uint32_t));
+            } else {
+                centroid_topK = expand_centroid_neighbors_gpu(
+                    centroids_host_for_step6,
+                    centroid_knn_graph_host,
+                    n_centroids, D, K, effective_nprobe,
+                    search_max_iters);
+            }
             const uint32_t* graph_ptr = centroid_topK.data();
             uint32_t graph_K = effective_nprobe;
             double t6_topk_expand = std::chrono::duration<double>(Clock::now() - t6).count();

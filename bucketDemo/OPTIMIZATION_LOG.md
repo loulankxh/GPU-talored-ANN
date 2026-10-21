@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#19 (optimize_chunked method E: single-chunk edges stay in memory)**, 2026-10-21:
+After **#20 (exact brute-force centroid self-kNN replaces CAGRA build + self-search)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **16.10** | 0.9286 / 0.9776 / 0.9947 | 1921K / 971K |
-| SIFT1M large (out-of-core path) | **33.01** | 0.8958 / 0.9615 / 0.9886 | 2216K / 1181K |
+| SIFT1M auto (GPU-resident) | **14.70** | 0.9286 / 0.9777 / 0.9946 | 1946K / 1033K |
+| SIFT1M large (out-of-core path) | **30.78** | 0.9011 / 0.9633 / 0.9891 | 2216K / 1190K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -641,6 +641,41 @@ First run (`runs/iter13/sift1M_large`): 36.94 s (+5.2%) but **REJECT on GPU peak
 Borderline → large rerun (`runs/iter19/sift1M_large_b`): 32.52 s, +4.7% → ACCEPT.
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +3.3% / +4.7% on rerun (34.12 → 33.01 s), 1M-auto +0.9% (path untouched).
+
+### #20 — exact brute-force centroid self-kNN replaces CAGRA build + self-search  (2026-10-21)
+**Idea / rationale:** Step 3 ran a full `cagra::build` (NN-Descent + sort + prune, after copying the centroids to host) on the 10K centroids every round (0.2–0.5 s), and Step 6 then ran a CAGRA self-search on that pruned navigable graph to get each centroid's `nprobe` nearest buckets (`expand_centroid_neighbors_gpu`, ~0.08 s/round). For non-PQ runs both are replaced by one exact `brute_force::search` of the centroids against themselves (k = max(K, nprobe) + 1, self removed by id — not by position, since duplicate centroid vectors tie at distance 0; out-of-range ids / short rows → error), cuVS 26.12 `detail/knn_brute_force.cuh`. The first K columns become the centroid graph (DiskJoin bucket order, round-1 reorder, `centroid_knn.bin` windows for prune_windowed), the first nprobe columns are Step 6's neighbour table directly. Invariants unchanged (bucket order still derived from the centroid KNN graph — now the exact one). PQ runs keep the CAGRA navigable graph (their Step 4 still searches it). Step 3 per round 0.2–0.5 → 0.015 s; topk expand 0.08 → 0.003 s. Side effect: large-path search recall@10 at itopk 32 rose 0.8958 → 0.9011 (prune windows now are the exact nearest buckets).
+**Files:** `src/bucket.cu`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 14.70 | +8.7% | +32.4% | 1.27x | bucket2 13.01, optimize 1.32, translate 0.40 | 3686 | 1.55 |
+| sift1M_large | large | 30.78 | +6.8% | +59.0% | 2.67x | bucket2 27.39, prune 1.40, optimize_chunked 1.63, translate 0.45 | 1356 | 3.88 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.75 | 3.20 | 0.16 | 0.00 | 2.08 | 1.16 | 0.02 | 4.37 | 0.00 | 0.75 |
+| sift1M_large | 0.57 | 4.76 | 0.18 | 0.00 | 6.05 | 2.18 | 0.03 | 12.04 | 0.94 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9805 | 0.9751 | 0.9684 | 0.9630 |
+| sift1M_large | 0.9834 | 0.9754 | 0.9694 | 0.9641 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9286 / 1946K | 0.9777 / 1033K | 0.9946 / 493K | 0.9987 / 184K | 0.9997 / 66K |
+| ours sift1M_large | 0.9011 / 2216K | 0.9633 / 1190K | 0.9891 / 561K | 0.9974 / 189K | 0.9995 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-auto +8.7% (16.10 → 14.70 s), 1M-large +6.8% (33.01 → 30.78 s).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
