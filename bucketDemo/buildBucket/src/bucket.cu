@@ -1014,6 +1014,12 @@ struct VecBucket {
 
 // ============== Phase 8: Batch Assignment via Graph ANNS ==============
 
+// 定义在后面 (Step 6 的 gather kernel)；Step 4 out-of-core 路径复用它在 GPU 上
+// 做 "按行 gather + 转 float"。
+template <typename DataT>
+__global__ void gather_rows_int32(const DataT* __restrict__ src, const int32_t* __restrict__ idx,
+                                  float* __restrict__ dst, int64_t n_dst_rows, int64_t D);
+
 /**
  * 分批处理原始数据集，在 GPU 上基于 centroid KNN 图做 ANNS 检索，
  * 为每个非 centroid 数据点找到最近的 2 个 centroid，在 CPU 上做均衡分配。
@@ -1169,12 +1175,21 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
 
     std::vector<uint32_t> h_top2(Nv * TOP_K);
 
+    // out-of-core 非 PQ: 原始 T 区间 + 行偏移直接上传，在 GPU 上 gather + 转
+    // float (原来 CPU 转 float 再上传 4x 字节的 pageable 数据, ~0.5-0.6s/轮)。
+    T*       d_raw_range   = nullptr;
+    size_t   d_raw_cap     = 0;     // elements
+    int32_t* d_local_rows  = nullptr;
+    std::vector<int32_t> h_local_rows;
+
     // GPU-resident 路径 (非 PQ, queries 直接从显存 gather): 用 exact brute-force
     // top-2 (cuVS brute_force = 分块 GEMM + select_k，对应 cuVS 26.12
     // detail/knn_brute_force.cuh::tiled_brute_force_knn) 代替近似的 CAGRA 图
     // 搜索——10K centroids × 990K 点的 GEMM 在 V100 上比 CAGRA single-CTA
     // 搜索 (~0.7s/轮) 快，而且结果是精确 top-2。out-of-core / PQ 路径不变。
-    const bool use_bf = !is_pq && static_cast<bool>(gpu_query_loader);
+    // 非 PQ 时 out-of-core 也用 (centroids 很小、常驻 GPU；queries 本来就按
+    // Nv 分批，显存仍受 Mbatch_bytes 约束，不依赖整份数据集在 GPU 上)。
+    const bool use_bf = !is_pq;
     std::optional<cuvs::neighbors::brute_force::index<float, float>> bf_idx;
     int64_t* d_top2_i64 = nullptr;
     std::vector<int64_t> h_top2_i64;
@@ -1231,6 +1246,35 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             CUDA_CHECK(cudaMemcpy(d_queries, codes.data(),
                                   batch_size * D * sizeof(uint8_t),
                                   cudaMemcpyHostToDevice));
+        } else if (!gpu_query_loader && std::is_same<CentroidT, float>::value) {
+            // 非 PQ 模式：原始 T 区间整段上传，GPU 上按非 centroid 行 gather + 转 float
+            const int64_t n_raw = batch_hi - batch_lo + 1;
+            const size_t raw_elems = static_cast<size_t>(n_raw) * D;
+            if (raw_elems > d_raw_cap) {
+                if (d_raw_range) CUDA_CHECK(cudaFree(d_raw_range));
+                CUDA_CHECK(cudaMalloc(&d_raw_range, raw_elems * sizeof(T)));
+                d_raw_cap = raw_elems;
+            }
+            if (!d_local_rows) CUDA_CHECK(cudaMalloc(&d_local_rows, Nv * sizeof(int32_t)));
+            h_local_rows.resize(static_cast<size_t>(batch_size));
+            int64_t n_bad = 0;
+            #pragma omp parallel for schedule(static) reduction(+:n_bad)
+            for (int64_t i = 0; i < batch_size; ++i) {
+                int64_t local = non_centroid_indices[batch_start + i] - batch_lo;
+                if (local < 0 || local >= n_raw) { ++n_bad; local = 0; }   // bounds check
+                h_local_rows[static_cast<size_t>(i)] = static_cast<int32_t>(local);
+            }
+            if (n_bad > 0) throw std::runtime_error("batch_assign: row offset out of read range");
+            CUDA_CHECK(cudaMemcpy(d_raw_range, raw_batch.data(), raw_elems * sizeof(T),
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_local_rows, h_local_rows.data(), batch_size * sizeof(int32_t),
+                                  cudaMemcpyHostToDevice));
+            const int threads = 256;
+            const int64_t total = batch_size * D;
+            gather_rows_int32<T><<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
+                d_raw_range, d_local_rows, reinterpret_cast<float*>(d_queries), batch_size, D);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
         } else if (!gpu_query_loader) {
             // 非 PQ 模式：读取原始 T 数据 -> 转为 CentroidT -> 上传
             std::vector<CentroidT> batch_data(batch_size * D);
@@ -1341,6 +1385,8 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     if (d_top2)       CUDA_CHECK(cudaFree(d_top2));
     if (d_distances)  CUDA_CHECK(cudaFree(d_distances));
     if (d_top2_i64)   CUDA_CHECK(cudaFree(d_top2_i64));
+    if (d_raw_range)  CUDA_CHECK(cudaFree(d_raw_range));
+    if (d_local_rows) CUDA_CHECK(cudaFree(d_local_rows));
     // NOTE: d_centroids 和 d_graph 由 caller 管理，本函数不释放
 
     // 聚类大小统计

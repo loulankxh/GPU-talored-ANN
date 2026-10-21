@@ -35,12 +35,12 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#7 (resident Step 4: exact brute-force top-2 instead of CAGRA search)**, 2026-10-21:
+After **#8 (out-of-core Step 4: brute-force top-2 + GPU-side gather/convert)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **17.19** | 0.9295 / 0.9779 / 0.9947 | 1946K / 1035K |
-| SIFT1M large (out-of-core path) | **51.93** | 0.8975 / 0.9619 / 0.9888 | 2000K / 945K |
+| SIFT1M auto (GPU-resident) | **17.42** | 0.9301 / 0.9778 / 0.9947 | 1945K / 1036K |
+| SIFT1M large (out-of-core path) | **48.92** | 0.8996 / 0.9629 / 0.9889 | 1943K / 1033K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
@@ -51,7 +51,7 @@ Priority (from the user, 2026-10-21):
 
 From the IVF-PQ CAGRA build (cuVS 26.12 `neighbors/detail/cagra/cagra_build.cuh::build_knn_graph`, `ivf_pq/ivf_pq_build.cuh`):
 - Train centroids on a **fixed-size sample** (IVF-PQ trains balanced k-means on `kmeans_trainset_fraction` of the data) instead of kmeans|| over all 10M points (SIFT10M Step 2 = 265 s over 4 rounds).
-- Batch assignment like IVF-PQ `extend`: GEMM vs centroids + select, with data streamed in large batches through **pinned host buffers and overlapping H2D / compute / D2H** (Step 4 on SIFT10M = 129 s).
+- Batch assignment like IVF-PQ `extend`: GEMM vs centroids + select (done in #7/#8), still to do: stream data in batches through **pinned host buffers overlapping read / H2D / compute** (Step 4 out-of-core after #8: read 0.13 s + search 0.42 s per round on SIFT1M, serial; SIFT10M Step 4 was 129 s before #8).
 - IVF-PQ's kNN-graph build searches the dataset against itself in big batches, using `refine` for exact re-ranking of candidates: an analogue for Step 6 is approximate candidate scoring (e.g. fp16 / lower precision) followed by an exact re-rank of the top candidates only.
 - Overlap of search and host-side post-processing via a background thread (`build_knn_graph` uses a pinned double buffer): the out-of-core Step 6 `scatter_pending` + `pool_build` (≈100 s / round on SIFT10M) are host-bound and serial with the GPU.
 - ACE (`detail/cagra/cagra_ace.cuh`): cuVS's own partitioned out-of-core CAGRA build — check its partition I/O and per-partition graph merge for ideas for `prune_windowed` / `optimize_chunked`.
@@ -375,6 +375,43 @@ Borderline large gain → rerun (`runs/iter6/sift1M_large_b`): +4.19% → also A
 [exited with code 0]
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-auto +7.2% (18.53 → 17.19 s; Step 4 3.28 → 2.18 s), 1M-large −0.0% (path untouched).
+
+### #8 — out-of-core Step 4: brute-force top-2 + GPU-side gather/convert  (2026-10-21)
+**Idea / rationale:** extend #7 to the out-of-core batch assignment. (1) Exact `brute_force::search` top-2 for every non-PQ run (centroids are small and already on the GPU; queries are still batched by `Nv` under the `Mbatch_bytes` budget, so nothing depends on the full dataset fitting in GPU memory). (2) The batch's raw `uint8` row range is uploaded as is (128 MB instead of 512 MB float, no pageable CPU conversion buffer) together with int32 row offsets of the non-centroid rows (bounds-checked against the read range), and gathered + converted to float on the GPU with the existing `gather_rows_int32` kernel — like cuVS 26.12 IVF-PQ `extend` / `cagra_build.cuh`, which upload raw batches and convert on device. Per round on SIFT1M: convert_upload 0.51–0.62 → 0.02 s, search 0.69–0.75 → 0.42 s. GPU peak 1374–1536 MiB (gate 2116). PQ path unchanged.
+**Files:** `src/bucket.cu`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 17.42 | -1.3% | +19.9% | 1.51x | bucket2 15.72, optimize 1.30, translate 0.39 | 4160 | 1.61 |
+| sift1M_large | large | 48.92 | +5.8% | +34.9% | 4.24x | bucket2 39.31, prune 3.89, optimize_chunked 5.30, translate 0.41 | 1536 | 3.95 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.75 | 3.24 | 1.48 | 0.00 | 2.11 | 1.12 | 0.02 | 5.64 | 0.00 | 0.75 |
+| sift1M_large | 0.56 | 5.13 | 1.38 | 0.00 | 5.32 | 2.16 | 0.03 | 20.68 | 2.68 | 1.07 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9933 | 0.9900 | 0.9870 | 0.9842 |
+| sift1M_large | 0.9926 | 0.9890 | 0.9865 | 0.9838 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9301 / 1945K | 0.9778 / 1036K | 0.9947 / 525K | 0.9988 / 188K | 0.9997 / 68K |
+| ours sift1M_large | 0.8996 / 1943K | 0.9629 / 1033K | 0.9889 / 493K | 0.9973 / 186K | 0.9995 / 68K |
+
+[exited with code 0]
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +5.8% (51.93 → 48.92 s; Step 4 8.66 → 5.32 s), 1M-auto −1.3% (noise; resident Step 4 2.18 → 2.11 s).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
