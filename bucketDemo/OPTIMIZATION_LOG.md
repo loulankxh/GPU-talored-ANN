@@ -35,15 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#18 (prune_windowed: batched positions + parallel bulk load)**, 2026-10-21:
+After **#19 (optimize_chunked method E: single-chunk edges stay in memory)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **16.24** | 0.9288 / 0.9770 / 0.9943 | 1948K / 1034K |
-| SIFT1M large (out-of-core path) | **34.12** | 0.8974 / 0.9618 / 0.9884 | 1946K / 931K |
+| SIFT1M auto (GPU-resident) | **16.10** | 0.9286 / 0.9776 / 0.9947 | 1921K / 971K |
+| SIFT1M large (out-of-core path) | **33.01** | 0.8958 / 0.9615 / 0.9886 | 2216K / 1181K |
 | CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
-
-(auto 16.24 vs 16.17 after #13: path untouched since, run-to-run noise.)
 
 ## Ideas backlog
 
@@ -606,6 +604,43 @@ First run (`runs/iter13/sift1M_large`): 36.94 s (+5.2%) but **REJECT on GPU peak
 | ours sift1M_large | 0.8974 / 1946K | 0.9618 / 931K | 0.9884 / 532K | 0.9970 / 189K | 0.9992 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +6.2% (36.36 → 34.12 s; prune 4.06 → 1.34 s), 1M-auto −0.4% (path untouched).
+
+### #19 — optimize_chunked method E: single-chunk edges stay in memory  (2026-10-21)
+**Idea / rationale:** with one chunk (SIFT1M: the whole reverse-edge set fits the GPU budget) every one of the N·K_out = 32M edge records still went through `EdgeChunkAccumulator`: create/start → buffered writes to `tmp_dir` → `finish()` merge → `read_chunk()` back in Phase 2 (~0.9 s), plus two N·K_out-sized pinned buffers (overflow + drain, 640 MB, `cudaMallocHost` ~0.35 s) for a chunk that can never overflow and drains once. Now, if `num_chunks == 1` and the edges fit `--edge-buffer-mb`, drained records go into a host vector handed straight to Phase 2; if that chunk also holds all edges, the overflow buffer shrinks to a token size and the single drain goes D2H straight into the vector (no pinned drain buffer). Multi-chunk / over-budget runs keep the disk accumulator unchanged. Same idea as cuVS 26.12 `detail/cagra/graph_core.cuh::optimize`, which builds and merges the reverse graph fully in memory when it fits. Output byte-identical in all three modes (single drain; in-memory with mid-batch drains via `--gpu-budget-mb 300`; disk accumulator via `--edge-buffer-mb 100`). optimize_chunked 3.45 → 1.64 s, RSS 1.43 → 0.94 GB.
+**Files:** `src/optimize_chunked.cu`  **Params changed:** none
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 16.10 | +0.9% | +26.0% | 1.40x | bucket2 14.34, optimize 1.30, translate 0.45 | 3870 | 1.60 |
+| sift1M_large | large | 33.01 | +3.3% | +56.0% | 2.86x | bucket2 29.66, prune 1.33, optimize_chunked 1.64, translate 0.45 | 1490 | 3.89 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.75 | 3.21 | 1.29 | 0.00 | 2.20 | 1.09 | 0.02 | 4.58 | 0.00 | 0.75 |
+| sift1M_large | 0.57 | 4.54 | 1.87 | 0.00 | 6.27 | 2.16 | 0.03 | 12.27 | 0.98 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9799 | 0.9739 | 0.9684 | 0.9632 |
+| sift1M_large | 0.9832 | 0.9747 | 0.9683 | 0.9633 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9286 / 1921K | 0.9776 / 971K | 0.9947 / 533K | 0.9987 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.8958 / 2216K | 0.9615 / 1181K | 0.9886 / 561K | 0.9973 / 188K | 0.9993 / 68K |
+
+Borderline → large rerun (`runs/iter19/sift1M_large_b`): 32.52 s, +4.7% → ACCEPT.
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +3.3% / +4.7% on rerun (34.12 → 33.01 s), 1M-auto +0.9% (path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)

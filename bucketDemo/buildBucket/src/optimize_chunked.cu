@@ -1366,6 +1366,20 @@ static void run_method_E(
     batch_rows = static_cast<uint32_t>(std::min<int64_t>(batch_rows, N));
     uint32_t overflow_cap = batch_rows * static_cast<uint32_t>(K_out);  // 一整批全挤爆同一个 chunk 也能兜住
 
+    // 单 chunk 且整份反向边 (N*K_out 条) 放得进 --edge-buffer-mb 时，边直接
+    // 留在内存里交给 Phase 2，不再经过 EdgeChunkAccumulator 的
+    // create/start → 分块写盘 → finish 合并 → read_chunk 读回 (SIFT1M:
+    // 32M 条 × 10 B，acc.create+finish ≈ 0.9 s)。多 chunk (放不下 GPU/内存
+    // 预算) 时仍走磁盘 accumulator，跟原来一样。
+    const size_t total_edges = static_cast<size_t>(N) * static_cast<size_t>(K_out);
+    const bool edges_in_memory = (num_chunks == 1) &&
+        (total_edges * sizeof(edge_chunk::EdgeRecord) <= edge_buffer_bytes);
+    // 唯一的 chunk 本身就装得下全部边时永远不会溢出、也只在最后 drain 一次：
+    // overflow buffer 只留个象征性大小，drain 直接 D2H 进 mem_edges，省掉
+    // 两块 N*K_out 大小的 pinned buffer (SIFT1M: 640 MB, cudaMallocHost ~0.3 s)。
+    const bool single_drain = edges_in_memory && capacity_per_chunk >= total_edges;
+    if (single_drain) overflow_cap = 1024;
+
     std::cout << "  [Method E] " << plan.label
               << ", num_chunks=" << num_chunks
               << ", capacity_per_chunk=" << capacity_per_chunk << " records"
@@ -1410,15 +1424,26 @@ static void run_method_E(
     edge_chunk::EdgeRecord* h_overflow_buf = nullptr;
     CUDA_CHECK(cudaMallocHost(&h_overflow_buf, static_cast<size_t>(overflow_cap) * sizeof(edge_chunk::EdgeRecord)));
     edge_chunk::EdgeRecord* h_drain_buf = nullptr;
-    CUDA_CHECK(cudaMallocHost(&h_drain_buf, capacity_per_chunk * sizeof(edge_chunk::EdgeRecord)));
+    if (!single_drain)
+        CUDA_CHECK(cudaMallocHost(&h_drain_buf, capacity_per_chunk * sizeof(edge_chunk::EdgeRecord)));
     double t_alloc_pinned = std::chrono::duration<double>(Clock::now() - t_alloc1).count();
     std::cout << "  [Timing] Alloc: device=" << std::fixed << std::setprecision(2) << t_alloc_device
               << "s, pinned-host=" << t_alloc_pinned << "s\n";
 
+    std::vector<edge_chunk::EdgeRecord> mem_edges;
+    if (edges_in_memory && !single_drain) mem_edges.reserve(total_edges);
+    std::cout << "  [Method E] edges " << (edges_in_memory ? "in memory" : "via disk accumulator") << "\n";
+
     auto t_acc_create0 = Clock::now();
-    auto acc = edge_chunk::EdgeChunkAccumulator::create(tmp_dir, num_chunks, edge_buffer_bytes,
-        static_cast<size_t>(N) * static_cast<size_t>(K_out));
-    acc.start();
+    auto acc = edges_in_memory
+        ? edge_chunk::EdgeChunkAccumulator{}
+        : edge_chunk::EdgeChunkAccumulator::create(tmp_dir, num_chunks, edge_buffer_bytes,
+              static_cast<size_t>(N) * static_cast<size_t>(K_out));
+    if (!edges_in_memory) acc.start();
+    auto add_edges = [&](int32_t c, const edge_chunk::EdgeRecord* recs, size_t n) {
+        if (edges_in_memory) mem_edges.insert(mem_edges.end(), recs, recs + n);
+        else acc.add_records(c, recs, n);
+    };
     double t_acc_create = std::chrono::duration<double>(Clock::now() - t_acc_create0).count();
     std::cout << "  [Timing] acc.create()+start()=" << std::fixed << std::setprecision(2)
               << t_acc_create << "s\n";
@@ -1472,17 +1497,17 @@ static void run_method_E(
                 for (uint32_t e = 0; e < ofc; ++e) {
                     uint32_t c = edge_chunk::chunk_of(plan.starts.data(),
                         static_cast<uint32_t>(num_chunks), h_overflow_buf[e].dst);
-                    acc.add_records(static_cast<int32_t>(c), &h_overflow_buf[e], 1);
+                    add_edges(static_cast<int32_t>(c), &h_overflow_buf[e], 1);
                 }
                 total_overflow += ofc;
             }
 
             for (int32_t c = 0; c < num_chunks; ++c) {
-                if (h_chunk_count[static_cast<size_t>(c)] >= capacity_per_chunk) {
+                if (!single_drain && h_chunk_count[static_cast<size_t>(c)] >= capacity_per_chunk) {
                     uint32_t take = static_cast<uint32_t>(capacity_per_chunk);
                     CUDA_CHECK(cudaMemcpy(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
                         static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
-                    acc.add_records(c, h_drain_buf, take);
+                    add_edges(c, h_drain_buf, take);
                     CUDA_CHECK(cudaMemset(d_chunk_count + c, 0, sizeof(uint32_t)));
                     total_in_chunk += take;
                 }
@@ -1496,9 +1521,16 @@ static void run_method_E(
             uint32_t cnt = h_chunk_count[static_cast<size_t>(c)];
             if (cnt == 0) continue;
             uint32_t take = std::min(cnt, static_cast<uint32_t>(capacity_per_chunk));
+            if (single_drain) {   // 唯一一次 drain，直接进 mem_edges
+                mem_edges.resize(take);
+                CUDA_CHECK(cudaMemcpy(mem_edges.data(), d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
+                    static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+                total_in_chunk += take;
+                continue;
+            }
             CUDA_CHECK(cudaMemcpy(h_drain_buf, d_chunk_buf + static_cast<size_t>(c) * capacity_per_chunk,
                 static_cast<size_t>(take) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
-            acc.add_records(c, h_drain_buf, take);
+            add_edges(c, h_drain_buf, take);
             total_in_chunk += take;
         }
 
@@ -1512,7 +1544,10 @@ static void run_method_E(
     }
 
     auto t_finish0 = Clock::now();
-    acc.finish();
+    if (!edges_in_memory) acc.finish();
+    else if (mem_edges.size() != static_cast<size_t>(N) * static_cast<size_t>(K_out))
+        throw std::runtime_error("Method E: in-memory edge count " + std::to_string(mem_edges.size()) +
+                                 " != N*K_out");
     double t_acc_finish = std::chrono::duration<double>(Clock::now() - t_finish0).count();
 
     // -------- 清理 Phase 1 的 GPU/host 分配 --------
@@ -1557,7 +1592,8 @@ static void run_method_E(
             if (!fwd_in2.good())
                 throw std::runtime_error("Method E Phase 2: failed to read forward rows for chunk " + std::to_string(c));
 
-            acc.read_chunk(c, chunk_edges);
+            if (edges_in_memory) chunk_edges = std::move(mem_edges);   // num_chunks == 1
+            else acc.read_chunk(c, chunk_edges);
             auto csr = edge_chunk::build_rank_ordered_csr(chunk_edges, j_lo, chunk_sz);
 
             #pragma omp parallel for schedule(dynamic, 1024)
