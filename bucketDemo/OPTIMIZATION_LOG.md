@@ -1602,7 +1602,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +4.0% (109.02 → 104.66 s; rerun +9.5%, 98.64 s = 0.80× CAGRA native), 1M-large +1.5% (rerun) / +3.2%, 1M-auto +0.3%.
 
-### #57 — prune_windowed GPU path: no float copy; pinned double-buffered H2D; results streamed D2H → writer  (2026-10-21, commit TBD)
+### #57 — prune_windowed GPU path: no float copy; pinned double-buffered H2D; results streamed D2H → writer  (2026-10-21, commit 5dbf2fc)
 **Idea / rationale:** timers inside the #38 GPU prune on SIFT10M showed compute 4.3 s = output vector zero-fill 0.92 s + pageable H2D of 3.84 GB 1.37 s (2.8 GB/s) + kernel 1.08 s + D2H into fresh pageable pages 0.80 s, then a separate 1.17 s write; the bulk load also converted the whole dataset to a float copy (5.1 GB) that the GPU kernel never reads. Now: (1) decide GPU vs CPU before the bulk load and skip the float buffer on the GPU path; (2) `Staging` with two 64 MB pinned buffers: OpenMP memcpy of the next chunk into one buffer while the previous chunk DMAs from the other (same pinned-staging pattern as cuVS 26.12 `cagra_build.cuh::build_knn_graph`); (3) results come back in row chunks through the pinned buffers into a sink callback that feeds `StreamingGraphWriter` directly (no N × out_deg host buffer; D2H overlaps the write). Output byte-identical (cmp on the SIFT10M intermediates).
 **Files:** `bucketDemo/buildBucket/src/prune_windowed.cpp`, `prune_windowed_gpu.cu`, `prune_windowed_gpu.hpp`
 **Params changed:** none
