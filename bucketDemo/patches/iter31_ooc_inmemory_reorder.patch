@@ -1,0 +1,37 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index d449e23..90819e7 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -5807,6 +5807,32 @@ int run_pipeline_impl(
+                 if (!out.good())
+                     throw std::runtime_error("Inline reorder: failed writing " + data_reordered_path);
+                 gres->permute(reorder_info.inverse_perm);
++            } else if (static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= config.cpu_limit_bytes / 4) {
++                // out-of-core 但原始数据 (两份: 读入 + 重排后) 放得进 CPU 预算的
++                // 1/4: 跟 GPU-resident 一样整份读入、按 inverse_perm 并行重排、一次
++                // 顺序写出 (SIFT1M 128 MB: 1.0 s → ~0.3 s)。超预算时走下面按桶缓冲
++                // 散写的流式 writer (内存只占 bucket_vec_buffer)。
++                std::vector<DataT> raw_all;
++                int32_t n_tmp = 0, d_tmp = 0;
++                load::read_bigann_raw_range<DataT>(working_input_path, 0, N, raw_all, n_tmp, d_tmp);
++                if (static_cast<int64_t>(raw_all.size()) != N * static_cast<int64_t>(D) ||
++                    static_cast<int64_t>(reorder_info.inverse_perm.size()) != N)
++                    throw std::runtime_error("Inline reorder: size mismatch in in-memory path");
++                std::vector<DataT> reordered(raw_all.size());
++                #pragma omp parallel for schedule(static)
++                for (int64_t i = 0; i < N; ++i) {
++                    std::memcpy(reordered.data() + static_cast<size_t>(i) * D,
++                                raw_all.data() + static_cast<size_t>(reorder_info.inverse_perm[i]) * D,
++                                static_cast<size_t>(D) * sizeof(DataT));
++                }
++                raw_all = std::vector<DataT>();
++                std::ofstream out(data_reordered_path, std::ios::binary | std::ios::trunc);
++                int32_t hdr[2] = {static_cast<int32_t>(N), static_cast<int32_t>(D)};
++                out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
++                out.write(reinterpret_cast<const char*>(reordered.data()),
++                          static_cast<std::streamsize>(reordered.size() * sizeof(DataT)));
++                if (!out.good())
++                    throw std::runtime_error("Inline reorder: failed writing " + data_reordered_path);
+             } else {
+                 auto writer = reordered_io::ReorderedDatasetWriter<DataT>::create(
+                     data_reordered_path, D, n_centroids,
