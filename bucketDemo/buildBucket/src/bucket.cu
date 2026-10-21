@@ -4478,7 +4478,10 @@ void build_vector_knn_with_tensorcore(
         static_cast<int>((avg_bucket_size + est_wpb - 1) / est_wpb));
 
     constexpr int MAX_SLOTS = 8;
-    constexpr double OVERSUB = 1.5;  // 1.5× SM 利用率目标，hide launch overhead
+    // 2.0× SM 利用率目标，hide launch overhead。#40 实测 (SIFT1M --out-of-core,
+    // GPU bucket 缓存之后): 3 slot (=1.5x) 1.59 s/轮, 4 slot (=2.0x) 1.43 s/轮,
+    // 6 slot 1.38 s/轮但显存 +0.8 GB。
+    constexpr double OVERSUB = 2.0;
     int target_streams = std::max(2,
         static_cast<int>(std::ceil(num_sm * OVERSUB / est_blocks_per_kernel)));
     target_streams = std::min(target_streams, MAX_SLOTS);
@@ -4558,7 +4561,8 @@ void build_vector_knn_with_tensorcore(
         CUDA_CHECK(cudaMalloc(&d_norms_pool[s],    bytes_norms_pool));
         CUDA_CHECK(cudaMalloc(&d_ids_bucket[s],    bytes_ids_bucket));
         CUDA_CHECK(cudaMalloc(&d_ids_pool[s],      bytes_ids_pool));
-        CUDA_CHECK(cudaMalloc(&d_out_neighbors[s], bytes_out));
+        // ids 后面紧跟 dists (block top-M 路径一次 D2H 拷回两者)，所以开两倍
+        CUDA_CHECK(cudaMalloc(&d_out_neighbors[s], 2 * bytes_out));
         CUDA_CHECK(cudaMalloc(&d_select_idx[s],    bytes_select_idx));
         CUDA_CHECK(cudaMalloc(&d_select_dist[s],   bytes_select_dist));
         CUDA_CHECK(cudaMallocHost(&h_ids_bucket[s], bytes_ids_bucket));
@@ -4566,7 +4570,7 @@ void build_vector_knn_with_tensorcore(
         CUDA_CHECK(cudaMallocHost(&h_B_raw[s],      bytes_B_raw));
         h_ids_bucket64[s] = new int64_t[max_bucket_size];
         h_ids_pool64[s]   = new int64_t[max_pool_size_ub];
-        CUDA_CHECK(cudaMallocHost(&h_out[s],        bytes_out));
+        CUDA_CHECK(cudaMallocHost(&h_out[s],        2 * bytes_out));
         if (want_distances) {
             CUDA_CHECK(cudaMalloc(&d_out_dists[s],  bytes_out_dists));
             CUDA_CHECK(cudaMallocHost(&h_out_dists[s], bytes_out_dists));
@@ -4585,6 +4589,7 @@ void build_vector_knn_with_tensorcore(
         int64_t c           = -1;   // bucket index in this slot's last submitted iteration; -1 = empty
         int     bucket_size = 0;
         int     actual_M    = 0;
+        bool    fused_out   = false; // dists 紧跟在 h_out 的 ids 后面 (block top-M 路径)
     };
     Pending pending[MAX_SLOTS]{};   // 全部默认初始化为 {-1, 0, 0}
 
@@ -4697,7 +4702,10 @@ void build_vector_knn_with_tensorcore(
         job->bs = bs; job->aM = aM;
         job->gid.assign(h_ids_bucket[slot], h_ids_bucket[slot] + bs);
         job->nb.assign(h_out[slot], h_out[slot] + n_out);
-        job->d.assign(h_out_dists[slot], h_out_dists[slot] + n_out);   // 始终已分配 (want_distances 恒为 true)
+        const float* hd = pending[slot].fused_out
+            ? reinterpret_cast<const float*>(h_out[slot] + n_out)
+            : h_out_dists[slot];   // 始终已分配 (want_distances 恒为 true)
+        job->d.assign(hd, hd + n_out);
         {
             std::lock_guard<std::mutex> lk(scatter_mtx);
             scatter_queue.push_back(std::move(job));
@@ -5096,6 +5104,7 @@ void build_vector_knn_with_tensorcore(
         }
         }   // !use_dev_cache
 
+        bool fused_out = false;   // block top-M 把 dists 写在 ids 后面 (见 3g)
         // dots 行宽: block top-M kernel (actual_M ≤ 256) 要 4 对齐; raft 回退路径按
         // pool_size 紧凑排布
         const int ldd_c = (actual_M <= 256) ? (pool_size + 3) / 4 * 4 : pool_size;
@@ -5155,10 +5164,12 @@ void build_vector_knn_with_tensorcore(
             // actual_M ≤ 256: 单个 block top-M kernel (跟 GPU-resident 同一个，
             // 输出按 bucket 内行号)，替代 dots_to_dist + raft select_k + gather
             // 三个 kernel；更大的 M 回退到 raft select_k。
-            if (!launch_block_topM_bucket<GemmOutT>(
+            fused_out = launch_block_topM_bucket<GemmOutT>(
                     streams[slot], d_dots[slot], d_norms_pool[slot], d_ids_pool[slot],
-                    d_out_neighbors[slot], d_out_dists[slot],
-                    bucket_size, pool_size, ldd_c, actual_M, /*out_ld=*/actual_M))
+                    d_out_neighbors[slot],
+                    reinterpret_cast<float*>(d_out_neighbors[slot] + static_cast<size_t>(bucket_size) * actual_M),
+                    bucket_size, pool_size, ldd_c, actual_M, /*out_ld=*/actual_M);
+            if (!fused_out)
             // d_dots 被 dots_to_dist_inplace_kernel 原地改写为 float dist,
             // RAFT 输出落 d_select_idx/dist scratch, 最后 gather 到 d_out_neighbors
             launch_extract_topM_raft<GemmOutT>(
@@ -5187,10 +5198,11 @@ void build_vector_knn_with_tensorcore(
         }
 
         // ---- 3g: 异步 D2H, 不 sync ----
+        // block top-M 路径: ids + dists 在同一块连续 buffer 里，一次拷回
         CUDA_CHECK(cudaMemcpyAsync(h_out[slot], d_out_neighbors[slot],
-                                   static_cast<size_t>(bucket_size) * actual_M * sizeof(int32_t),
+                                   static_cast<size_t>(bucket_size) * actual_M * sizeof(int32_t) * (fused_out ? 2 : 1),
                                    cudaMemcpyDeviceToHost, streams[slot]));
-        if (want_distances) {
+        if (want_distances && !fused_out) {
             CUDA_CHECK(cudaMemcpyAsync(h_out_dists[slot], d_out_dists[slot],
                                        static_cast<size_t>(bucket_size) * actual_M * sizeof(float),
                                        cudaMemcpyDeviceToHost, streams[slot]));
@@ -5198,7 +5210,7 @@ void build_vector_knn_with_tensorcore(
 
         t_submit += diag_secs(dt3, diag_now());
 
-        pending[slot] = {c, bucket_size, actual_M};
+        pending[slot] = {c, bucket_size, actual_M, fused_out};
         ++processed_buckets;
     }
 

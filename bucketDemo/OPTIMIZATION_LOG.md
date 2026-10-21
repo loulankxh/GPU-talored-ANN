@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#39 (optimize_chunked method E phase 2 on the GPU)**, 2026-10-21:
+After **#41 (out-of-core 4 slots + fused ids/dists D2H)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **9.23** (0.80x CAG0.9292 / 0.9775 / 0.9946) | 0.9292 / 0.9775 / 0.9946 | 1950K / 1035K |
-| SIFT1M large (out-of-core path) | **13.26** (1.15x CAG0.9292 / 0.9775 / 0.9946) | 0.9147 / 0.9711 / 0.9922 | 1946K / 999K |
-| CAG0.9292 / 0.9775 / 0.9946 native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
+| SIFT1M auto (GPU-resident) | **9.26** (0.80x CAGRA) | 0.9278 / 0.9775 / 0.9948 | 2214K / 1189K |
+| SIFT1M large (out-of-core path) | **12.67** (1.10x CAGRA) | 0.9144 / 0.9708 / 0.9920 | 2219K / 1189K |
+| CAGRA native (reference) | 11.54 | 0.9305 / 0.9782 / 0.9948 | 1942K / 1036K |
 
 ## Ideas backlog
 
@@ -79,7 +79,7 @@ Other:
 
 | # | idea | result | reason |
 |---|---|---|---|
-| 40 | Out-of-core Step 6 slots: OVERSUB 1.5 → 2.0 (3 → 4 slots on SIFT1M). Sweep: 3 slots 1.59 s/round, 4: 1.43, 6: 1.38 (+0.8 GB GPU). Patch: `bucketDemo/patches/iter40_ooc_4slots.patch` | large 12.87 s (+2.9%), GPU peak 1674–2052 MiB | just under 3%; bundle with the next out-of-core Step 6 change |
+| 40 | Out-of-core Step 6 slots: OVERSUB 1.5 → 2.0 (3 → 4 slots on SIFT1M). Sweep: 3 slots 1.59 s/round, 4: 1.43, 6: 1.38 (+0.8 GB GPU). Patch: `bucketDemo/patches/iter40_ooc_4slots.patch` | large 12.87 s (+2.9%), GPU peak 1674–2052 MiB | just under 3%; bundled into accepted #41 |
 | 37 | Out-of-core Step 4 bucket write (in-memory mode from #36): deterministic multi-threaded `add_range_parallel` (per-thread per-bucket counts → prefix → parallel copy; same in-bucket order) + byte-array centroid test instead of `unordered_set`. Patch: `bucketDemo/patches/iter37_parallel_bucket_write.patch` | write part 0.13 → 0.03–0.06 s, but bucket_write total only 0.35 → 0.29 s/round (input read 0.14 s + sampled centroid read 0.07–0.1 s dominate); KNN recall unchanged | < 1% of the large path — not benchmarked |
 | 31 | Out-of-core Step 4.5 inline reorder in memory when 2·N·D B ≤ cpu_limit/4 (read whole input, permute by inverse_perm in parallel, one sequential write — like the resident path; streaming per-bucket writer kept otherwise; output verified == base[inverse_perm]). Patch: `bucketDemo/patches/iter31_ooc_inmemory_reorder.patch` | pass3_write 1.03 → 0.385 s; large 22.09 s (+3.1%) then rerun 22.14 s (+2.9%) | borderline gain not confirmed (rerun just under 3%). Consistent ~0.65 s saving — bundle with the next large-path change |
 | 29 | Out-of-core Step 6 GPU path = resident's: block top-M kernel (templated on dots type, rows by bucket position, ld padded to 4) instead of dots_to_dist + raft select_k + gather (raft kept for M > 256), and fp16 tensor-core GEMM instead of INT8 IMMA (dp4a on V100). Patch: `bucketDemo/patches/iter29_ooc_block_topm_fp16.patch` | loop 3.24 → ~3.0–3.2 s/round (gpu_submit 1.1 → 0.95 s, stream_sync 1.25 → 1.1 s; GEMM time unchanged ~0.62 s/round); large 24.55 s (−1.6%), auto −0.2% | no gain: the out-of-core loop is now split ~evenly between GPU wait, host scatter (`scatter_pending` ~0.7–1.0 s) and launch/H2D submit (~1 s), none dominant |
@@ -1148,6 +1148,43 @@ Borderline → large rerun (`runs/iter38/sift1M_large_b`): 13.98 s (+5.6%), reca
 | ours sift1M_large | 0.9147 / 1946K | 0.9711 / 999K | 0.9922 / 562K | 0.9982 / 189K | 0.9995 / 68K |
 
 **Verdict:** ACCEPT — speedup vs previous best: 1M-large +6.8% (14.22 → 13.26 s, 1.15× CAGRA native), 1M-auto 0.0% (path untouched).
+
+### #41 — out-of-core Step 6: 4 slots + fused ids/dists D2H  (2026-10-21, commit TBD)
+**Idea / rationale:** bundle the #40 slot change (OVERSUB 1.5 → 2.0, 3 → 4 in-flight slots) with one fused device→host copy per slot: block top-M writes dists right after the ids in `d_out_neighbors[slot]` (buffer sized 2×`bytes_out`), so each slot does one D2H instead of two, and the scatter thread reads dists from `h_out[slot] + n_out`. This follows cuVS 26.12 `detail/cagra/cagra_build.cuh::build_knn_graph`, which batches results into one pinned staging buffer per batch.
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`
+**Params changed:** none
+**Borderline confirmation:** rerun `sift1M_large_b` 12.70 s (+4.2%), ACCEPT, so both runs pass.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 9.26 | -0.3% | +57.4% | 0.80x | bucket2 7.57, optimize 1.30, translate 0.45 | 4022 | 1.38 |
+| sift1M_large | large | 12.67 | +4.4% | +83.1% | 1.10x | bucket2 10.80, prune 0.84, optimize_chunked 0.64, translate 0.38 | 1674 | 2.78 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.76 | 1.11 | 0.10 | 0.00 | 0.74 | 0.45 | 0.03 | 3.36 | 0.00 | 0.48 |
+| sift1M_large | 0.57 | 1.47 | 0.15 | 0.00 | 2.22 | 0.44 | 0.03 | 4.78 | 0.44 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9754 | 0.9678 | 0.9602 | 0.9543 |
+| sift1M_large | 0.9731 | 0.9662 | 0.9587 | 0.9526 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| ours sift1M_auto | 0.9278 / 2214K | 0.9775 / 1189K | 0.9948 / 562K | 0.9988 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9144 / 2219K | 0.9708 / 1189K | 0.9920 / 561K | 0.9982 / 189K | 0.9995 / 68K |
+
+**Verdict:** ACCEPT — speedup vs previous best: 1M-large +4.4% (13.26 → 12.67 s, 1.10× CAGRA native; rerun +4.2%), 1M-auto −0.3% (noise, path untouched).
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
