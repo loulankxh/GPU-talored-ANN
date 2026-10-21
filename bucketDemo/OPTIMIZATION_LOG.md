@@ -1647,7 +1647,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +8.2% (104.66 → 96.09 s, **0.78× CAGRA native**; the stored 104.66 s was the slower of #56's two runs, its rerun was 98.64 s), 1M-large 0.0%, 1M-auto −0.3%.
 
-### #61 — GPU-resident Step 6: block top-M threshold seeded with each point's running M-th distance (rounds 2..t)  (2026-10-21, commit TBD)
+### #61 — GPU-resident Step 6: block top-M threshold seeded with each point's running M-th distance (rounds 2..t)  (2026-10-21, commit 5124e4f)
 **Idea / rationale:** the block top-M kernel's cost is the serial inserts of candidates that pass the row threshold (#60: ~120K warp instructions / row). In rounds 2..t the resident path already holds every point's running top-M (sorted ascending, `d_run_d`), and `resident_merge_kernel` keeps the best M of (running ∪ this round, deduped). So a candidate whose true distance is ≥ the point's running M-th can never enter the merged result. The kernel now starts the shared row threshold (#49) at `run_d[gid][M−1] − ‖q‖²` (kernel distances exclude ‖q‖²) instead of +inf. Fewer passing candidates means fewer inserts. Rows may now emit fewer than M valid entries (padded −1 / inf, sorted); the merge already handles that. Merged results are unchanged except for ties at the boundary. The out-of-core path has no device-resident running state and passes nullptr (unchanged). Follows the "fewer candidates, not cheaper inserts" note from #60 (the filter-by-current-k-th idea of raft `warp_sort_filtered`).
 **Files:** `bucketDemo/buildBucket/src/bucket.cu`
 **Params changed:** none
