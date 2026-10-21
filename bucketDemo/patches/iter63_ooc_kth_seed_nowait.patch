@@ -1,0 +1,167 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index fe220f9..0655514 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -3177,7 +3177,9 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
+     // 非空 (GPU-resident round 2..t): 跨轮 running top-M (行宽 out_ld，升序)。
+     // 本轮候选的真实距离 ≥ 该点 running 第 M 个就进不了合并后的 top-M
+     // (resident_merge_kernel 取两者并集去重后的前 M)，拿它当行阈值初值
+-    const float* __restrict__ seed_d = nullptr)
++    const float* __restrict__ seed_d = nullptr,
++    // 非空 (out-of-core round 2..t): 按 gid 索引的 running 第 M 个距离 (ChunkedKnnAccumulator::kth)
++    const float* __restrict__ seed_gid = nullptr, int64_t seed_n = 0)
+ {
+     constexpr int LANES = 32;
+     constexpr int K_PER_LANE = K_OUT / LANES;
+@@ -3207,11 +3209,15 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
+     };
+     if (threadIdx.x == 0) {
+         s_th = 0xFFFFFFFFu;
++        float sk = INFINITY;
+         if (seed_d) {
+             const int64_t srow = static_cast<int64_t>(kRowByQuery ? q : ids_pool[q]);
+-            const float sk = seed_d[srow * out_ld + out_ld - 1];
+-            if (sk < INFINITY) s_th = f2key(sk - norms_pool[q]);   // kernel 内距离不含 ‖q‖²
++            sk = seed_d[srow * out_ld + out_ld - 1];
++        } else if (seed_gid) {
++            const int64_t g = ids_pool[q];
++            if (g >= 0 && g < seed_n) sk = seed_gid[g];   // bounds check
+         }
++        if (sk < INFINITY) s_th = f2key(sk - norms_pool[q]);   // kernel 内距离不含 ‖q‖²
+     }
+     __syncthreads();
+ 
+@@ -3353,11 +3359,13 @@ template <typename DotT>
+ static inline bool launch_block_topM_bucket(
+     cudaStream_t stream, const DotT* d_dots, const float* d_norms_pool, const int32_t* d_ids_pool,
+     int32_t* d_out_neighbors, float* d_out_dists,
+-    int bucket_size, int pool_size, int ldd, int actual_M, int out_ld)
++    int bucket_size, int pool_size, int ldd, int actual_M, int out_ld,
++    const float* d_seed_gid = nullptr, int64_t seed_n = 0)
+ {
+     constexpr int G = 8;
+ #define LAUNCH_BUCKET_KOUT(KV) block_topK_from_dots_kernel<(KV), G, DotT, true><<<bucket_size, G * 32, 0, stream>>>( \
+-        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld)
++        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld, \
++        nullptr, d_seed_gid, seed_n)
+     if      (actual_M <= 32)  LAUNCH_BUCKET_KOUT(32);
+     else if (actual_M <= 64)  LAUNCH_BUCKET_KOUT(64);
+     else if (actual_M <= 128) LAUNCH_BUCKET_KOUT(128);
+@@ -3898,6 +3906,21 @@ struct ChunkedKnnAccumulator {
+     std::string final_knn_path, final_dist_path;
+     int final_iter = -1;
+     bool final_written = false;
++    // 非最终轮 merge 完之后每个点 running 第 M 个距离 (真实 L2²，不足 M 个为 inf)，
++    // 下一轮 Step 6 拿来当 block top-M 的行阈值初值 (见 #61/#62)
++    // merge 线程写 kth_work，整轮写完后在 kth_mtx 下换成 kth_done (最近一次完成的
++    // 那份)。Step 6 只读 kth_done、不等 merge: 本轮还没完成就用更早一轮的——
++    // running 第 M 个距离只会越来越小，旧的仍是合法上界 (只是松一些)。
++    std::vector<float> kth_work, kth_done;
++    std::unique_ptr<std::mutex> kth_mtx = std::make_unique<std::mutex>();   // unique_ptr: 对象要能 move
++    bool kth_valid = false;   // kth_done 里有数据 (guarded by kth_mtx)
++    // 拷一份最近完成的 kth (没有则返回 false)
++    bool snapshot_kth(std::vector<float>& out) {
++        std::lock_guard<std::mutex> lk(*kth_mtx);
++        if (!kth_valid) return false;
++        out = kth_done;
++        return true;
++    }
+     void set_final_output(const std::string& knn_path, const std::string& dist_path, int iter) {
+         final_knn_path = knn_path; final_dist_path = dist_path; final_iter = iter;
+     }
+@@ -4150,6 +4173,7 @@ struct ChunkedKnnAccumulator {
+             return true;
+         };
+ 
++        if (!is_final && kth_work.size() != static_cast<size_t>(N)) kth_work.resize(static_cast<size_t>(N));
+         #pragma omp parallel num_threads(merge_parallelism)
+         {
+             #pragma omp single
+@@ -4245,6 +4269,11 @@ struct ChunkedKnnAccumulator {
+                         scratch, id_sort_buf);
+                 }
+                 if (n_records > 0) std::filesystem::remove(ip);
++                if (!is_final) {
++                    for (int64_t pos = 0; pos < chunk_c_size; ++pos)
++                        kth_work[static_cast<size_t>(chunk_start + pos)] =
++                            run_dists[static_cast<size_t>(pos) * M + static_cast<size_t>(M - 1)];
++                }
+                 auto t4 = now();
+                 tm.merge_cpu = secs_between(t3, t4);
+ 
+@@ -4273,6 +4302,11 @@ struct ChunkedKnnAccumulator {
+             }
+         }
+ 
++        if (!is_final) {
++            std::lock_guard<std::mutex> lk(*kth_mtx);
++            kth_done.swap(kth_work);
++            kth_valid = true;
++        }
+         if (is_final) {
+             if (::close(fd_knn) != 0 || (fd_dist >= 0 && ::close(fd_dist) != 0))
+                 throw std::runtime_error("ChunkedKnnAccumulator: close failed for final outputs");
+@@ -4577,7 +4611,8 @@ void build_vector_knn_with_tensorcore(
+     int32_t order_window_arg,
+     size_t cache_bytes,
+     const std::vector<int32_t>* precomputed_order = nullptr,
+-    size_t gpu_cache_bytes = 0)
++    size_t gpu_cache_bytes = 0,
++    const float* seed_kth = nullptr)   // (N,) 上一轮 merge 后每点 running 第 M 个距离 (#62)
+ {
+     auto func_t0 = std::chrono::high_resolution_clock::now();
+     constexpr bool want_distances = true;  // 合并去重总是需要距离
+@@ -4820,6 +4855,13 @@ void build_vector_knn_with_tensorcore(
+     // ----
+     int32_t* d_identity_idx = nullptr;
+     CUDA_CHECK(cudaMalloc(&d_identity_idx, bytes_identity_idx));
++    // round 2..t: 每点 running 第 M 个距离 (N floats，SIFT10M 40 MB) 上传一次，
++    // block top-M 按 gid 取行阈值初值
++    float* d_seed_kth = nullptr;
++    if (seed_kth) {
++        CUDA_CHECK(cudaMalloc(&d_seed_kth, static_cast<size_t>(N) * sizeof(float)));
++        CUDA_CHECK(cudaMemcpy(d_seed_kth, seed_kth, static_cast<size_t>(N) * sizeof(float), cudaMemcpyHostToDevice));
++    }
+     {
+         std::vector<int32_t> h_identity(max_pool_size_ub);
+         std::iota(h_identity.begin(), h_identity.end(), 0);
+@@ -5484,7 +5526,8 @@ void build_vector_knn_with_tensorcore(
+                     streams[slot], d_dots[slot], d_norms_pool[slot], d_ids_pool[slot],
+                     d_out_neighbors[slot],
+                     reinterpret_cast<float*>(d_out_neighbors[slot] + static_cast<size_t>(bucket_size) * actual_M),
+-                    bucket_size, pool_size, ldd_c, actual_M, /*out_ld=*/actual_M);
++                    bucket_size, pool_size, ldd_c, actual_M, /*out_ld=*/actual_M,
++                    d_seed_kth, d_seed_kth ? N : 0);
+             if (!fused_out)
+             // d_dots 被 dots_to_dist_inplace_kernel 原地改写为 float dist,
+             // RAFT 输出落 d_select_idx/dist scratch, 最后 gather 到 d_out_neighbors
+@@ -5590,6 +5633,7 @@ void build_vector_knn_with_tensorcore(
+             cudaFreeHost(h_jobs[sl]); cudaFree(d_jobs[sl]); cudaEventDestroy(ev_load[sl]);
+         }
+     }
++    cudaFree(d_seed_kth);
+     cudaFree(d_identity_idx);
+     for (int s = 0; s < num_slots; ++s) {
+         cudaFree(d_B_raw[s]);
+@@ -6889,13 +6933,20 @@ int run_pipeline_impl(
+                 // bucket 处理顺序在 Step 3 之后已经在后台算好
+                 std::vector<int32_t> order_rk = order_future.valid() ? order_future.get()
+                                                                      : std::vector<int32_t>();
++                // 每点 running 第 M 个距离当 block top-M 的行阈值初值: 用最近一次
++                // 已经完成的 merge 的结果，不等正在后台跑的那次 (等它会把 merge
++                // 放上关键路径: #62 round 3 等了 7.9 s)
++                std::vector<float> kth_seed;
++                const bool have_seed = knn_acc->snapshot_kth(kth_seed);
++                std::cout << "  [Step6] k-th seed: " << (have_seed ? "from the last completed merge" : "none yet") << "\n";
+                 build_vector_knn_with_tensorcore<DataT>(
+                     N, D, *bucket_vecs_ptr, graph_ptr,
+                     n_centroids, graph_K, neighbors_m,
+                     *knn_acc,
+                     centroid_knn_graph_host.data(), K,
+                     order_window_arg, step6_cache_bytes,
+-                    order_rk.empty() ? nullptr : &order_rk, config.gpu_bucket_cache_mb << 20);
++                    order_rk.empty() ? nullptr : &order_rk, config.gpu_bucket_cache_mb << 20,
++                    have_seed ? kth_seed.data() : nullptr);
+             }
+             double t6_after_build = std::chrono::duration<double>(Clock::now() - t6).count();
+             double t6_build_vector_knn = t6_after_build - t6_topk_expand;
