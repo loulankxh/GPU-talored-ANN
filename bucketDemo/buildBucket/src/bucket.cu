@@ -4570,6 +4570,26 @@ struct DevPoolJob {
 // 一个 block 一个桶 (job)，一个 warp 一行：写 fp16 行 + gid，顺手算 ‖row‖²
 // (8-bit 值在 fp16/fp32 里都精确，跟 compute_row_norms_kernel 从 d_B 读回来
 // 算的结果完全一样)，省掉单独的 norms kernel。
+// GPU bucket 缓存未命中的批量装载 (参考 TAGORE gpu_construct: 整块一次 H2D 再在显存里分发)：
+// producer 把一个 position 的全部未命中桶按 d_buf 布局写进 pinned 暂存区，末尾附 MissJob 表，
+// 一次 cudaMemcpyAsync 到显存暂存区，再由这个 kernel 把每段拷到各自的 d_buf (一个 block 一段)。
+struct MissJob {
+    char*    dst;
+    uint64_t src_off;   // 在暂存区里的偏移 (16B 对齐)
+    uint64_t bytes;
+};
+
+__global__ void devcache_scatter_misses_kernel(const char* __restrict__ stage, const MissJob* __restrict__ jobs)
+{
+    const MissJob j = jobs[blockIdx.x];
+    const char* src = stage + j.src_off;
+    const uint64_t n16 = j.bytes / 16;
+    const uint4* s4 = reinterpret_cast<const uint4*>(src);
+    uint4* d4 = reinterpret_cast<uint4*>(j.dst);
+    for (uint64_t i = threadIdx.x; i < n16; i += blockDim.x) d4[i] = s4[i];
+    for (uint64_t i = n16 * 16 + threadIdx.x; i < j.bytes; i += blockDim.x) j.dst[i] = src[i];
+}
+
 template <typename DataT>
 __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
                                             __half* __restrict__ B, int32_t* __restrict__ ids_pool,
@@ -5264,6 +5284,13 @@ void build_vector_knn_with_tensorcore(
     // job 表直接放 pinned host 内存让 gather kernel 经 UVA 读 (每桶几十条 × 32 B)，
     // 省掉主线程每桶一次 cudaMemcpyAsync；不支持映射时退回 H2D 拷贝。
     bool jobs_mapped = false;
+    // 未命中桶的 pinned 暂存区 (每 slot 一块，按 d_buf 布局 [int32 ids 16B 对齐][vecs] 写好，一次
+    // 异步 H2D)。参考 TAGORE gpu_construct: 缓冲区按上界一次分配、整块拷贝，不走 pageable 小拷贝。
+    // 一个 position 的未命中最多就是整个 pool，所以按 pool 上界 + 每桶 16B 对齐余量分配。
+    char* h_dstage[MAX_SLOTS] = {nullptr};
+    char* d_dstage[MAX_SLOTS] = {nullptr};
+    MissJob* h_mjobs[MAX_SLOTS] = {nullptr};
+    size_t dstage_cap = 0;
     if (use_dev_cache) {
         int dev = 0, uva = 0, can_map = 0;
         CUDA_CHECK(cudaGetDevice(&dev));
@@ -5290,9 +5317,22 @@ void build_vector_knn_with_tensorcore(
             std::move(future_access_dev), gpu_cache_bytes,
             [](const DevBucket& b) { return b.bytes; });
         dev_cache->set_pin_current_position(true);   // 本 position 的桶都在 job 表里，不能被淘汰
+        if (!d_blob) {
+            dstage_cap = max_pool_size_ub * (sizeof(int32_t) + static_cast<size_t>(D) * sizeof(DataT))
+                       + (static_cast<size_t>(K) + 1) * 16;
+            dstage_cap = (dstage_cap + 255) / 256 * 256;   // 后面接 MissJob 表 (8B 字段)，必须对齐
+            for (int sl = 0; sl < num_slots; ++sl) {
+                // [未命中数据 dstage_cap][MissJob 表 (K+1) 条]，一次拷过去
+                const size_t tot = dstage_cap + (static_cast<size_t>(K) + 1) * sizeof(MissJob);
+                CUDA_CHECK(cudaMallocHost(&h_dstage[sl], tot));
+                CUDA_CHECK(cudaMalloc(&d_dstage[sl], tot));
+                h_mjobs[sl] = reinterpret_cast<MissJob*>(h_dstage[sl] + dstage_cap);
+            }
+            std::cout << "  [VectorKNN] miss staging: " << num_slots << " x " << dstage_cap / 1e6 << " MB pinned\n";
+        }
         std::cout << "  [VectorKNN] GPU bucket cache: " << gpu_cache_bytes / 1e6 << " MB\n";
     }
-    double t_dev_upload = 0;
+    double t_dev_upload = 0, t_dev_hostget = 0, t_dev_malloc = 0, t_dev_copy = 0;
     int64_t n_dev_loads = 0;
     std::exception_ptr prod_exc;
     double t_wait_producer = 0;
@@ -5324,6 +5364,10 @@ void build_vector_knn_with_tensorcore(
                     // pool 由 GPU 从 bucket 缓存 gather；这里只解析/加载桶、写 job 表
                     size_t dofs = 0;
                     int nj = 0;
+                    size_t stage_off = 0;
+                    int n_miss = 0;
+                    // 这个 slot 上一次 (num_slots 个 position 之前) 的未命中拷贝完成后才能重写暂存区
+                    if (h_dstage[slot]) CUDA_CHECK(cudaEventSynchronize(ev_load[slot]));
                     auto dev_loader = [&](int32_t bid) {
                         auto tu0 = diag_now();
                         if (d_blob) {
@@ -5343,23 +5387,30 @@ void build_vector_knn_with_tensorcore(
                             return db;   // d_buf 为空: 不拥有显存，淘汰时什么都不做
                         }
                         const VecBucket<DataT>& hb = bucket_cache.get(pos, bid, bucket_loader);
+                        t_dev_hostget += diag_secs(tu0, diag_now());
                         DevBucket db;
                         db.ctx = &dev_ctx;
                         db.count = static_cast<int64_t>(hb.ids.size());
                         const size_t ids_bytes = (static_cast<size_t>(db.count) * sizeof(int32_t) + 15) / 16 * 16;
                         const size_t vec_bytes = static_cast<size_t>(db.count) * D * sizeof(DataT);
                         db.bytes = ids_bytes + vec_bytes;
+                        auto tm0 = diag_now();
                         CUDA_CHECK(cudaMallocAsync(&db.d_buf, std::max<size_t>(db.bytes, 16), copy_stream));
-                        std::vector<int32_t> ids32(static_cast<size_t>(db.count));
-                        for (int64_t i = 0; i < db.count; ++i) ids32[static_cast<size_t>(i)] = static_cast<int32_t>(hb.ids[static_cast<size_t>(i)]);
+                        t_dev_malloc += diag_secs(tm0, diag_now());
                         char* base = static_cast<char*>(db.d_buf);
                         db.d_ids  = reinterpret_cast<const int32_t*>(base);
                         db.d_vecs = base + ids_bytes;
                         if (db.count > 0) {
-                            CUDA_CHECK(cudaMemcpyAsync(base, ids32.data(), static_cast<size_t>(db.count) * sizeof(int32_t),
-                                                       cudaMemcpyHostToDevice, copy_stream));
-                            CUDA_CHECK(cudaMemcpyAsync(base + ids_bytes, hb.vecs.data(), vec_bytes,
-                                                       cudaMemcpyHostToDevice, copy_stream));
+                            if (stage_off + db.bytes > dstage_cap)   // bounds check (未命中总量 ≤ pool 上界)
+                                throw std::runtime_error("VectorKNN: miss staging overflow at pos " + std::to_string(pos));
+                            char* hs = h_dstage[slot] + stage_off;
+                            int32_t* hs_ids = reinterpret_cast<int32_t*>(hs);
+                            for (int64_t i = 0; i < db.count; ++i) hs_ids[i] = static_cast<int32_t>(hb.ids[static_cast<size_t>(i)]);
+                            std::memcpy(hs + ids_bytes, hb.vecs.data(), vec_bytes);
+                            if (n_miss > static_cast<int>(K))   // bounds check (一个 position 最多 K+1 个桶)
+                                throw std::runtime_error("VectorKNN: miss job table overflow at pos " + std::to_string(pos));
+                            h_mjobs[slot][n_miss++] = MissJob{base, static_cast<uint64_t>(stage_off), static_cast<uint64_t>(db.bytes)};
+                            stage_off += (db.bytes + 15) / 16 * 16;   // 下一块 16B 对齐 (余量已算进 dstage_cap)
                         }
                         ++n_dev_loads;
                         t_dev_upload += diag_secs(tu0, diag_now());
@@ -5395,6 +5446,16 @@ void build_vector_knn_with_tensorcore(
                     for (uint32_t k = 0; k < K; ++k) {
                         uint32_t nb_c = centroid_knn_graph[c * K + k];
                         if (nb_c < static_cast<uint32_t>(n_centroids)) add_dev(static_cast<int64_t>(nb_c));
+                    }
+                    if (n_miss > 0) {   // 这个 position 的未命中: 一次 H2D (数据 + job 表) + 一个分发 kernel
+                        auto tc0 = diag_now();
+                        CUDA_CHECK(cudaMemcpyAsync(d_dstage[slot], h_dstage[slot], stage_off, cudaMemcpyHostToDevice, copy_stream));
+                        CUDA_CHECK(cudaMemcpyAsync(d_dstage[slot] + dstage_cap, h_mjobs[slot],
+                                                   static_cast<size_t>(n_miss) * sizeof(MissJob), cudaMemcpyHostToDevice, copy_stream));
+                        devcache_scatter_misses_kernel<<<n_miss, 256, 0, copy_stream>>>(
+                            d_dstage[slot], reinterpret_cast<const MissJob*>(d_dstage[slot] + dstage_cap));
+                        CUDA_CHECK(cudaGetLastError());
+                        t_dev_copy += diag_secs(tc0, diag_now());
                     }
                     CUDA_CHECK(cudaEventRecord(ev_load[slot], copy_stream));
                     n_jobs_staged[slot] = nj;
@@ -5824,7 +5885,8 @@ void build_vector_knn_with_tensorcore(
     // ---- 释放 ----
     if (use_dev_cache) {
         std::cout << "  [VectorKNN] GPU bucket cache: " << n_dev_loads << " bucket uploads, upload "
-                  << std::fixed << std::setprecision(3) << t_dev_upload << "s, evictions "
+                  << std::fixed << std::setprecision(3) << t_dev_upload << "s (host get " << t_dev_hostget
+                  << "s, malloc " << t_dev_malloc << "s, h2d call " << t_dev_copy << "s), evictions "
                   << dev_cache->evictions() << "\n";
         dev_cache.reset();                       // 释放全部 device 桶 (都已提交)
         CUDA_CHECK(cudaStreamSynchronize(copy_stream));
@@ -5832,6 +5894,7 @@ void build_vector_knn_with_tensorcore(
         for (auto& pe : pos_ring) cudaEventDestroy(pe.ev);
         for (int sl = 0; sl < num_slots; ++sl) {
             cudaFreeHost(h_jobs[sl]); cudaFree(d_jobs[sl]); cudaEventDestroy(ev_load[sl]);
+            if (h_dstage[sl]) { cudaFreeHost(h_dstage[sl]); cudaFree(d_dstage[sl]); }
             if (sl == 0 && d_blob) { cudaFree(d_blob); d_blob = nullptr; }
         }
     }
@@ -6357,8 +6420,11 @@ int run_pipeline_impl(
         auto write_reordered_async = [&](const std::string& path, const DataT* p, size_t n,
                                          std::shared_ptr<std::vector<DataT>> holder) {
             const int32_t n32 = static_cast<int32_t>(N), d32 = static_cast<int32_t>(D);
-            reorder_write = std::async(std::launch::async, [path, n32, d32, p, n, holder]() {
-                std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            // 文件在这里同步创建: blob 模式下 round 1 的 reader 不 join 就构造 (只 open、不读)，
+            // 文件若还没被后台线程建出来就会 "cannot open" (SIFT1M large 偶发)
+            std::ofstream out_file(path, std::ios::binary | std::ios::trunc);
+            if (!out_file.is_open()) throw std::runtime_error("Inline reorder: cannot create " + path);
+            reorder_write = std::async(std::launch::async, [out = std::move(out_file), path, n32, d32, p, n, holder]() mutable {
                 int32_t hdr[2] = {n32, d32};
                 out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
                 out.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n * sizeof(DataT)));

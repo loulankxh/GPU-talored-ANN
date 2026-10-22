@@ -126,4 +126,8 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
 
 ## Iteration notes
 
-(none yet)
+- **#1 (accepted, +7.3% SIFT100M):** batching the GPU-cache misses of a position (pinned staging in `d_buf` layout,
+  one H2D + scatter kernel) cut the per-miss API cost: SIFT100M upload 479 / 536 → 296 / 386 s per round. The copy
+  calls are now negligible (17 s); what remains per miss is the host Belady get (139 / 201 s: host cache 8.6 GB <
+  13.6 GB of records), `cudaMallocAsync` (67 / 75 s) + eviction `cudaFreeAsync`, and ~20 misses per bucket. TAGORE's
+  lesson holds: allocate once, move big blocks. Next: B1b (device arena), then B2 / B3 for the miss count and host get.
