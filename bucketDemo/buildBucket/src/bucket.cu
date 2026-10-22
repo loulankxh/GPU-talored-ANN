@@ -1761,7 +1761,18 @@ void write_bucket_vectors_from_assignments(
 
     // ---- centroid 自己的向量: n_centroids 条，一次性小读 ----
     auto t_pre0 = Clock::now();
-    if (host_raw) {
+    if (host_raw && bucket_vecs.in_memory) {
+        // 内存模式下 add() 只碰 bucket c 自己的游标和字节区间，centroid c 恰好进 bucket c
+        // → 各 c 互不相干，并行 (SIFT10M 10 万个 centroid 串行 0.2-0.4 s/轮)
+        int64_t n_bad = 0;
+        #pragma omp parallel for schedule(static) reduction(+:n_bad)
+        for (int64_t c = 0; c < n_centroids; ++c) {
+            const int64_t gi = centroid_global_indices[c];
+            if (gi < 0 || gi >= N) { ++n_bad; continue; }   // bounds check
+            bucket_vecs.add(c, gi, host_raw + static_cast<size_t>(gi) * D);
+        }
+        if (n_bad > 0) throw std::runtime_error("write_bucket_vectors: centroid id out of range");
+    } else if (host_raw) {
         for (int64_t c = 0; c < n_centroids; ++c) {
             const int64_t gi = centroid_global_indices[c];
             if (gi < 0 || gi >= N)   // bounds check
@@ -6303,6 +6314,22 @@ int run_pipeline_impl(
         std::unique_ptr<GpuResidentKnn<DataT>> gres;
         // --fused-optimize-degree: round 1 重排的 inverse_perm 留到最后做 id 翻译
         std::vector<uint32_t> fused_inv_perm;
+        // round 1 重排后的 data_reordered.<ext> 在后台线程写 (进程内后面的步骤读的是
+        // raw_host / 显存里的数据，只有 prune 等后续进程要这个文件)；在任何可能读它
+        // 的地方之前、释放它所用的缓冲之前、以及进程结束前 join
+        std::future<void> reorder_write;
+        auto join_reorder_write = [&] { if (reorder_write.valid()) reorder_write.get(); };
+        auto write_reordered_async = [&](const std::string& path, const DataT* p, size_t n,
+                                         std::shared_ptr<std::vector<DataT>> holder) {
+            const int32_t n32 = static_cast<int32_t>(N), d32 = static_cast<int32_t>(D);
+            reorder_write = std::async(std::launch::async, [path, n32, d32, p, n, holder]() {
+                std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                int32_t hdr[2] = {n32, d32};
+                out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+                out.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n * sizeof(DataT)));
+                if (!out.good()) throw std::runtime_error("Inline reorder: failed writing " + path);
+            });
+        };
         const bool raw_preloaded = !raw_host.empty();
         if (neighbors_m > 0 && neighbors_m <= 256 && mem_est.fits_in_gpu && !force_out_of_core) {
             size_t need = GpuResidentKnn<DataT>::bytes_needed(N, D, neighbors_m);
@@ -6695,7 +6722,7 @@ int run_pipeline_impl(
                 centroid_global_indices, assignments, *bucket_vecs_ptr,
                 512LL * 1024 * 1024, ooc_host_raw ? raw_host.data() : nullptr);
             // 最后一轮写完 bucket 之后 Step 6 只读 bucket_vecs，原始数据不再需要
-            if (ooc_host_raw && iter + 1 == iterations) raw_host = std::vector<DataT>();
+            if (ooc_host_raw && iter + 1 == iterations) { join_reorder_write(); raw_host = std::vector<DataT>(); }
         }
         double t4_bucket_write = std::chrono::duration<double>(Clock::now() - t4_bw0).count();
 
@@ -6817,13 +6844,8 @@ int run_pipeline_impl(
                                 static_cast<size_t>(D) * sizeof(DataT));
                 }
                 raw_host = std::vector<DataT>();
-                std::ofstream out(data_reordered_path, std::ios::binary | std::ios::trunc);
-                int32_t hdr[2] = {N, D};
-                out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
-                out.write(reinterpret_cast<const char*>(reordered.data()),
-                          static_cast<std::streamsize>(reordered.size() * sizeof(DataT)));
-                if (!out.good())
-                    throw std::runtime_error("Inline reorder: failed writing " + data_reordered_path);
+                auto holder = std::make_shared<std::vector<DataT>>(std::move(reordered));
+                write_reordered_async(data_reordered_path, holder->data(), holder->size(), holder);
                 gres->permute(reorder_info.inverse_perm);
             } else if (static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= config.cpu_limit_bytes / 4) {
                 // out-of-core 但原始数据 (两份: 读入 + 重排后) 放得进 CPU 预算的
@@ -6848,15 +6870,15 @@ int run_pipeline_impl(
                                 static_cast<size_t>(D) * sizeof(DataT));
                 }
                 raw_all = std::vector<DataT>();
-                std::ofstream out(data_reordered_path, std::ios::binary | std::ios::trunc);
-                int32_t hdr[2] = {static_cast<int32_t>(N), static_cast<int32_t>(D)};
-                out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
-                out.write(reinterpret_cast<const char*>(reordered.data()),
-                          static_cast<std::streamsize>(reordered.size() * sizeof(DataT)));
-                if (!out.good())
-                    throw std::runtime_error("Inline reorder: failed writing " + data_reordered_path);
-                // 重排后的副本就是新坐标系下的原始数据集：round 2..t 继续用它
-                if (ooc_host_raw && iterations > 1) raw_host = std::move(reordered);
+                // 重排后的副本就是新坐标系下的原始数据集：round 2..t 继续用它 (后台写文件
+                // 直接用 raw_host 的缓冲，释放 raw_host 之前 join)；否则交给 holder 保活
+                if (ooc_host_raw && iterations > 1) {
+                    raw_host = std::move(reordered);
+                    write_reordered_async(data_reordered_path, raw_host.data(), raw_host.size(), nullptr);
+                } else {
+                    auto holder = std::make_shared<std::vector<DataT>>(std::move(reordered));
+                    write_reordered_async(data_reordered_path, holder->data(), holder->size(), holder);
+                }
             } else {
                 auto writer = reordered_io::ReorderedDatasetWriter<DataT>::create(
                     data_reordered_path, D, n_centroids,
@@ -7076,6 +7098,9 @@ int run_pipeline_impl(
             // 文件（batch_assign_with_cagra_anns 在 round 1 传了 nullptr 跳过
             // 了它）。round 2..t 照旧用 BucketVectorAccumulator。
             if (iter == 0) {
+                // 不能走 blob 模式时 reader 要读 data_reordered 文件: 先等后台写完
+                if (!(ooc_host_raw && static_cast<int64_t>(raw_host.size()) == N * static_cast<int64_t>(D)))
+                    join_reorder_write();
                 reordered_io::ReorderedDatasetBucketReader<DataT> reader(
                     working_input_path, D, reorder_offsets_new, reorder_pos_of);
                 // raw_host 这时是重排后的整份数据集 (ooc_host_raw 且多轮时) → blob 模式
@@ -7162,6 +7187,7 @@ int run_pipeline_impl(
             elapsed_final_merge_wait = wait_s;
         }
 
+        join_reorder_write();   // data_reordered.<ext> 必须在进程结束前写完
         // 把按 chunk 分片的 running 状态 (跨全部 iteration 合并去重后的最终
         // 结果) 按 chunk 顺序拼接成 vector_knn.bin / vector_dists.bin。
         if (gres) {

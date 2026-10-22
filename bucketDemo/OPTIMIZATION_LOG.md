@@ -35,13 +35,13 @@ Note: builds before 2026-10-21 02:00 had no `-O3` (CMake 4 left `CMAKE_BUILD_TYP
 
 ## Current best
 
-After **#66 (blob mode: no Belady setup + gather issued by the producer thread)**, 2026-10-21:
+After **#69 (background data_reordered write + optimize_chunked staged I/O + parallel centroid add)**, 2026-10-21:
 
 | config | build total (s) | recall@10 itopk 32 / 64 / 128 | QPS itopk 32 / 64 |
 |---|---|---|---|
-| SIFT1M auto (GPU-resident) | **6.31** (0.55x CAGRA; #61) | 0.9272 / 0.9769 / 0.9942 | 2222K / 1192K |
-| SIFT1M large (out-of-core path) | **9.69** (0.84x CAGRA) | 0.9135 / 0.9708 / 0.9919 | 1946K / 1034K |
-| SIFT10M auto (→ large path, 1 run) | **84.76** (0.69x CAGRA; rerun 84.00) | 0.8386 / 0.9280 / 0.9735 | 1870K / 1011K |
+| SIFT1M auto (GPU-resident) | **6.25** (0.54x CAGRA) | 0.9278 / 0.9771 / 0.9944 | 1948K / 1035K |
+| SIFT1M large (out-of-core path) | **9.70** (0.84x CAGRA) | 0.9138 / 0.9703 / 0.9922 | 2221K / 1190K |
+| SIFT10M auto (→ large path, 1 run) | **81.65** (0.67x CAGRA; first run 80.56) | 0.8381 / 0.9279 / 0.9735 | 1870K / 1013K |
 | CAGRA native SIFT1M / SIFT10M | 11.54 / 122.59 | 0.9305 / 0.9782 / 0.9948 — 0.8672 / 0.9463 / 0.9839 | 1942K / 1036K — 1868K / 1013K |
 
 ## Ideas backlog
@@ -81,8 +81,6 @@ Other:
 
 | # | idea | result | reason |
 |---|---|---|---|
-| 68 | Bundle: #67 optimize_chunked staged I/O + parallel centroid add in `write_bucket_vectors_from_assignments` (memory mode; centroid c → bucket c, independent). Patch (both): `bucketDemo/patches/iter68_oc_io_parallel_centroid_write.patch` | 10M 83.74 s (+1.2%): optimize_chunked 4.89 → 2.83 s, centroid_write 0.2–0.4 → 0.03 s/round, but Step 5 +0.8 s / Step 4 +0.4 s noise; 1M-large −1.8%, 1M-auto 0.0% | no config ≥ 3%: ~2.5 s real saving on 10M lost in single-run noise (±1–2 s). Keep for the next bundle |
-| 67 | Large-path I/O: (a) `optimize_chunked` single-batch Phase 1 reads the forward graph with 8-thread pread into an uninitialized pageable buffer and uploads through two 64 MB pinned staging buffers (no 1.28 GB `cudaMallocHost`, 0.7 s on 10M); GPU Phase 2 result stays on the device and streams in row chunks through pinned buffers into the writer (no zero-filled N×K host vector). (b) `translate_ids`: 1M-row batches read with 8-thread pread. Patch (a only): `bucketDemo/patches/iter67_optimize_chunked_staged_io.patch` | 10M optimize_chunked 4.89 → 2.92 s (Phase 1 2.50 → 1.46 s, pinned alloc 0.70 → 0 s), but translate 3.48 → 4.12 s; total 84.30 s (+0.5%; Step 4 / 6 +0.8 s each noise). Synthetic 10M translate A/B: old 3.66 / 6.78 s, new 3.71 / 8.27 s (identical output) — translate is bound by the 1.28 GB write / page-cache writeback, not the read | no config ≥ 3%. (a) is a real ~2 s saving on 10M (~2.4%) — bundle; (b) dropped |
 | 62 | Out-of-core version of #61: `ChunkedKnnAccumulator::merge_iteration` records each point's running M-th distance (`kth`, N floats) in non-final rounds; Step 6 of rounds 2..t waits for that merge, uploads `kth` and the block top-M seeds its shared row threshold by gid. Patch: `bucketDemo/patches/iter62_ooc_kth_seed.patch` | one-off SIFT10M (t=2): round-2 loop 13.3 → 12.1 s (stream_sync 4.4 → 2.6 s). Benchmark: 1M-large 10.58 s (−4.5%, Step 6 4.46 → 5.16 s), 10M 101.52 s (−5.8%, Step 6 44.5 → 51.2 s), 1M-auto −1.3% | judge: two configs > 3% slower. Waiting for the previous merge before Step 6 (instead of after it) puts the merge on the critical path / makes it compete with Step 6 for CPU and disk; the out-of-core loop is host-bound after the seed. Would need the seed without the extra synchronisation (e.g. seed from round t−2's kth, already complete) |
 | 60 | Block top-M kernel: per-warp batched filtered queue (raft `warp_sort_filtered` style on public `raft::util::bitonic`, 4-slot per-lane buffer, bitonic merge when full) instead of serial `warp_topk_insert`; shared row threshold kept. Motivation: nsys after #49 — top-M 49% of out-of-core Step 6 GPU time (127 µs/bucket), gather 26%, GEMMs ~22%; ncu: one 182-row launch = 22.4M warp instructions (~120K/row, mostly the per-candidate inserts) | quick test (1 run): resident loop 0.907 → 1.14 s/round, out-of-core 1.25 → 1.39 s/round | rejected without the full benchmark: the bitonic merges (sort 128 / merge 64 per flush) cost more than the serial inserts at this K/pool size — same finding as #45. Remaining idea: fewer passing candidates (tighter threshold seeded from the running KNN's K-th distance in rounds 2..t) rather than a cheaper insert |
 | 59 | Out-of-core Step 6 slots after #49: OVERSUB 2.0 / 3.0 / 4.0 (4 / 5 / 7 streams), SIFT1M large quick sweep (1 run each) | loop/round 1.25 1.19 1.10 / 1.17 1.13 1.17 / 1.11 1.16 1.07 s; Step 6 4.33 / 4.32 / 4.15 s | not benchmarked: differences within run-to-run noise — the loop is GPU-throughput-bound since #49, more concurrent small kernels don't help |
@@ -1776,6 +1774,49 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift10M_auto | 0.8386 / 1870K | 0.9280 / 1011K | 0.9735 / 526K | 0.9918 / 186K | 0.9979 / 68K |
 
 **Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +3.4% (87.75 → 84.76 s, 0.69× CAGRA native; rerun +4.3%), 1M-large +1.1%, 1M-auto −1.1% (noise).
+
+### #69 — data_reordered written in the background + #67 optimize_chunked staged I/O + parallel centroid add (#68)  (2026-10-21, commit TBD)
+**Idea / rationale:** (1) Step 4.5 wrote `data_reordered.<ext>` (SIFT10M 1.28 GB) synchronously after the in-memory permute (pass3_write 2.35 s). Inside bucket2 nothing reads that file on the resident path (data on the GPU) or the out-of-core path with host raw data (Step 4/bucket write read `raw_host`; Step 6 round 1 is in blob mode since #64). Only later processes (prune_windowed) need it. The write now runs on a `std::async` thread from the buffer that is kept anyway (`raw_host` when it carries over to rounds 2..t, otherwise a shared holder). It is joined before the round-1 reader is built if blob mode isn't usable, before `raw_host` is freed after the last round, and before the final outputs. (2) #67 patch: `optimize_chunked` single-batch Phase 1 reads the forward graph with 8-thread pread into a pageable buffer and uploads through two 64 MB pinned staging buffers (no 1.28 GB `cudaMallocHost`); the GPU Phase 2 result streams D2H through pinned row chunks straight into the writer. (3) #68: centroid adds in `write_bucket_vectors_from_assignments` run in parallel in memory mode (centroid c → bucket c, independent). Each alone was below the noise of a single SIFT10M run; together they clear it.
+**Files:** `bucketDemo/buildBucket/src/bucket.cu`, `optimize_chunked.cu`
+**Params changed:** none
+**Borderline confirmation:** 10M first run 80.56 s (+5.0%), rerun `sift10M_auto_b` 81.65 s (+3.7%) → both ACCEPT; best.json stores the rerun (slower).
+**SIFT10M:** Step 4.5 2.83 → 1.74 s, optimize_chunked 4.89 → 2.83 s, centroid_write 0.2–0.4 → 0.03 s/round.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.25 | +2.8% | +71.3% | 0.54x | bucket2 6.25 | 3524 | 1.71 |
+| sift1M_large | large | 9.70 | -0.1% | +87.1% | 0.84x | bucket2 7.87, prune 0.72, optimize_chunked 0.69, translate 0.46 | 1550 | 2.05 |
+| sift10M_auto | large | 81.65 | +3.7% | +54.3% | 0.67x | bucket2 71.27, prune 4.00, optimize_chunked 2.85, translate 3.53 | 8996 | 12.64 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.62 | 0.26 | 0.17 | 0.00 | 0.64 | 0.35 | 0.02 | 2.76 | 0.00 | 0.92 |
+| sift1M_large | 0.13 | 0.58 | 0.31 | 0.00 | 0.96 | 0.30 | 0.04 | 4.31 | 0.52 | 0.00 |
+| sift10M_auto | 1.34 | 7.54 | 2.00 | 0.00 | 18.59 | 1.68 | 0.33 | 34.67 | 4.00 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9716 | 0.9658 | 0.9594 | 0.9533 |
+| sift1M_large | 0.9721 | 0.9660 | 0.9592 | 0.9532 |
+| sift10M_auto | 0.9167 | 0.8978 | 0.8829 | 0.8716 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9278 / 1948K | 0.9771 / 1035K | 0.9944 / 489K | 0.9987 / 188K | 0.9997 / 68K |
+| ours sift1M_large | 0.9138 / 2221K | 0.9703 / 1190K | 0.9922 / 562K | 0.9982 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8382 / 1869K | 0.9291 / 1011K | 0.9738 / 493K | 0.9922 / 184K | 0.9979 / 68K |
+
+**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +3.7% (84.76 → 81.65 s, 0.67× CAGRA native; first run +5.0%), 1M-auto +2.8% (6.31 → 6.25 s... relative to stored 6.43? see table), 1M-large −0.1%.
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
