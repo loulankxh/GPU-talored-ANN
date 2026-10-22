@@ -154,3 +154,6 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
 - **#6 (rejected, −9.5% SIFT100M):** Phase 2 CSR radix build 53 → 11 s works, but that run read the edge / forward files
   at disk speed (124 + 49 s). Unclear whether the no-zero-fill allocator or the environment caused it; retry the CSR
   part alone. SIFT100M single runs swing by tens of seconds through the page cache — the main noise source now.
+- **#7 (rejected, +2.1%):** CSR part alone gives optimize_chunked −33 s (Phase 2 116 → 82 s) with reads at page-cache
+  speed → #6's slow reads came from leaving the *read* buffers uninitialized. Next for optimize_chunked: B10 (user plan,
+  bounded streaming top-K_out per destination; exact by the protected-set argument), measured first (step 1).
