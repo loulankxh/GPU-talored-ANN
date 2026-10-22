@@ -269,11 +269,15 @@ int main(int argc, char** argv)
         // thread, one position at a time) and sit squarely in the critical
         // path even with high thread counts, so they're worth isolating
         // explicitly rather than assuming the OMP region dominates just
-        // because it's the only parallel part.
+        // because it's the only parallel part. t_iter_total wraps the *whole*
+        // body of every loop iteration (plus the bulk load / GPU block), not
+        // just the four named sub-regions, so an untimed sliver (e.g. a
+        // destructor running after t_write stopped) shows up immediately as
+        // sum-of-parts < t_iter_total instead of an unexplained wall gap.
         prune_windowed::BucketWindow window(offsets_new.data(), n_buckets);
 
         int64_t n_copy_positions = 0;
-        double t_fetch = 0, t_window_build = 0, t_compute = 0, t_write = 0;
+        double t_fetch = 0, t_window_build = 0, t_compute = 0, t_write = 0, t_iter_total = 0;
         int64_t min_center_count = std::numeric_limits<int64_t>::max(), max_center_count = 0;
 
         // Batched fast path: 每个 bucket 只有 ~100 行 (SIFT1M)，逐 position
@@ -331,6 +335,7 @@ int main(int argc, char** argv)
             const int32_t* all_cand = all_cand_buf.get();
             const float*   all_vec  = all_vec_buf.get();
             t_fetch += std::chrono::duration<double>(Clock::now() - tl0).count();
+            t_iter_total += std::chrono::duration<double>(Clock::now() - tl0).count();
             struct Slice { int32_t pos; int64_t first, count; const int32_t* cand; const float* vec; };
             auto slice_of = [&](int32_t bucket) {
                 const int32_t pos = pos_of[static_cast<size_t>(bucket)];
@@ -374,6 +379,7 @@ int main(int argc, char** argv)
                 t_write += t_sink;
                 t_compute += std::chrono::duration<double>(Clock::now() - tg0).count() - t_sink;
                 min_center_count = max_center_count = 0;
+                t_iter_total += std::chrono::duration<double>(Clock::now() - tg0).count();
                 std::cout << "  mode=batched+GPU\n";
                 goto pruned_done;
             }
@@ -383,6 +389,7 @@ int main(int argc, char** argv)
             std::vector<int64_t> row_start(static_cast<size_t>(kBatch) + 1);
             std::vector<uint32_t> row_block;
             for (int32_t pos0 = 0; pos0 < n_buckets; pos0 += kBatch) {
+                auto titer0 = Clock::now();
                 const int32_t nb = std::min(kBatch, n_buckets - pos0);
 
                 auto tf0 = Clock::now();
@@ -445,11 +452,14 @@ int main(int argc, char** argv)
                 auto tr0 = Clock::now();
                 writer.write_rows(row_block.data(), offsets_new[static_cast<size_t>(pos0)], total_rows);
                 t_write += std::chrono::duration<double>(Clock::now() - tr0).count();
+
+                t_iter_total += std::chrono::duration<double>(Clock::now() - titer0).count();
             }
         }
 
 pruned_done:
         for (int32_t pos = 0; !batched && pos < n_buckets; ++pos) {
+            auto titer0 = Clock::now();
             int32_t b = order[static_cast<size_t>(pos)];
 
             // Once the cache holds every bucket (resident_count() ==
@@ -544,6 +554,8 @@ pruned_done:
             auto tr0 = Clock::now();
             writer.write_rows(row_block.data(), center.first_global_id, center.count);
             t_write += std::chrono::duration<double>(Clock::now() - tr0).count();
+
+            t_iter_total += std::chrono::duration<double>(Clock::now() - titer0).count();
         }
 
         if (writer.rows_written() != N)
@@ -566,6 +578,7 @@ pruned_done:
                   << "s window_build=" << t_window_build
                   << "s compute(parallel)=" << t_compute
                   << "s write=" << t_write << "s (sum=" << (t_fetch + t_window_build + t_compute + t_write)
+                  << "s vs loop total=" << t_iter_total
                   << "s vs wall=" << t_prune << "s)\n";
         std::cout << "  [Timing] Prune = " << t_prune << "s\n";
 
