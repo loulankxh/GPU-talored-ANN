@@ -173,7 +173,9 @@ SIFT100M 3–7% faster with everything else passing (rechecked later with multi-
 
 ## Tried & rejected
 
-(empty)
+| # | idea | result | reason / patch |
+|---|---|---|---|
+| 6 | `optimize_chunked -m E` Phase 2: cache-friendly CSR (per-thread block histograms, 64-bit keys (row<<5|rank)<<32|src, per-block sort; byte-identical, fallback to the old build) + no-zero-fill allocator for the edge / key / CSR buffers + Phase 2 sub-timers (`EdgeChunkAccumulator`, `build_rank_ordered_csr_fast`; TAGORE `reorder` / `order_merge_new` block-wise processing) | SIFT100M 1463.29 s vs best 1336.36 (**−9.5 %**): Phase 2 116 → 203 s with breakdown read_fwd 49.4 / read_edges 123.6 / csr 11.3 / merge 2.7 / write 12.1 s — the CSR part improved (~53 → 11 s estimated from SIFT10M ×10) but both reads ran at ~260 MB/s = raw disk speed (files not in page cache in this run; 207 GB free afterwards, cause unknown: environment or the untouched buffers). SIFT10M forced disk path: Phase 2 14.6–17.8 → 10.1–10.6 s, byte-identical. 1M auto −0.2 %, 1M large −1.0 % (rerun; first run 8.96 s was −4.1 % vs the optimistic #5 best, difference only in untouched bucket2), 10M +1.6 %; recall unchanged | judge: SIFT100M regression > 7 % | `bucketDemo/patches/tagore6_csr_radix_noinit.patch` — recheck: CSR part alone (keep zero-fill) and a multi-run SIFT100M |
 
 ## Iterations
 
@@ -529,3 +531,10 @@ slightly optimistic best. SIFT100M best now **1336.36 s** (+58.4 % vs #0, 0.62×
 | ours sift1M_large | 0.9138 / 2219K | 0.9704 / 1189K | 0.9920 / 561K | 0.9982 / 189K | 0.9994 / 68K |
 | ours sift10M_auto | 0.8328 / 1870K | 0.9247 / 1010K | 0.9714 / 467K | 0.9910 / 185K | 0.9977 / 68K |
 | ours sift100M_auto | 0.7331 / 67K | 0.8423 / 63K | 0.9171 / 38K | 0.9631 / 23K | 0.9855 / 13K |
+
+### #6 — REJECTED: optimize_chunked Phase 2 cache-friendly CSR + no-zero-fill buffers (2026-10-22)
+
+See **Tried & rejected** (#6). The CSR build is clearly faster, but the single SIFT100M run had Phase 2's file reads at
+disk speed (read_edges 124 s, read_fwd 49 s), so the total regressed 9.5 %. Next attempt: the CSR part only
+(keep the zero-filled buffers, which may matter for read speed), and/or overlap the next chunk's read with the CSR /
+merge / write of the current one.

@@ -151,3 +151,6 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
 - **#5 (accepted by user decision, +6.8%):** `EdgeChunkAccumulator::finish` copy removed (−100 s in optimize_chunked,
   byte-identical) but single-run SIFT100M noise (Step 6 ±10 s) keeps it under the 7% gate. Bundle the patch with the
   next optimize_chunked change (Phase 2 111 s, Phase 1 48 s, create 12 s) so the pair clears 7%.
+- **#6 (rejected, −9.5% SIFT100M):** Phase 2 CSR radix build 53 → 11 s works, but that run read the edge / forward files
+  at disk speed (124 + 49 s). Unclear whether the no-zero-fill allocator or the environment caused it; retry the CSR
+  part alone. SIFT100M single runs swing by tens of seconds through the page cache — the main noise source now.
