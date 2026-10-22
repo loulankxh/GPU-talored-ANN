@@ -25,13 +25,16 @@
 #pragma once
 
 #include <algorithm>
+#include <omp.h>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef __CUDACC__
@@ -55,6 +58,8 @@ struct EdgeRecord {
 };
 #pragma pack(pop)
 static_assert(sizeof(EdgeRecord) == 10, "EdgeRecord must be 10 bytes packed");
+
+using EdgeVec = std::vector<EdgeRecord>;
 
 // ---------------------------------------------------------------------
 // chunk_of: binary search over sorted chunk boundaries (ChunkPlan::starts
@@ -194,7 +199,7 @@ public:
     }
 
     // 读回 chunk c 的全部记录 (只读一次: 读完删掉它的文件)
-    void read_chunk(int32_t c, std::vector<EdgeRecord>& out) {
+    void read_chunk(int32_t c, EdgeVec& out) {
         int64_t cnt = merged_count[static_cast<size_t>(c)];
         out.resize(static_cast<size_t>(cnt));
         if (cnt == 0) return;
@@ -226,7 +231,7 @@ struct ChunkCsr {
 // of the (non-deterministic) scatter order -- previously ties in rank kept
 // the GPU scatter's arrival order. Bounds check: every edge's dst must fall
 // inside [j_lo, j_lo + chunk_size).
-inline ChunkCsr build_rank_ordered_csr(const std::vector<EdgeRecord>& edges,
+inline ChunkCsr build_rank_ordered_csr(const EdgeVec& edges,
                                         uint32_t j_lo, uint32_t chunk_size)
 {
     struct RankSrc { uint16_t rank; uint32_t src; };
@@ -283,6 +288,92 @@ inline ChunkCsr build_rank_ordered_csr(const std::vector<EdgeRecord>& edges,
 // math, but reads priority from `rank_sorted_src`'s physical order (index 0
 // = strongest) instead of assuming write order encoded priority.
 // ---------------------------------------------------------------------
+// build_rank_ordered_csr 的 cache 友好版本 (结果逐字节相同)。原版对 1.6B 条边在 50M 行上做
+// 原子计数 + 原子 scatter (随机访问整块 row_offsets/cursor)，SIFT100M Phase 2 里约一半时间。
+// 这里两趟基数划分: (1) 每个线程按 kRowBlock 行一块做局部直方图 (无原子)，(2) 按块 scatter 成
+// 64 位键 ((本地行 << 5 | rank) << 32 | src)，(3) 每块在 cache 里排序 → 行内按 (rank, src) 升序，
+// 跟原版 sort 的比较完全一致 ((rank, src) 在一行内唯一，是全序)。参考 TAGORE large_index.cu
+// reorder / order_merge_new 的分块处理思路 (先按块分桶，块内再做细活)。
+// 前提: K_out ≤ 32 (rank 5 bit)、chunk_size < 2^27；不满足时调用方用原版。
+inline bool rank_ordered_csr_fast_ok(uint32_t chunk_size, uint32_t K_out) {
+    return K_out <= 32 && chunk_size < (1u << 27);
+}
+
+inline ChunkCsr build_rank_ordered_csr_fast(const EdgeVec& edges,
+                                             uint32_t j_lo, uint32_t chunk_size)
+{
+    constexpr uint32_t kRowBlockBits = 13;            // 8192 行一块
+    const uint32_t n_blocks = (chunk_size >> kRowBlockBits) + 1;
+    const int64_t n_edges = static_cast<int64_t>(edges.size());
+    const int T = std::max(1, omp_get_max_threads());
+
+    // (1) 每线程每块的边数 (线程按静态区间分边，跟 (2) 的划分一致)
+    std::vector<int64_t> hist(static_cast<size_t>(T) * n_blocks + 1, 0);
+    int64_t n_bad = 0;
+    #pragma omp parallel num_threads(T) reduction(+:n_bad)
+    {
+        const int t = omp_get_thread_num();
+        const int64_t e0 = n_edges * t / T, e1 = n_edges * (t + 1) / T;
+        int64_t* h = hist.data() + static_cast<size_t>(t) * n_blocks;
+        for (int64_t e = e0; e < e1; ++e) {
+            const EdgeRecord& r = edges[static_cast<size_t>(e)];
+            uint32_t lj = r.dst - j_lo;
+            if (lj >= chunk_size || r.rank >= 32) { ++n_bad; continue; }   // bounds check
+            h[lj >> kRowBlockBits]++;
+        }
+    }
+    if (n_bad > 0)
+        throw std::runtime_error("build_rank_ordered_csr_fast: " + std::to_string(n_bad) +
+                                 " edges with dst outside the chunk or rank >= 32");
+    // 块主序的前缀: block b 的区间 = [blk_start[b], blk_start[b+1])，块内按线程号排
+    std::vector<int64_t> blk_start(static_cast<size_t>(n_blocks) + 1, 0);
+    std::vector<int64_t> cur(static_cast<size_t>(T) * n_blocks);
+    {
+        int64_t pos = 0;
+        for (uint32_t b = 0; b < n_blocks; ++b) {
+            blk_start[b] = pos;
+            for (int t = 0; t < T; ++t) {
+                cur[static_cast<size_t>(t) * n_blocks + b] = pos;
+                pos += hist[static_cast<size_t>(t) * n_blocks + b];
+            }
+        }
+        blk_start[n_blocks] = pos;
+    }
+    // (2) scatter 成 64 位键
+    // 键数组不清零 (只被下面的并行 scatter 写满、只在本函数里用)；读文件的缓冲照旧用 std::vector
+    std::unique_ptr<uint64_t[]> keys(new uint64_t[static_cast<size_t>(std::max<int64_t>(n_edges, 1))]);
+    #pragma omp parallel num_threads(T)
+    {
+        const int t = omp_get_thread_num();
+        const int64_t e0 = n_edges * t / T, e1 = n_edges * (t + 1) / T;
+        int64_t* c = cur.data() + static_cast<size_t>(t) * n_blocks;
+        for (int64_t e = e0; e < e1; ++e) {
+            const EdgeRecord& r = edges[static_cast<size_t>(e)];
+            uint32_t lj = r.dst - j_lo;
+            uint64_t k = (static_cast<uint64_t>((lj << 5) | r.rank) << 32) | r.src;
+            keys[static_cast<size_t>(c[lj >> kRowBlockBits]++)] = k;
+        }
+    }
+    // (3) 块内排序 + 每行计数
+    ChunkCsr csr;
+    csr.row_offsets.assign(static_cast<size_t>(chunk_size) + 1, 0);
+    #pragma omp parallel for schedule(dynamic, 4) num_threads(T)
+    for (int64_t b = 0; b < static_cast<int64_t>(n_blocks); ++b) {
+        uint64_t* kb = keys.get() + blk_start[static_cast<size_t>(b)];
+        uint64_t* ke = keys.get() + blk_start[static_cast<size_t>(b) + 1];
+        std::sort(kb, ke);
+        for (uint64_t* k = kb; k < ke; ++k) csr.row_offsets[static_cast<size_t>(*k >> 37) + 1]++;
+    }
+    for (uint32_t i = 0; i < chunk_size; ++i)
+        csr.row_offsets[i + 1] += csr.row_offsets[i];
+    // 块排好序后 keys 整体就是 (行, rank, src) 升序，跟 row_offsets 一一对应
+    csr.src.resize(static_cast<size_t>(n_edges));
+    #pragma omp parallel for schedule(static) num_threads(T)
+    for (int64_t e = 0; e < n_edges; ++e)
+        csr.src[static_cast<size_t>(e)] = static_cast<uint32_t>(keys[static_cast<size_t>(e)]);
+    return csr;
+}
+
 inline void merge_rank_ordered_into_row(
     uint32_t* row,                     // [K_out], forward row for node j; modified in place
     const uint32_t* rank_sorted_src,   // this row's CSR segment, rank-ascending

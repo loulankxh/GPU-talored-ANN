@@ -16,7 +16,7 @@ CHUNKED_GPU_BUDGET_MB=16000
 CHUNKED_EDGE_BUFFER_MB=16000
 
 # extra flags appended verbatim (keep empty unless an optimization needs them)
-BUCKET2_EXTRA="--skip-npy --skip-dists --kmeans-train-fraction 0.10"
+BUCKET2_EXTRA="--skip-npy --skip-dists --kmeans-train-fraction 0.10 --cache-mb 15000"   # #9: Step 6 host Belady cache holds a whole SIFT100M round (13.6 GB of records; default cpu_limit/2 = 8.6 GB)
 OPTIMIZE_EXTRA="--skip-sort"
 PRUNE_EXTRA=""
 CHUNKED_EXTRA=""

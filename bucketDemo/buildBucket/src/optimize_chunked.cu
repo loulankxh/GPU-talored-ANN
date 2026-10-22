@@ -1591,7 +1591,7 @@ static void run_method_E(
     std::cout << "  [Timing] Alloc: device=" << std::fixed << std::setprecision(2) << t_alloc_device
               << "s, pinned-host=" << t_alloc_pinned << "s\n";
 
-    std::vector<edge_chunk::EdgeRecord> mem_edges;
+    edge_chunk::EdgeVec mem_edges;
     if (edges_in_memory && !single_drain) mem_edges.reserve(total_edges);
     std::cout << "  [Method E] edges " << (edges_in_memory ? "in memory" : "via disk accumulator") << "\n";
 
@@ -1834,22 +1834,30 @@ static void run_method_E(
         }
 
         std::vector<uint32_t> row_block;
-        std::vector<edge_chunk::EdgeRecord> chunk_edges;
+        edge_chunk::EdgeVec chunk_edges;
+        double p2_fwd = 0, p2_edges = 0, p2_csr = 0, p2_merge = 0, p2_write = 0;
+        auto p2s = [](Clock::time_point a) { return std::chrono::duration<double>(Clock::now() - a).count(); };
 
         for (int32_t c = 0; !gpu_phase2 && c < num_chunks; ++c) {
             uint32_t j_lo = plan.starts[static_cast<size_t>(c)];
             uint32_t j_hi = plan.starts[static_cast<size_t>(c) + 1];
             uint32_t chunk_sz = j_hi - j_lo;
 
+            auto q0 = Clock::now();
             row_block.resize(static_cast<size_t>(chunk_sz) * K_out);
             fwd_in2.read(reinterpret_cast<char*>(row_block.data()),
                         static_cast<std::streamsize>(row_block.size() * sizeof(uint32_t)));
             if (!fwd_in2.good())
                 throw std::runtime_error("Method E Phase 2: failed to read forward rows for chunk " + std::to_string(c));
 
+            p2_fwd += p2s(q0); q0 = Clock::now();
             if (edges_in_memory) chunk_edges = std::move(mem_edges);   // num_chunks == 1
             else acc.read_chunk(c, chunk_edges);
-            auto csr = edge_chunk::build_rank_ordered_csr(chunk_edges, j_lo, chunk_sz);
+            p2_edges += p2s(q0); q0 = Clock::now();
+            auto csr = edge_chunk::rank_ordered_csr_fast_ok(chunk_sz, static_cast<uint32_t>(K_out))
+                ? edge_chunk::build_rank_ordered_csr_fast(chunk_edges, j_lo, chunk_sz)
+                : edge_chunk::build_rank_ordered_csr(chunk_edges, j_lo, chunk_sz);
+            p2_csr += p2s(q0); q0 = Clock::now();
 
             #pragma omp parallel for schedule(dynamic, 1024)
             for (int64_t lj = 0; lj < static_cast<int64_t>(chunk_sz); ++lj) {
@@ -1860,8 +1868,14 @@ static void run_method_E(
                     csr.src.data() + lo, hi - lo, static_cast<uint32_t>(K_out));
             }
 
+            p2_merge += p2s(q0); q0 = Clock::now();
             writer.write_rows(row_block.data(), j_lo, chunk_sz);
+            p2_write += p2s(q0);
         }
+        if (!gpu_phase2)
+            std::cout << "  [Timing] Phase 2 breakdown: read_fwd=" << std::fixed << std::setprecision(2) << p2_fwd
+                      << "s read_edges=" << p2_edges << "s csr=" << p2_csr << "s merge=" << p2_merge
+                      << "s write=" << p2_write << "s\n";
 
         if (writer.rows_written() != N)
             throw std::runtime_error("Method E: wrote " + std::to_string(writer.rows_written()) +

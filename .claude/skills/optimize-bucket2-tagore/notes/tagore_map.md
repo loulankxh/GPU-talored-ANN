@@ -162,3 +162,6 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   then re-apply the slot patch. Single-run gains of 2–3% are below the gates — the remaining easy wins are that size.
 - **#9 (possible gain +6.9%):** host cache for a whole round removes most of the host get (47/63 → 20/23 s); with 6 slots
   Step 6 348 → 263 s. Bundle with #7 next.
+- **#10 (accepted, +7.7% → 1233.4 s):** #9 + #7 bundled. Remaining SIFT100M: bucket2 875 (Step 6 268, Step 4 218,
+  Step 4.5 135, Step 2 128, Step 1 72, wait 27), optimize_chunked 160, prune 141, translate 58. Next candidates: Step 4
+  (search 61 / 42 s, BucketWrite 68 s), Step 4.5 (pass3_write 57 + resample 68 s overlap — B5), B10 (memory, SIFT1B).
