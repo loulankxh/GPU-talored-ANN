@@ -6479,9 +6479,12 @@ int run_pipeline_impl(
                 if (ext == ".fbin" || ext == ".bin") {
                     int32_t n_tmp, d_tmp;
                     load::read_fbin_sampled(path, sorted_order, X_sampled, n_tmp, d_tmp);
+                } else if (ext == ".u8bin" || ext == ".i8bin") {
+                    // 只读采样行 (原来整份读成 float 再挑: SIFT100M 51 GB 缓冲, Step 1 + Step 4.5 resample 各 ~70 s)
+                    int32_t n_tmp, d_tmp;
+                    load::read_u8bin_sampled_to_f32(path, sorted_order, X_sampled, n_tmp, d_tmp);
                 } else {
-                    // u8bin/ibin: fallback 到全量读取再采样
-                    // TODO: 为其他格式实现 sampled reader
+                    // ibin: fallback 到全量读取再采样
                     std::vector<float> X_full_tmp;
                     if (ext == ".u8bin" || ext == ".i8bin") {
                         int32_t n2, d2;

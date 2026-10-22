@@ -15,6 +15,8 @@
 
 #pragma once
 #include <cstdint>
+#include <unistd.h>
+#include <fcntl.h>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -134,6 +136,70 @@ inline void read_fbin_sampled(const std::string& path,
         in.read(reinterpret_cast<char*>(out.data() + i * d), row_bytes);
         require(in.good(), "Failed to read sampled row " + std::to_string(sorted_indices[i]));
     }
+}
+
+// .u8bin / .i8bin 的采样读取: 只把 sorted_indices 指到的行转成 float (跟 read_u8bin_to_f32 一样的
+// static_cast<float>(uint8)，结果逐位相同)，不再整份读进 N×D 的 float 缓冲 (SIFT100M: 51 GB) 再挑行。
+// 文件按 8 MB 的行块并行 pread (OpenMP)，每块只转换落在块里的采样行；out 第 i 行 = sorted_indices[i]。
+// 参考 TAGORE prep: 只把需要的点从磁盘读进来。
+inline void read_u8bin_sampled_to_f32(const std::string& path,
+                                      const std::vector<int64_t>& sorted_indices,
+                                      std::vector<float>& out,
+                                      int32_t& N, int32_t& D) {
+    {
+        std::ifstream in(path, std::ios::binary);
+        require(in.is_open(), "Cannot open file: " + path);
+        auto [n, d] = read_bigann_header(in);
+        N = n; D = d;
+    }
+    const int64_t n_samples = static_cast<int64_t>(sorted_indices.size());
+    require(std::is_sorted(sorted_indices.begin(), sorted_indices.end()), "read_u8bin_sampled_to_f32: indices not sorted");
+    require(n_samples == 0 || (sorted_indices.front() >= 0 && sorted_indices.back() < N),   // bounds check
+            "read_u8bin_sampled_to_f32: index out of range");
+    out.resize(static_cast<size_t>(n_samples) * D);
+    if (n_samples == 0) return;
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    require(fd >= 0, "Cannot open file: " + path);
+    const int64_t row_bytes = D;   // 1 B per component
+    const int64_t chunk_rows = std::max<int64_t>(1, (8 << 20) / row_bytes);
+    const int64_t n_chunks = (static_cast<int64_t>(N) + chunk_rows - 1) / chunk_rows;
+    const off_t header_bytes = 2 * sizeof(int32_t);
+    bool ok = true;
+    #pragma omp parallel
+    {
+        std::vector<uint8_t> buf(static_cast<size_t>(chunk_rows * row_bytes));
+        #pragma omp for schedule(dynamic, 1)
+        for (int64_t ch = 0; ch < n_chunks; ++ch) {
+            const int64_t r0 = ch * chunk_rows, r1 = std::min<int64_t>(N, r0 + chunk_rows);
+            // 这一块里的采样行 = sorted_indices 的 [i0, i1)
+            const int64_t i0 = std::lower_bound(sorted_indices.begin(), sorted_indices.end(), r0) - sorted_indices.begin();
+            const int64_t i1 = std::lower_bound(sorted_indices.begin(), sorted_indices.end(), r1) - sorted_indices.begin();
+            if (i0 == i1) continue;
+            // 只读到最后一个采样行为止
+            const int64_t last = sorted_indices[static_cast<size_t>(i1 - 1)];
+            const size_t want = static_cast<size_t>((last - r0 + 1) * row_bytes);
+            size_t got = 0;
+            while (got < want) {
+                ssize_t r = ::pread(fd, buf.data() + got, want - got,
+                                    header_bytes + static_cast<off_t>(r0 * row_bytes) + static_cast<off_t>(got));
+                if (r <= 0) break;
+                got += static_cast<size_t>(r);
+            }
+            if (got != want) {
+                #pragma omp atomic write
+                ok = false;
+                continue;
+            }
+            for (int64_t i = i0; i < i1; ++i) {
+                const uint8_t* src = buf.data() + static_cast<size_t>((sorted_indices[static_cast<size_t>(i)] - r0) * row_bytes);
+                float* dst = out.data() + static_cast<size_t>(i) * D;
+                for (int32_t k = 0; k < D; ++k) dst[k] = static_cast<float>(src[k]);
+            }
+        }
+    }
+    ::close(fd);
+    require(ok, "read_u8bin_sampled_to_f32: short read from " + path);
 }
 
 // ---------- chunked sequential readers (contiguous row range) ----------

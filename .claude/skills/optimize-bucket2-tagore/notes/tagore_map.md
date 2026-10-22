@@ -172,3 +172,5 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   RAM (TAGORE's bounded reverse list, made exact by the protected-set argument) — optimize_chunked 160 → 63 s, RSS 79 →
   38 GB, page-cache noise gone. Next: re-apply #11 (sampled u8bin reader, bucket2 −150 s, RSS −35 GB) now that the noise
   source is gone; then Step 4 (219 s), Step 6 (235 s), prune (140 s), Step 4.5 (132 s).
+- **#13 (accepted, +8.8% → 998.6 s, 0.46× TAGORE):** #11 re-applied. SIFT100M now: Step 6 245, Step 4 220, prune 138,
+  Step 2 127, optimize_chunked 78, Step 4.5 72, translate 47, wait 30, Step 3 14, Step 1 12. RSS 40 GB.
