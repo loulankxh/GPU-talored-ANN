@@ -1466,7 +1466,8 @@ static void run_method_E(
     const ChunkPlan& plan,
     size_t gpu_budget_bytes,
     size_t edge_buffer_bytes,
-    const std::string& tmp_dir)
+    const std::string& tmp_dir,
+    size_t host_budget_bytes)
 {
     using Clock = std::chrono::steady_clock;
     const int32_t num_chunks = static_cast<int32_t>(plan.starts.size()) - 1;
@@ -1593,16 +1594,26 @@ static void run_method_E(
 
     edge_chunk::EdgeVec mem_edges;
     if (edges_in_memory && !single_drain) mem_edges.reserve(total_edges);
-    std::cout << "  [Method E] edges " << (edges_in_memory ? "in memory" : "via disk accumulator") << "\n";
+    // 多 chunk 时: 每个点只留 (rank, src) 最小的 K_out 条反向边、放内存 (TopKReverseStore，输出逐字节相同)，
+    // 不再写 chunk 文件再读回——SIFT100M 32 GB 的边文件读回时命中/不命中 page cache 能差 ±115 s。
+    // 放不下 host 预算的一半 (例如 SIFT1B) 时照旧走磁盘 accumulator。
+    const bool use_store = !edges_in_memory &&
+        edge_chunk::TopKReverseStore::bytes_needed(N, static_cast<uint32_t>(K_out)) <= host_budget_bytes / 2;
+    edge_chunk::TopKReverseStore store;
+    if (use_store) store.init(N, static_cast<uint32_t>(K_out));
+    std::cout << "  [Method E] edges " << (edges_in_memory ? "in memory"
+                                           : use_store ? "in memory, top-K_out per destination"
+                                                       : "via disk accumulator") << "\n";
 
     auto t_acc_create0 = Clock::now();
-    auto acc = edges_in_memory
+    auto acc = (edges_in_memory || use_store)
         ? edge_chunk::EdgeChunkAccumulator{}
         : edge_chunk::EdgeChunkAccumulator::create(tmp_dir, num_chunks, edge_buffer_bytes,
               static_cast<size_t>(N) * static_cast<size_t>(K_out));
-    if (!edges_in_memory) acc.start();
+    if (!edges_in_memory && !use_store) acc.start();
     auto add_edges = [&](int32_t c, const edge_chunk::EdgeRecord* recs, size_t n) {
         if (edges_in_memory) mem_edges.insert(mem_edges.end(), recs, recs + n);
+        else if (use_store) store.add(recs, n);
         else acc.add_records(c, recs, n);
     };
     double t_acc_create = std::chrono::duration<double>(Clock::now() - t_acc_create0).count();
@@ -1663,6 +1674,8 @@ static void run_method_E(
             if (ofc > 0) {
                 CUDA_CHECK(cudaMemcpy(h_overflow_buf, d_overflow_buf,
                     static_cast<size_t>(ofc) * sizeof(edge_chunk::EdgeRecord), cudaMemcpyDeviceToHost));
+                if (use_store) store.add(h_overflow_buf, ofc);   // 整批插入 (chunk 无关)
+                else
                 for (uint32_t e = 0; e < ofc; ++e) {
                     uint32_t c = edge_chunk::chunk_of(plan.starts.data(),
                         static_cast<uint32_t>(num_chunks), h_overflow_buf[e].dst);
@@ -1790,9 +1803,9 @@ static void run_method_E(
     }
 
     auto t_finish0 = Clock::now();
-    if (!edges_in_memory) acc.finish();
-    else if (gpu_phase2 ? d_gpu_out == nullptr
-                        : mem_edges.size() != static_cast<size_t>(N) * static_cast<size_t>(K_out))
+    if (!edges_in_memory && !use_store) acc.finish();
+    else if (edges_in_memory && gpu_phase2 ? d_gpu_out == nullptr
+                        : edges_in_memory && mem_edges.size() != static_cast<size_t>(N) * static_cast<size_t>(K_out))
         throw std::runtime_error("Method E: in-memory edge count " + std::to_string(mem_edges.size()) +
                                  " != N*K_out");
     double t_acc_finish = std::chrono::duration<double>(Clock::now() - t_finish0).count();
@@ -1851,6 +1864,24 @@ static void run_method_E(
                 throw std::runtime_error("Method E Phase 2: failed to read forward rows for chunk " + std::to_string(c));
 
             p2_fwd += p2s(q0); q0 = Clock::now();
+            if (use_store) {
+                // 每行的反向源直接从 store 取 ((rank, src) 升序)，合并规则不变
+                #pragma omp parallel
+                {
+                    std::vector<uint32_t> src(static_cast<size_t>(K_out));
+                    #pragma omp for schedule(dynamic, 4096)
+                    for (int64_t lj = 0; lj < static_cast<int64_t>(chunk_sz); ++lj) {
+                        uint32_t n_src = store.sources(j_lo + static_cast<uint32_t>(lj), src.data());
+                        edge_chunk::merge_rank_ordered_into_row(
+                            row_block.data() + static_cast<size_t>(lj) * K_out,
+                            src.data(), n_src, static_cast<uint32_t>(K_out));
+                    }
+                }
+                p2_merge += p2s(q0); q0 = Clock::now();
+                writer.write_rows(row_block.data(), j_lo, chunk_sz);
+                p2_write += p2s(q0);
+                continue;
+            }
             if (edges_in_memory) chunk_edges = std::move(mem_edges);   // num_chunks == 1
             else acc.read_chunk(c, chunk_edges);
             p2_edges += p2s(q0); q0 = Clock::now();
@@ -1914,6 +1945,9 @@ int main(int argc, char** argv)
                 "require the full graph resident in host memory like A/B/C/D do)")
             ("gpu-budget-mb", po::value<size_t>()->default_value(8000),
                 "GPU memory budget for chunk buffers (MB)")
+            ("host-budget-mb", po::value<size_t>()->default_value(204800),
+                "Method E: host-memory ceiling (MB) for the whole process; the per-destination top-K_out reverse-edge "
+                "store is used when it needs <= half of it (default 200 GB, user decision 2026-10-22: a ceiling, not a target)")
             ("edge-buffer-mb", po::value<size_t>()->default_value(1024),
                 "Method E only: total host-side staging budget (MB), shared across all "
                 "chunks' disk-flush buffers -- same semantics as bucket2's --bucket-vec-buffer")
@@ -1942,6 +1976,7 @@ int main(int argc, char** argv)
         const size_t gpu_budget_b   = gpu_budget_mb << 20;
         const size_t edge_buffer_mb = vm["edge-buffer-mb"].as<size_t>();
         const size_t edge_buffer_b  = edge_buffer_mb << 20;
+        const size_t host_budget_b  = vm["host-budget-mb"].as<size_t>() << 20;
         std::string tmp_dir_arg     = vm["tmp-dir"].as<std::string>();
         const std::string bo_path   = vm["bucket-offsets"].as<std::string>();
         int32_t rev_cap_arg         = vm["rev-degree-cap"].as<int32_t>();
@@ -1991,7 +2026,7 @@ int main(int argc, char** argv)
 
             std::cout << "=== Step 3: Reverse graph + merge (method E) ===\n";
             auto t2 = Clock::now();
-            run_method_E(fwd_path, out_path, N, K_out, plan, gpu_budget_b, edge_buffer_b, tmp_dir);
+            run_method_E(fwd_path, out_path, N, K_out, plan, gpu_budget_b, edge_buffer_b, tmp_dir, host_budget_b);
             std::cout << "  Done [" << std::chrono::duration<double>(Clock::now() - t2).count()
                       << "s]\n";
 

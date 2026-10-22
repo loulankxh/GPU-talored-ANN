@@ -30,34 +30,34 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#10 (#9 Step 6 host cache + 6 slots, bundled with #7 optimize_chunked radix CSR)**, 2026-10-22 (`runs/tagore10`):
+After **#12 (optimize_chunked: per-destination top-K_out reverse edges in memory, no edge files; B10 step 3 partly)**, 2026-10-22 (`runs/tagore12`):
 
 **Build time (s, median; sum of all stages)**
 
 | config | path | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
 |---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | resident | 5.13 | +0.8% | +18.1% | 0.56x | 0.44x | bucket2 5.13 | 5052 | 1.68 |
-| sift1M_large | large | 8.70 | -1.0% | +10.2% | 0.95x | 0.75x | bucket2 6.83, prune 0.72, optimize_chunked 0.72, translate 0.48 | 1286 | 1.98 |
-| sift10M_auto | large | 73.88 | +0.5% | +10.4% | 0.34x | 0.60x | bucket2 63.35, prune 3.97, optimize_chunked 2.95, translate 3.61 | 8996 | 11.68 |
-| sift100M_auto | large | 1233.41 | +7.7% | +61.6% | 0.57x | — | bucket2 875.30, prune 140.58, optimize_chunked 159.83, translate 57.70 | 14588 | 78.86 |
+| sift1M_auto | resident | 5.21 | -1.6% | +16.8% | 0.57x | 0.45x | bucket2 5.21 | 4584 | 1.68 |
+| sift1M_large | large | 8.96 | -3.0% | +7.5% | 0.98x | 0.78x | bucket2 7.04, prune 0.72, optimize_chunked 0.74, translate 0.49 | 1286 | 1.98 |
+| sift10M_auto | large | 73.06 | +1.1% | +11.4% | 0.34x | 0.60x | bucket2 62.97, prune 3.83, optimize_chunked 2.90, translate 3.36 | 8996 | 11.73 |
+| sift100M_auto | large | 1094.79 | +11.2% | +65.9% | 0.51x | — | bucket2 834.71, prune 140.10, optimize_chunked 63.10, translate 56.88 | 14588 | 73.47 |
 
 **bucket2 step breakdown (s)**
 
 | config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | 0.63 | 0.24 | 0.09 | 0.00 | 0.39 | 0.20 | 0.02 | 2.05 | 0.00 | 0.97 |
-| sift1M_large | 0.14 | 0.51 | 0.19 | 0.00 | 0.95 | 0.17 | 0.02 | 3.68 | 0.56 | 0.00 |
-| sift10M_auto | 1.38 | 3.83 | 0.66 | 0.00 | 18.13 | 1.71 | 0.21 | 31.49 | 5.05 | 0.00 |
-| sift100M_auto | 72.06 | 127.76 | 14.32 | 0.00 | 218.01 | 134.79 | 4.55 | 268.39 | 26.84 | 0.00 |
+| sift1M_auto | 0.64 | 0.23 | 0.10 | 0.00 | 0.43 | 0.23 | 0.02 | 2.06 | 0.00 | 0.94 |
+| sift1M_large | 0.14 | 0.47 | 0.17 | 0.00 | 1.10 | 0.21 | 0.02 | 3.65 | 0.54 | 0.00 |
+| sift10M_auto | 1.39 | 3.83 | 0.59 | 0.00 | 18.50 | 1.69 | 0.21 | 31.16 | 4.70 | 0.00 |
+| sift100M_auto | 71.05 | 124.51 | 14.34 | 0.00 | 218.59 | 132.29 | 5.25 | 235.01 | 25.71 | 0.00 |
 
 **(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
 
 | config | recall@1 | recall@10 | recall@32 | recall@64 |
 |---|---|---|---|---|
-| sift1M_auto | 0.9546 | 0.9434 | 0.9339 | 0.9259 |
-| sift1M_large | 0.9523 | 0.9443 | 0.9348 | 0.9268 |
-| sift10M_auto | 0.8849 | 0.8581 | 0.8384 | 0.8251 |
-| sift100M_auto | 0.6923 | 0.6592 | 0.6332 | 0.6165 |
+| sift1M_auto | 0.9543 | 0.9435 | 0.9339 | 0.9262 |
+| sift1M_large | 0.9556 | 0.9438 | 0.9335 | 0.9259 |
+| sift10M_auto | 0.8828 | 0.8556 | 0.8365 | 0.8232 |
+| sift100M_auto | 0.6905 | 0.6575 | 0.6316 | 0.6155 |
 
 **(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); sift1M/10M: cuVS CAGRA search, sift100M: DiskANN CPU search (itopk = L)**
 
@@ -68,10 +68,10 @@ After **#10 (#9 Step 6 host cache + 6 slots, bundled with #7 optimize_chunked ra
 | TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
 | CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
 | CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
-| ours sift1M_auto | 0.9266 / 1947K | 0.9765 / 1035K | 0.9940 / 519K | 0.9987 / 180K | 0.9997 / 68K |
-| ours sift1M_large | 0.9134 / 2218K | 0.9702 / 1188K | 0.9917 / 562K | 0.9980 / 189K | 0.9996 / 68K |
-| ours sift10M_auto | 0.8327 / 1866K | 0.9250 / 1012K | 0.9714 / 437K | 0.9909 / 184K | 0.9976 / 67K |
-| ours sift100M_auto | 0.7315 / 32K | 0.8399 / 64K | 0.9166 / 39K | 0.9627 / 23K | 0.9853 / 13K |
+| ours sift1M_auto | 0.9264 / 1947K | 0.9766 / 841K | 0.9942 / 502K | 0.9987 / 179K | 0.9997 / 68K |
+| ours sift1M_large | 0.9141 / 2222K | 0.9705 / 1192K | 0.9918 / 563K | 0.9981 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8343 / 1869K | 0.9247 / 1012K | 0.9717 / 484K | 0.9913 / 183K | 0.9979 / 68K |
+| ours sift100M_auto | 0.7312 / 96K | 0.8402 / 75K | 0.9158 / 43K | 0.9623 / 24K | 0.9853 / 13K |
 
 ## Baseline verification
 
@@ -152,8 +152,7 @@ SIFT100M Step 6 = 1687 s of 3215 s, and ~1000 s of it is the producer waiting on
 | B8 | (user idea, relayed 2026-10-22) **Sparse running rewrite** — "只重写这一轮真的变了的那些行。每个 chunk 里先按 id 排序，再成段写回，而不是把整个 running 重写一遍": rewrite only rows whose top-M changed, sorted by id per chunk, written back as contiguous runs (pwrite) | `order_merge_new` (only the touched lists are rewritten) | merge iter ≥ 1 (matters when ITERATIONS ≥ 3) | depends on B7 |
 | B9 | (user idea, relayed 2026-10-22) **Generalize #4's deferral:** after each round ≥ 2 keep all not-yet-merged arrival files while their total ≤ one full first-round arrival (≈ running size); merge (running + all pending → running, or → vector_knn at the end) only when the bound would be exceeded or at the final round. Open points: next-round threshold = read-only pass over running + pending (like #4) vs keep the older looser kth (exact too, more arrival bytes) — measure; final merge reads pending files one at a time into the same buffer (per-thread memory unchanged, RSS guard) | `order_merge_new` (merge in one final pass) | merges for ITERATIONS ≥ 3 | SIFT10M merges / disk I/O |
 | B9a | (sub-item of B9, user decision relayed 2026-10-22, **low priority** — only ITERATIONS ≥ 3) next-round threshold while running is not rewritten — **implement C, or measure A / B / C and keep the fastest**; log the measured cost of each and the choice. A: read-only pass per round over running + pending arrivals per chunk (exact kth, no write; reads ~running size). B: keep the older, looser kth (exact result; later arrivals grow and hit the pending bound sooner). C: keep in host memory a tail of up to r of the last distances of each point's top-M (+ its current length t; r = 8 → N·r·4 B = 3.2 GB at SIFT100M, counted in the RSS guard); with j new candidates (all < old kth) the new kth is exact only if j < t (value at old rank M − j), tail length becomes t − j; else fall back to B for that point; refill the tail to r whenever running is actually rewritten; log fall-backs per round. New candidates' distances come from the arrival records (update at write time or at round end) | `order_merge_new` | B9 thresholds | all keep vector_knn identical |
-| B10 | **(user-approved plan, relayed 2026-10-22) required before SIFT1B: host-memory-bounded `optimize_chunked -m E` disk path** (implementation, output byte-identical). Facts: Method E chunk capacity comes from `plan_bucket_aligned_chunks(offsets, K_out, gpu_budget_b)` (0.6 × GPU budget / (4K+4) B ≈ 72.7M nodes: SIFT100M 2 chunks, SIFT1B ~14) — a leftover of methods A–D; on the disk path host RAM is the limit. Max RSS is already 79 GB at SIFT100M; Phase 2 holds a whole chunk's reverse edges (10 B) + keys (8 B) + src (4 B) ≈ 22 B/edge (~35 GB for 1.6G edges) + row_block + Phase 1 buffers (edge buffer 16 GB, pinned drain ~4.2 / overflow ~4.7 GB), and scales with the chunk's in-degree sum (hot spots, unknown before Phase 1). **Correctness argument:** `merge_rank_ordered_into_row` keeps the P = K_out/2 protected forward edges and fills the other K_out − P slots weakest-first, so the result is exactly the K_out − P best-ranked reverse sources not in the protected set (moves of present entries evict nothing; sources unique per row); the protected set has ≤ P members ⇒ keeping only the **L = K_out lowest (rank, src)** reverse edges per destination reproduces today's output byte for byte (same tie order as key (row, rank, src)); L read from the forward-graph header at runtime (holds for any P, e.g. CAGRA's max(mst_edges, d/2)); no hard-coded 32, no 5-bit rank limit (rank is uint16). **Steps:** (1) measure first, no behavior change: per-phase RSS + per-buffer sizes (Phase 1 buffers, after acc.finish, Phase 2 per chunk: edges / keys / CSR / row_block) on SIFT10M and SIFT100M, each chunk's edge count vs S×K_out — find what the 79 GB is; (2) new `--host-budget-mb` (params.sh `CHUNKED_HOST_BUDGET_MB`, **default 200 GB, user decision 2026-10-22 — a ceiling, not a target**: size buffers by need, cap by the budget; the judge's 1.2× RSS guard still applies) for the whole process; Phase 1 buffers (edge accumulator, pinned drain / overflow, fwd batch) derived from it instead of the fixed `--edge-buffer-mb`, and really released before Phase 2; (3) Phase 2 = streaming bounded top-L per destination: read the chunk file in fixed blocks, per destination keep the L smallest keys (rank << 32 \| src), at the end sort each node's ≤ L keys and run `merge_rank_ordered_into_row` unchanged; Phase 1 unchanged; per-node memory ≈ 12 × K_out B independent of in-degree → chunk capacity = Phase-2 share of the budget / (12 × K_out B), a hard guarantee; threads partition each read block by destination range (no locks); (4) compare two per-node structures and log both: bounded max-heap of size L (reject key ≥ top in O(1), else replace + sift-down; expected inserts ≈ L·(1 + ln(c/L)); final sort) vs sorted small array (shift ≤ L entries, no final sort) — against #7's radix CSR (all edges + keys + src resident); verify with the Phase 2 breakdown timers and RSS; (5) audit the other stages for SIFT1B (bucket2, prune, translate host-memory bounds; 64-bit N×K products such as `overflow_cap = batch_rows * K_out`, uint32 today). Supersedes #7's CSR patch | `order_merge_new` (bounded per-cluster buffers, streamed once) | optimize_chunked (SIFT100M 192 s, RSS 79 GB) | SIFT1B feasibility; Phase 2 time + memory |
-| B5 | Step 4.5: background writer so `pass3_write` (67 s) overlaps `resample` (92 s) | `cached_ofstream`, CPU merge thread overlapped with GPU | Step 4.5 195 | −50…−65 s |
+| B10 | **(user-approved plan, relayed 2026-10-22) required before SIFT1B: host-memory-bounded `optimize_chunked -m E` disk path** (implementation, output byte-identical). Facts: Method E chunk capacity comes from `plan_bucket_aligned_chunks(offsets, K_out, gpu_budget_b)` (0.6 × GPU budget / (4K+4) B ≈ 72.7M nodes: SIFT100M 2 chunks, SIFT1B ~14) — a leftover of methods A–D; on the disk path host RAM is the limit. Max RSS is already 79 GB at SIFT100M; Phase 2 holds a whole chunk's reverse edges (10 B) + keys (8 B) + src (4 B) ≈ 22 B/edge (~35 GB for 1.6G edges) + row_block + Phase 1 buffers (edge buffer 16 GB, pinned drain ~4.2 / overflow ~4.7 GB), and scales with the chunk's in-degree sum (hot spots, unknown before Phase 1). **Correctness argument:** `merge_rank_ordered_into_row` keeps the P = K_out/2 protected forward edges and fills the other K_out − P slots weakest-first, so the result is exactly the K_out − P best-ranked reverse sources not in the protected set (moves of present entries evict nothing; sources unique per row); the protected set has ≤ P members ⇒ keeping only the **L = K_out lowest (rank, src)** reverse edges per destination reproduces today's output byte for byte (same tie order as key (row, rank, src)); L read from the forward-graph header at runtime (holds for any P, e.g. CAGRA's max(mst_edges, d/2)); no hard-coded 32, no 5-bit rank limit (rank is uint16). **Steps:** (1) measure first, no behavior change: per-phase RSS + per-buffer sizes (Phase 1 buffers, after acc.finish, Phase 2 per chunk: edges / keys / CSR / row_block) on SIFT10M and SIFT100M, each chunk's edge count vs S×K_out — find what the 79 GB is; (2) new `--host-budget-mb` (params.sh `CHUNKED_HOST_BUDGET_MB`, **default 200 GB, user decision 2026-10-22 — a ceiling, not a target**: size buffers by need, cap by the budget; the judge's 1.2× RSS guard still applies) for the whole process; Phase 1 buffers (edge accumulator, pinned drain / overflow, fwd batch) derived from it instead of the fixed `--edge-buffer-mb`, and really released before Phase 2; (3) Phase 2 = streaming bounded top-L per destination: read the chunk file in fixed blocks, per destination keep the L smallest keys (rank << 32 \| src), at the end sort each node's ≤ L keys and run `merge_rank_ordered_into_row` unchanged; Phase 1 unchanged; per-node memory ≈ 12 × K_out B independent of in-degree → chunk capacity = Phase-2 share of the budget / (12 × K_out B), a hard guarantee; threads partition each read block by destination range (no locks); (4) compare two per-node structures and log both: bounded max-heap of size L (reject key ≥ top in O(1), else replace + sift-down; expected inserts ≈ L·(1 + ln(c/L)); final sort) vs sorted small array (shift ≤ L entries, no final sort) — against #7's radix CSR (all edges + keys + src resident); verify with the Phase 2 breakdown timers and RSS; (5) audit the other stages for SIFT1B (bucket2, prune, translate host-memory bounds; 64-bit N×K products such as `overflow_cap = batch_rows * K_out`, uint32 today). Supersedes #7's CSR patch | `order_merge_new` (bounded per-cluster buffers, streamed once) | optimize_chunked (SIFT100M 192 s, RSS 79 GB) | SIFT1B feasibility; Phase 2 time + memory | **Progress (#12):** step 3 done for the case that fits half of `--host-budget-mb` (new option, default 200 GB): `TopKReverseStore` (sorted small array per destination, radix-partitioned parallel insertion, no locks) — edges never touch disk; disk path kept as fallback (SIFT1B). Still open: step 1 (per-buffer RSS measurement), step 2 (derive Phase 1 buffers from the budget), step 4 (heap vs sorted-array comparison — only the sorted array is implemented), step 5 (SIFT1B audit) || B5 | Step 4.5: background writer so `pass3_write` (67 s) overlaps `resample` (92 s) | `cached_ofstream`, CPU merge thread overlapped with GPU | Step 4.5 195 | −50…−65 s |
 | B6 | `optimize_chunked -m E`: reverse edges collected on the GPU per chunk (unbounded, same rule), disk edge accumulator only when a chunk does not fit | `filter_cagra` reverse push + `filter_reverse_1hop` | optimize_chunked 280 (acc.finish 91, Phase 1 53) | −80…−140 s |
 
 ## Awaiting approval
@@ -625,3 +624,65 @@ float), cancelled in this run by optimize_chunked's Phase 2 reading its 32 GB ed
 this change). Page-cache hits / misses of those files now swing SIFT100M by ±115 s per run (#6, #7, #10, #11), more than
 the 7 % gate (~86 s). Next: make optimize_chunked Phase 2 independent of the page cache (B10: bounded per-node top-K_out
 cuts Phase 2 memory so the edges can stay in RAM).
+
+### #12 — optimize_chunked: per-destination top-K_out reverse edges in memory instead of edge files (2026-10-22)
+
+**Idea:** Phase 1 of `optimize_chunked -m E` wrote all 3.2 G reverse-edge records (32 GB) to per-chunk files that Phase 2
+read back; whether those reads hit the page cache swung SIFT100M by ±115 s per run (#6: 124 s, #7/#10: 33 s, #11: 150 s).
+By the B10 protected-set argument (user plan, relayed 2026-10-22) only the K_out lowest (rank, src) reverse edges of each
+destination can influence `merge_rank_ordered_into_row`, so `TopKReverseStore` keeps exactly those in RAM (key =
+rank << 32 | src, sorted small array per node; N × K_out × 8 B + N × 2 B = 25.8 GB at SIFT100M, independent of in-degree).
+Drained batches (and the overflow buffer as one batch) are radix-partitioned by destination range (per-thread histograms)
+and inserted lock-free, one thread per range. Phase 2 reads the forward rows per chunk and merges each row with the
+store's (rank, src)-ordered sources — `merge_rank_ordered_into_row` unchanged. Used when the store needs ≤ half of the new
+`--host-budget-mb` (default 204800 MB = 200 GB, user decision: a ceiling, not a target); otherwise the old disk path
+(e.g. SIFT1B). Output **byte-identical** (SIFT10M forced to 2 chunks vs the disk path: `cmp` identical; 6.9 vs 23.1 s).
+**TAGORE source:** `filter_cagra` / `filter_reverse_1hop` (bounded per-node reverse lists kept on the device, no host
+round trip); here the bound keeps exactly the top K_out, so the result is unchanged (as in cuVS CAGRA's
+`kern_make_rev_graph_k`). **Class:** implementation (B10 step 3, partly).
+**SIFT100M:** optimize_chunked 159.8 → **63.1 s** (Phase 1 48.1 → 27.6 s, acc.create / finish 18.7 → 0 s, Phase 2 83.9 →
+24.6 s: read_fwd 10.8 / merge 1.7 / write 11.6 s), optimize_chunked max RSS 78.9 → **38.1 GB**; total 1233.41 → **1094.79 s
+(+11.2 %, +65.9 % vs #0, 0.51× TAGORE)**; pipeline max RSS 79.1 → 73.5 GB (now bucket2). DiskANN recall unchanged (graph
+identical by construction). SIFT1M auto −1.6 %, 1M large −3.0 % (both paths do not use the store; within tolerance),
+10M +1.1 %.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 5.21 | -1.6% | +16.8% | 0.57x | 0.45x | bucket2 5.21 | 4584 | 1.68 |
+| sift1M_large | large | 8.96 | -3.0% | +7.5% | 0.98x | 0.78x | bucket2 7.04, prune 0.72, optimize_chunked 0.74, translate 0.49 | 1286 | 1.98 |
+| sift10M_auto | large | 73.06 | +1.1% | +11.4% | 0.34x | 0.60x | bucket2 62.97, prune 3.83, optimize_chunked 2.90, translate 3.36 | 8996 | 11.73 |
+| sift100M_auto | large | 1094.79 | +11.2% | +65.9% | 0.51x | — | bucket2 834.71, prune 140.10, optimize_chunked 63.10, translate 56.88 | 14588 | 73.47 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.64 | 0.23 | 0.10 | 0.00 | 0.43 | 0.23 | 0.02 | 2.06 | 0.00 | 0.94 |
+| sift1M_large | 0.14 | 0.47 | 0.17 | 0.00 | 1.10 | 0.21 | 0.02 | 3.65 | 0.54 | 0.00 |
+| sift10M_auto | 1.39 | 3.83 | 0.59 | 0.00 | 18.50 | 1.69 | 0.21 | 31.16 | 4.70 | 0.00 |
+| sift100M_auto | 71.05 | 124.51 | 14.34 | 0.00 | 218.59 | 132.29 | 5.25 | 235.01 | 25.71 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9543 | 0.9435 | 0.9339 | 0.9262 |
+| sift1M_large | 0.9556 | 0.9438 | 0.9335 | 0.9259 |
+| sift10M_auto | 0.8828 | 0.8556 | 0.8365 | 0.8232 |
+| sift100M_auto | 0.6905 | 0.6575 | 0.6316 | 0.6155 |
+
+**(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); sift1M/10M: cuVS CAGRA search, sift100M: DiskANN CPU search (itopk = L)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| TAGORE GNN-Descent k=96 + CAGRA prune, sift1M | 0.9220 / 1947K | 0.9752 / 1033K | 0.9936 / 497K | 0.9985 / 186K | 0.9996 / 68K |
+| TAGORE largeIndex Vamana, sift10M | 0.8448 / 1875K | 0.9238 / 1014K | 0.9662 / 482K | 0.9863 / 185K | 0.9950 / 68K |
+| TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9264 / 1947K | 0.9766 / 841K | 0.9942 / 502K | 0.9987 / 179K | 0.9997 / 68K |
+| ours sift1M_large | 0.9141 / 2222K | 0.9705 / 1192K | 0.9918 / 563K | 0.9981 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8343 / 1869K | 0.9247 / 1012K | 0.9717 / 484K | 0.9913 / 183K | 0.9979 / 68K |
+| ours sift100M_auto | 0.7312 / 96K | 0.8402 / 75K | 0.9158 / 43K | 0.9623 / 24K | 0.9853 / 13K |

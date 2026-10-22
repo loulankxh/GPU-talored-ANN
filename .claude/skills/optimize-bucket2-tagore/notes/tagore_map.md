@@ -168,3 +168,7 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
 - **#11 (rejected by rule, flagged):** sampled u8bin reader: bucket2 875 → 725 s, RSS 77 → 42 GB. Masked by optimize_chunked
   Phase 2 reading edges from disk (150 s vs 33 s). The optimize_chunked page-cache dependence is now the dominant noise
   source → fix it next (B10).
+- **#12 (accepted, +11.2% → 1094.8 s, 0.51× TAGORE):** reverse edges kept as a bounded exact top-K_out per destination in
+  RAM (TAGORE's bounded reverse list, made exact by the protected-set argument) — optimize_chunked 160 → 63 s, RSS 79 →
+  38 GB, page-cache noise gone. Next: re-apply #11 (sampled u8bin reader, bucket2 −150 s, RSS −35 GB) now that the noise
+  source is gone; then Step 4 (219 s), Step 6 (235 s), prune (140 s), Step 4.5 (132 s).
