@@ -134,11 +134,26 @@ Notes:
 
 ## Ideas backlog
 
-(empty — filled by step T0)
+Ranked by expected SIFT100M saving (T0 study, 2026-10-22; details in `.claude/skills/optimize-bucket2-tagore/notes/tagore_map.md`).
+SIFT100M Step 6 = 1687 s of 3215 s, and ~1000 s of it is the producer waiting on GPU bucket-cache misses
+(≈20 uploads per bucket per round, ~24 µs each: host Belady get + id vector + `cudaMallocAsync` + 2 pageable H2D).
+
+| id | idea | TAGORE source | target stage (SIFT100M s) | expected gain |
+|---|---|---|---|---|
+| B1 | Step 6 GPU-cache misses in batches: fixed device slab allocator (no per-bucket `cudaMallocAsync`), misses of a position packed into pinned staging with parallel memcpy, one H2D, int64→int32 ids on the GPU; first add host-get vs H2D sub-timers | `gpu_construct` (fixed per-GPU buffers sized once, one big H2D per cluster), `graph_pool` fixed slots | Step 6 upload 479 + 536 | −300…−700 s |
+| B2 | GPU bucket cache budget vs dots slot buffers (resource params: `--gpu-cache-mb`, dots slot cap): fewer evictions | `largeIndex` `buffer_size` / `max_points` sizing, `reorder` slot choice | Step 6 wait_producer 660 + 735 | −100…−400 s |
+| B3 | Host side of the miss path: round bucket records held in RAM (bucket2 host budget so the Belady cache / blob holds 13.6 GB; RSS guard ≤ 1.2× 79.4 GB) — cf. cuVS-loop #75 | `graph_pool` kept in host RAM | Step 6 cache_get − upload ≈ 230 + 250 | −100…−300 s |
+| B4 | KMeans|| d(x, C): fused tensor-core GEMM + row-min with precomputed norms (cuVS-loop `iter73` patch, maybe + `iter72`) — at SIFT100M kmeans_parallel is 180 s / round | `nn_descent_opt_cal` + `cal_power` | Step 2 368 | −100…−170 s |
+| B5 | Step 4.5: background writer so `pass3_write` (67 s) overlaps `resample` (92 s) | `cached_ofstream`, CPU merge thread overlapped with GPU | Step 4.5 195 | −50…−65 s |
+| B6 | `optimize_chunked -m E`: reverse edges collected on the GPU per chunk (unbounded, same rule), disk edge accumulator only when a chunk does not fit | `filter_cagra` reverse push + `filter_reverse_1hop` | optimize_chunked 280 (acc.finish 91, Phase 1 53) | −80…−140 s |
 
 ## Awaiting approval
 
-(empty — A1 is pre-approved, see `.claude/skills/optimize-bucket2-tagore/docs/A1_local_join.md`; entered in T0)
+| id | idea | TAGORE source | target stage | expected gain | what changes semantically | status |
+|---|---|---|---|---|---|---|
+| A1 | GNN-Descent local join (resident: TAGORE GNN-Descent; large path: fused prune + local join, RNG test + insertion, tensor-core GEMM) | `nn_descent_opt_*`, `sample_kernel6`, `merge_reverse_plus` | Step 6 (via lower NPROBE / ITERATIONS) + prune | see `docs/A1_local_join.md` §2.7 | adds a refinement stage, RNG prune on the large path | **APPROVED 2026-10-21** — `.claude/skills/optimize-bucket2-tagore/docs/A1_local_join.md`, split §2.8 |
+| A2 | Coarser large-path buckets: ~10–20K points per bucket (instead of ~100) with a small nprobe, so a bucket pair is one big GEMM and the GPU cache holds whole working sets (TAGORE clusters of ~2M points processed whole on the GPU) | `largeIndex` clusters + `gpu_construct` | Step 6 (1687 s), Step 2 (fewer centroids: 368 s) | Step 6 cache traffic largely gone; −500…−1000 s if quality holds with lower nprobe | bucketing (centroid count, `CENTROID_RATIO`) and the candidate set (`NPROBE`) change → pre-prune recall changes | awaiting user |
+| A3 | Bounded per-node reverse list on the GPU (TAGORE RESERVENUM: keep the d best-detour reverse candidates, drop overflow) so `optimize_chunked` is one GPU pass without the disk edge accumulator | `filter_cagra` reverse push (`tmp % d` replacement) + `filter_reverse_1hop` | optimize_chunked 280 s | −150…−200 s | reverse edges beyond the bound are dropped (CAGRA keeps all and ranks them) | awaiting user |
 
 ## Possible gains
 
@@ -157,3 +172,12 @@ SIFT100M 3–7% faster with everything else passing (rechecked later with multi-
 No source change. Worktree `opt/bucket2-tagore` built from main 3046497 (cuVS loop through #76) and verified against
 main's best (table above): all configs within tolerance, same path selection, 0 graph defects. This run is the loop's
 baseline (`state/best.json`, written by `judge.py --update`; search gated against CAGRA until step B).
+
+### T0 — TAGORE study pass (2026-10-22)
+
+No source change. Read TAGORE kernel by kernel (`notes/tagore_map.md`: line ranges, launch shapes, shared-memory
+layout, matching bucket2 stage + SIFT100M time, class). Main finding: SIFT100M Step 6 (1687 s) is producer-bound on
+the 2 GB GPU bucket cache — ≈20 uploads per bucket per round at ~24 µs each (479 / 536 s), while TAGORE moves whole
+~1 GB clusters with one copy into buffers allocated once. Backlog B1–B6 (implementation), A2 / A3 proposed
+(algorithm), A1 approved. TAGORE beats us on SIFT100M (2151 vs 3215 s) but loses on SIFT10M (214 vs 82 s) and SIFT1M
+(9.2 vs 6.3 s).
