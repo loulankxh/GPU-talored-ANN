@@ -170,7 +170,7 @@ SIFT100M 3–7% faster with everything else passing (rechecked later with multi-
 
 | # | idea | TAGORE source | SIFT100M | other configs | patch |
 |---|---|---|---|---|---|
-| — | (none open; #5 was accepted by the user on its own) | | | | |
+| 9 | Step 6 producer: host Belady cache holds a whole SIFT100M round (`--cache-mb 15000` in `BUCKET2_EXTRA`; 13.6 GB of records vs the default cpu_limit/2 = 8.6 GB) + #8's ≥ 6 slots on the GPU-cache miss path (TAGORE `graph_pool`: buffers in RAM, several slots) | 1336.36 → 1244.36 s (**+6.9 %**): Step 6 348 → 263 s (loop 174 / 166 → 117 / 138 s, host get 47 / 63 → 20 / 23 s); bucket2 942 → 859 s; optimize_chunked 192 → 196 s (noise); bucket2 RSS 77.0 GB (unchanged); DiskANN recall unchanged | 1M auto −0.2 %, 1M large −2.4 % (rerun; first run −4.5 % vs the optimistic #5 best, blob mode does not use this cache), 10M +0.6 % | `bucketDemo/patches/tagore9_step6_hostcache_6slots.patch` |
 
 ## Tried & rejected
 
@@ -555,3 +555,9 @@ See **Tried & rejected** (#8). Round 1 gained 33 s, round 2 is bound by the host
 Note for the user: #7 (+2.1 %, optimize_chunked −33 s) and #8 (+2.6 %, Step 6 −28 s) are both real stage gains below
 the single-run 3 % / 7 % thresholds; with SIFT100M single-run noise of ±20–30 s, multi-run medians (planned by the
 user) would let such changes be accepted; combined they are ~5 %.
+
+### #9 — REJECTED (possible gain +6.9 %): Step 6 host cache for a whole round + ≥ 6 slots (2026-10-22)
+
+See **Possible gains** (#9): a clear Step 6 win (−85 s), but the single-run total lands at +6.88 %. Next iteration
+bundles it with #7's optimize_chunked radix CSR (−33 s stage gain, byte-identical) — two independent stage gains that
+together should clear 7 %.

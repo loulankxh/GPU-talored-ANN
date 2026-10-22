@@ -160,3 +160,5 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
 - **#8 (rejected, +2.6%):** 6 slots fix round 1 of Step 6 (stream_sync −34 s) but round 2 is producer-bound (host get
   ~63 s, wait_producer 103 s). Next Step 6 step must be the host side (B1c / B3: records in one pinned arena / RAM),
   then re-apply the slot patch. Single-run gains of 2–3% are below the gates — the remaining easy wins are that size.
+- **#9 (possible gain +6.9%):** host cache for a whole round removes most of the host get (47/63 → 20/23 s); with 6 slots
+  Step 6 348 → 263 s. Bundle with #7 next.
