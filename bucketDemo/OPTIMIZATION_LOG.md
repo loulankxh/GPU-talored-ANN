@@ -77,6 +77,18 @@ Other:
 - **NPROBE 100** (measured in #11, at T=4, 1 run each): auto 15.70 s, large 36.79 s (vs 16.79 / 39.32 at 150), search recall@10 itopk 32 auto 0.9269 (CAGRA 0.9305, gate 0.9205), pre-prune KNN recall@64 0.938. Passes the gate but spends 0.3 pt of resident recall headroom — user decision.
 - **Resident Step 6 is GPU-bound, not launch-bound** (#11 probe): launching from 4 host threads changed nothing (launches block on a full queue). Kernel elimination per round (1.19 s loop, NPROBE 250): gather ~0.15 s, GEMM ~0.4 s, block top-M ~0.5 s; without GEMM+top-M 0.23 s. top-M block shape G=4/8/16 all ≈ same. Real fix = never materialize the (bucket × pool) dots matrix: fused GEMM + top-M (cuVS 26.12 `detail/fused_l2_knn.cuh` / `knn_brute_force.cuh`), or shrink the pool (#11).
 
+## #74 — SIFT100M robustness fixes (no speed claim) — committed as fix
+
+First SIFT100M runs (2026-10-21/22) exposed four large-N bugs; none affects the SIFT1M / SIFT10M code paths:
+1. Step 4 batch sizing ignored the per-batch raw-range upload buffer (D·sizeof(T) + 4 B per point) → OOM at Nv = 26M.
+2. Sampled (data does not fit) path computed `centroid_rows = sampled_rows × centroid_ratio` although `centroid_ratio` is relative to N (validate requires ratio < sample_rate) → SIFT100M got 100K centroids, buckets avg 1000 / max 7903, Step 6 needed 29.5 GB GPU. Now N × ratio (1M centroids, avg bucket 100, max 1299).
+3. KMeans|| `centroidsBuf` reserved up front (per-round resize held old + new copies, > 2 GB RMM pool at 1M centroids); `KmeansMinDistF16` dots tile capped at ~1 GB.
+4. Step 3 brute-force self-KNN searches in 64K-row batches only when its output exceeds 512 MB (1M centroids: 2.4 GB > pool).
+Non-regression (iter74): sift1M_auto 6.24 s (+0.2%), sift1M_large 9.78 s (−0.8%), sift10M 86.10 s idle-machine rerun (Step 2 KMeans|| round-to-round noise; the Step 3 batching cost seen there is removed by fix 4's threshold); search unchanged on all three.
+Also: run_pipeline `-d sift100M`, line-buffered stage logs (stdbuf -oL); judge.py 4-arg form; SKILL.md goal switched to SIFT100M (user decision 2026-10-22).
+
+SIFT100M round 1 profile (partial run, 1M centroids): Step 2 183 s, Step 3 48 s, Step 4 95 s, Step 4.5 178 s (pass3 write 71 s, resample 72 s, order 22 s), Step 6 setup 20 s (future_access 18.7 s) + bucket loop 785 s (0.785 ms/bucket vs ~0.11 on SIFT10M), merge ~2 min; Step 1 sample read 73 s.
+
 ## Tried & rejected
 
 | # | idea | result | reason |

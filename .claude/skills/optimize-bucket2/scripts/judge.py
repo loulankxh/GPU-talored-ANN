@@ -2,9 +2,11 @@
 """Accept / reject one candidate iteration against state/best.json.
 
 usage:
-  judge.py RUN_1M_AUTO RUN_1M_LARGE [RUN_10M_AUTO] [--update] [--md]
+  judge.py RUN_1M_AUTO RUN_1M_LARGE [RUN_10M_AUTO [RUN_100M_AUTO]] [--update] [--md]
     RUN_10M_AUTO: sift10M auto (1 rep; auto-selects the large path). Part of the loop
                   again since user decision 2026-10-21 (2nd).
+    RUN_100M_AUTO: sift100M auto (1 rep, large path). User decision 2026-10-22: the loop now
+                  optimizes SIFT100M; SIFT1M / SIFT10M are kept as quality checks.
     RUN_*    : run_pipeline.sh output dirs (each holds metrics.json)
     --update : on ACCEPT (or when best.json does not exist yet) write the
                candidate as the new state/best.json
@@ -18,6 +20,11 @@ Rules (agreed with the user):
                sift10M-auto is >= 3% faster than best, and no config is > 3% slower than
                best (user 2026-10-21: a >= 3% SIFT10M gain is accepted as long as neither
                SIFT1M config is > 3% slower and search passes).
+  sift100M     (4-arg form, user 2026-10-22) speed is judged on sift100M only: its
+               build_total must be >= 3% faster than best; sift1M / sift10M build times are
+               reported but not gated (they are quality checks: correctness, search vs CAGRA,
+               memory). sift100M search (no CAGRA reference) must stay >= best - 0.01 at every
+               itopk; sift100M memory follows the large-path 1.2x guard.
   quality      CAGRA-search recall@10 at every itopk, every config:
                  resident path: >= CAGRA - 0.01
                  large path   : >= CAGRA - 0.05   (user decision 2026-10-21: compare with CAGRA only)
@@ -31,16 +38,17 @@ SKILL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(SKILL, "state")
 BEST = os.path.join(STATE, "best.json")
 CAGRA = json.load(open(os.path.join(STATE, "cagra_baseline.json")))
-KEYS = ["sift1M_auto", "sift1M_large", "sift10M_auto"]
-LARGE_KEYS = ["sift1M_large", "sift10M_auto"]   # configs that must take the large path
+KEYS = ["sift1M_auto", "sift1M_large", "sift10M_auto", "sift100M_auto"]
+LARGE_KEYS = ["sift1M_large", "sift10M_auto", "sift100M_auto"]   # configs that must take the large path
 SPEED_GAIN, SPEED_TOL, RECALL_TOL, MEM_TOL = 0.03, 0.03, 0.01, 1.2
 CAGRA_TOL = {"auto": 0.01, "large": 0.05}  # allowed recall@10 gap to CAGRA per path
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 flags = {a for a in sys.argv[1:] if a.startswith("--")}
-if len(args) not in (2, 3):
+if len(args) not in (2, 3, 4):
     sys.exit(__doc__)
 KEYS = KEYS[:len(args)]
+SPEED_KEYS = ["sift100M_auto"] if "sift100M_auto" in KEYS else KEYS
 LARGE_KEYS = [k for k in LARGE_KEYS if k in KEYS]
 cand = {k: json.load(open(os.path.join(d, "metrics.json"))) for k, d in zip(KEYS, args)}
 cand_dirs = dict(zip(KEYS, map(os.path.abspath, args)))
@@ -86,19 +94,24 @@ if best:
             continue
         b, c = best["runs"][k]["build_total_s"], cand[k]["build_total_s"]
         speed[k] = (b - c) / b
-        if speed[k] < -SPEED_TOL:
+        if k in SPEED_KEYS and speed[k] < -SPEED_TOL:
             fail.append(f"{k}: {(-speed[k]) * 100:.1f}% slower than best ({c:.2f}s vs {b:.2f}s)")
-    if max(speed.values()) < SPEED_GAIN:
-        fail.append("no config is >= 3% faster than best ("
+    gated = {k: v for k, v in speed.items() if k in SPEED_KEYS}
+    if gated and max(gated.values()) < SPEED_GAIN:
+        fail.append("no gated config (" + ", ".join(SPEED_KEYS) + ") is >= 3% faster than best ("
                     + ", ".join(f"{k} {v * 100:+.1f}%" for k, v in speed.items()) + ")")
 
     for k in KEYS:
         cr = recalls(cand[k])
-        cag_tab = CAGRA[k.split("_")[0]].get("search")
+        cag_tab = CAGRA.get(k.split("_")[0], {}).get("search")
+        own = best["runs"].get(k) if cag_tab is None else None   # sift100M: no CAGRA, compare with own best
+        own_tab = recalls(own) if own else None
         for it in (cag_tab or CAGRA["sift1M"]["search"]):
             if it not in cr:
                 fail.append(f"{k}: missing itopk {it}"); continue
             if cag_tab is None:
+                if own_tab and it in own_tab and cr[it] < own_tab[it] - RECALL_TOL:
+                    fail.append(f"{k} itopk {it}: recall {cr[it]:.4f} < own best {own_tab[it]:.4f} - 0.01")
                 continue
             # tolerance follows the path the run took (sift10M auto → large path)
             cag_floor = cag_tab[it] - CAGRA_TOL["large" if cand[k]["path"] == "large" else "auto"]
@@ -146,7 +159,7 @@ if "--md" in flags:
         m = cand[k]; ds = k.split("_")[0]
         vb = f"{speed[k] * 100:+.1f}%" if k in speed else "—"
         vbase = f"{(base[k]['build_total_s'] - m['build_total_s']) / base[k]['build_total_s'] * 100:+.1f}%" if base and k in base else "—"
-        vc = f"{m['build_total_s'] / CAGRA[ds]['build_median_s']:.2f}x"
+        vc = f"{m['build_total_s'] / CAGRA[ds]['build_median_s']:.2f}x" if ds in CAGRA else "—"
         stg = ", ".join(f"{s} {v:.2f}" for s, v in m["stages_s"].items())
         print(f"| {k} | {m['path']} | {m['build_total_s']:.2f} | {vb} | {vbase} | {vc} | {stg} | "
               f"{m['gpu_peak_mib']} | {max(m['peak_rss_gb'].values()):.2f} |")
@@ -167,7 +180,7 @@ if "--md" in flags:
     print("| graph | " + " | ".join(f"itopk {i}" for i in its) + " |")
     print("|---|" + "---|" * len(its))
     for ds in ("sift1M", "sift10M"):
-        if "search" in CAGRA[ds]:
+        if "search" in CAGRA.get(ds, {}):
             print(f"| CAGRA native 64→32, {ds} | " + " | ".join(
                 f"{CAGRA[ds]['search'][i]:.4f} / {CAGRA[ds]['qps'][i] / 1e3:.0f}K" for i in its) + " |")
     for k in KEYS:

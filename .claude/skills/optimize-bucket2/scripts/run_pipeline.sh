@@ -45,7 +45,8 @@ export CUDA_VISIBLE_DEVICES=0
 TAG="k${KNN_K}p${NPROBE}m${NEIGHBORS_M}t${ITERATIONS}"
 timed() {  # timed NAME CMD... -> $OUT/rep$R/NAME.{log,time}; returns cmd exit code
   local name=$1; shift
-  /usr/bin/time -f "%e %M" -o "$RD/$name.time" "$@" > "$RD/$name.log" 2>&1
+  # stdbuf -oL: line-buffered logs so long (SIFT100M) runs can be followed live
+  /usr/bin/time -f "%e %M" -o "$RD/$name.time" stdbuf -oL -eL "$@" > "$RD/$name.log" 2>&1
 }
 
 for ((R = 0; R < REPS; R++)); do

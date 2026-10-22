@@ -269,7 +269,9 @@ MemoryEstimate estimate_memory_requirement(
     est.sampled_fits_with_kmeans = total_sampled <= config.gpu_limit_bytes;
 
     if (est.sampled_fits_with_kmeans) {
-        est.centroid_rows = std::max(static_cast<int64_t>(1), static_cast<int64_t>(est.sampled_data_rows * config.centroid_ratio));
+        // centroid_ratio 是相对全量 N 的 (validate 要求 centroid_ratio < sample_rate)；
+        // 原来按采样行数乘 → SIFT100M 只有 N/1000 个 centroid、bucket 平均 1000 点，Step 6 显存需求 29 GB
+        est.centroid_rows = std::max(static_cast<int64_t>(1), static_cast<int64_t>(N * config.centroid_ratio));
         est.centroid_data_bytes = est.centroid_rows * D * sizeof(float);
         est.need_pq = false;
         return est;
@@ -354,7 +356,9 @@ MemoryEstimate estimate_memory_requirement(
         throw std::runtime_error("Data too large for GPU memory even with maximum compression");
     }
 
-    est.centroid_rows = std::max(static_cast<int64_t>(1), static_cast<int64_t>(est.sampled_data_rows * config.centroid_ratio));
+    // centroid_ratio 是相对全量 N 的 (validate 要求 centroid_ratio < sample_rate)；
+    // 原来按采样行数乘 → SIFT100M 只有 N/1000 个 centroid、bucket 平均 1000 点，Step 6 显存需求 29 GB
+    est.centroid_rows = std::max(static_cast<int64_t>(1), static_cast<int64_t>(N * config.centroid_ratio));
     est.centroid_data_bytes = est.centroid_rows * D * sizeof(float);
 
     return est;
@@ -1328,8 +1332,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     //   query:       D * sizeof(CentroidT)
     //   neighbors:   TOP_K * 4
     //   distances:   TOP_K * 4
+    //   (非 PQ、host 区间上传路径) 原始 T 区间 + local row 下标: D * sizeof(T) + 4
+    //   (Nv 大时这块 SIFT100M: 26M × 132 B = 3.4 GB，原来没算进来 → OOM)
     size_t per_point_bytes = static_cast<size_t>(D) * sizeof(CentroidT)
                            + TOP_K * (sizeof(uint32_t) + sizeof(float));
+    if (!is_pq && !gpu_query_loader && std::is_same<CentroidT, float>::value)
+        per_point_bytes += static_cast<size_t>(D) * sizeof(T) + sizeof(int32_t);
 
     int64_t Nv = static_cast<int64_t>(remaining / per_point_bytes);
     Nv = std::max(static_cast<int64_t>(1), std::min(Nv, N_nc));
@@ -1989,7 +1997,10 @@ struct KmeansMinDistF16 {
             CUDA_CHECK(cudaMalloc(&d_cn, n * sizeof(float)));
             c_cap = n;
         }
-        const int64_t tile = std::min<int64_t>(kTile, N);
+        // dots 缓冲 ≤ ~1 GB: 候选多时 (SIFT100M 1M centroids → 每轮 ~500K 新候选)
+        // 4096 × n × 4 B 会到 8 GB，跟数据集本身一起把显存撑爆；SIFT1M/10M 不变
+        const int64_t tile = std::min<int64_t>(std::min<int64_t>(kTile, N),
+                                               std::max<int64_t>(256, (int64_t(1) << 30) / (n * 4)));
         if (tile * n > dots_cap) {
             cudaFree(d_dots);
             CUDA_CHECK(cudaMalloc(&d_dots, tile * n * sizeof(float)));
@@ -2133,6 +2144,11 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
 
         // Growing candidate data buffer on GPU
         rmm::device_uvector<float> centroidsBuf(D, stream);
+        // 预留期望的最终候选数 (~TOTAL_OVERSHOOT × n_centroids, 加 20% 余量)：逐轮
+        // resize 时新旧两份同时存在，1M centroids (SIFT100M) 要 ~1.5 GB，超过
+        // RMM 池 2 GB 上限；一次 reserve 之后 resize 不再搬家
+        centroidsBuf.reserve(static_cast<size_t>(std::min<double>(
+            static_cast<double>(working_N), TOTAL_OVERSHOOT * 1.2 * n_centroids) + 1) * D, stream);
         raft::copy(centroidsBuf.data(),
                    dataset_gpu.data_handle() + cIdx * D, D, stream);
 
@@ -2418,12 +2434,25 @@ std::vector<uint32_t> centroid_self_knn_bf(const float* d_centroids_f32, int64_t
     cuvs::neighbors::brute_force::index_params bp;
     bp.metric = cuvs::distance::DistanceType::L2Expanded;
     auto bf = cuvs::neighbors::brute_force::build(res, bp, cview);
-    auto nb = raft::make_device_matrix<int64_t, int64_t>(res, n_centroids, ks);
-    auto ds = raft::make_device_matrix<float, int64_t>(res, n_centroids, ks);
-    cuvs::neighbors::brute_force::search(res, bf, cview, nb.view(), ds.view());
+    // query 分批: 输出 (n, ks) int64+float 在 1M centroids (SIFT100M) 时 2.4 GB，
+    // 超过 RMM 池 2 GB 上限；只在输出 > 512 MB 时按 64K 行一批 (~160 MB)，结果跟
+    // 一次搜完全一样 (SIFT1M/10M 的 10K/100K centroids 仍一次搜完，分批每轮多 ~0.15 s)
+    constexpr int64_t kQB = 65536;
+    const bool split_q = n_centroids * ks * static_cast<int64_t>(sizeof(int64_t) + sizeof(float)) > (int64_t(512) << 20);
+    const int64_t qb = split_q ? std::min<int64_t>(kQB, n_centroids) : n_centroids;
+    auto nb = raft::make_device_matrix<int64_t, int64_t>(res, qb, ks);
+    auto ds = raft::make_device_matrix<float, int64_t>(res, qb, ks);
     std::vector<int64_t> h_nb(static_cast<size_t>(n_centroids * ks));
-    raft::copy(h_nb.data(), nb.data_handle(), h_nb.size(), raft::resource::get_cuda_stream(res));
-    raft::resource::sync_stream(res);
+    for (int64_t q0 = 0; q0 < n_centroids; q0 += qb) {
+        const int64_t qn = std::min(qb, n_centroids - q0);
+        auto qv = raft::make_device_matrix_view<const float, int64_t>(d_centroids_f32 + q0 * D, qn, D);
+        auto nbv = raft::make_device_matrix_view<int64_t, int64_t>(nb.data_handle(), qn, ks);
+        auto dsv = raft::make_device_matrix_view<float, int64_t>(ds.data_handle(), qn, ks);
+        cuvs::neighbors::brute_force::search(res, bf, qv, nbv, dsv);
+        raft::copy(h_nb.data() + q0 * ks, nb.data_handle(), static_cast<size_t>(qn * ks),
+                   raft::resource::get_cuda_stream(res));
+        raft::resource::sync_stream(res);
+    }
 
     std::vector<uint32_t> out(static_cast<size_t>(n_centroids) * k_out);
     int64_t n_bad = 0;
