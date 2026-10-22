@@ -1816,7 +1816,7 @@ SIFT10M is back in every iteration (`run_pipeline.sh -d sift10M -m auto -r 1`, t
 | ours sift1M_large | 0.9138 / 2221K | 0.9703 / 1190K | 0.9922 / 562K | 0.9982 / 189K | 0.9996 / 68K |
 | ours sift10M_auto | 0.8382 / 1869K | 0.9291 / 1011K | 0.9738 / 493K | 0.9922 / 184K | 0.9979 / 68K |
 
-**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +3.7% (84.76 → 81.65 s, 0.67× CAGRA native; first run +5.0%), 1M-auto +2.8% (6.31 → 6.25 s... relative to stored 6.43? see table), 1M-large −0.1%.
+**Verdict:** ACCEPT (SIFT10M rule) — speedup vs previous best: 10M-auto +3.7% (84.76 → 81.65 s, 0.67× CAGRA native; first run +5.0%), 1M-auto +2.8% (stored best 6.43 → 6.25 s, 0.54× CAGRA native), 1M-large −0.1%.
 
 <!-- template for an accepted entry:
 ### #N — <one-line idea>  (<date>, commit <hash>)
