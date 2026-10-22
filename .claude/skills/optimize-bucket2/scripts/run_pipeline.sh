@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One full build of the bucket pipeline + quality eval, on GPU 0.
 #
-#   run_pipeline.sh -d sift1M|sift10M [-m auto|large] [-r REPS] [-o OUTDIR] [-q] [-k]
+#   run_pipeline.sh -d sift1M|sift10M|sift100M [-m auto|large] [-r REPS] [-o OUTDIR] [-q] [-k]
 #     -m auto  : bucket2 picks GPU-resident vs out-of-core itself; optimize (cuVS
 #                resident prune+reverse) runs if it fits, else falls back to
 #                prune_windowed + optimize_chunked -m E.            (default)
@@ -34,7 +34,8 @@ done
 case $DS in
   sift1M)  BASE=$ROOT/dataset/sift1M/base.1M.u8bin;   : "${REPS:=3}" ;;
   sift10M) BASE=$ROOT/dataset/sift10M/base.10M.u8bin; : "${REPS:=1}" ;;
-  *) echo "-d sift1M|sift10M required"; exit 1 ;;
+  sift100M) BASE=$ROOT/dataset/sift100M/base.100M.u8bin; : "${REPS:=1}" ;;
+  *) echo "-d sift1M|sift10M|sift100M required"; exit 1 ;;
 esac
 DSDIR=$(dirname "$BASE")
 : "${OUT:=$BB/runs/$(date +%Y%m%d_%H%M%S)_${DS}_${MODE}}"
