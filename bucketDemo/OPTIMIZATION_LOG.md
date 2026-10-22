@@ -101,6 +101,49 @@ prune 1453 s: per-position CPU mode, fetch 1181 s (Belady cache 16 GB vs 76.8 GB
 pre-prune KNN recall@1/10/32/64 = 0.7531 / 0.7211 / 0.6976 / 0.6818.
 DiskANN search recall@10 / QPS at L 32/64/128/256/512: 0.7028 / 64K, 0.8132 / 61K, 0.8970 / 37K, 0.9501 / 21K, 0.9788 / 12K; 0 bad ids / self loops / dup edges.
 
+## #76 — prune_windowed: chunked out-of-core GPU prune — ACCEPTED (SIFT100M −31.7%)
+
+**Idea:** when the window data does not fit the host budget (SIFT100M: 76.8 GB float windows vs 16 GB) prune_windowed fell back to the per-position CPU path with a Belady bucket cache (fetch 1181 s of 1453 s, 7.2M evictions). New `prune_windowed_gpu::run_chunked`: walk the processing order in chunks of positions whose window union (cand + u8 rows, ≤ min(cache/2, 4 GB)) fits; adjacent positions' rows are contiguous in the new id space, so the union is read as merged row runs with parallel pread, compacted, uploaded, and the same `prune_kernel` runs with a per-position `cbase` map (id → compact row). The whole-data GPU path now passes cbase = offsets (identical results). GPU / host memory depend only on the chunk size, not on N. Reference: cuVS 26.12 `detail/cagra/cagra_ace.cuh` (partitioned out-of-core build) for the chunking, kernel from `graph_core.cuh::kern_fused_prune` as before.
+Bit-exact vs the batched GPU path on SIFT1M (forced 105 MB budget, 27 chunks). SIFT100M: 125 chunks, 13.95 × N rows loaded, prune 1453 → 152 s, prune RSS 18.2 → 5.4 GB; recall rose (0.703 → 0.745 @ L32): the old per-position CPU path also used candidates from any cache-resident bucket, the GPU path uses exactly the window.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.32 | -1.1% | +70.9% | 0.55x | bucket2 6.32 | 3900 | 1.71 |
+| sift1M_large | large | 9.45 | +2.6% | +87.4% | 0.82x | bucket2 7.56, prune 0.74, optimize_chunked 0.72, translate 0.45 | 1558 | 2.04 |
+| sift10M_auto | large | 82.63 | -1.2% | +53.7% | 0.67x | bucket2 72.07, prune 4.07, optimize_chunked 2.90, translate 3.59 | 8996 | 12.66 |
+| sift100M_auto | large | 3087.75 | +31.7% | +31.7% | — | bucket2 2566.60, prune 151.68, optimize_chunked 307.37, translate 62.10 | 14588 | 79.41 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.63 | 0.26 | 0.18 | 0.00 | 0.62 | 0.40 | 0.02 | 2.76 | 0.00 | 0.92 |
+| sift1M_large | 0.13 | 0.59 | 0.33 | 0.00 | 0.96 | 0.27 | 0.04 | 4.11 | 0.51 | 0.00 |
+| sift10M_auto | 1.39 | 7.31 | 2.38 | 0.00 | 18.82 | 1.78 | 0.32 | 34.77 | 4.18 | 0.00 |
+| sift100M_auto | 71.57 | 366.90 | 96.87 | 0.00 | 249.69 | 176.15 | 8.14 | 1562.68 | 25.68 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9750 | 0.9656 | 0.9590 | 0.9534 |
+| sift1M_large | 0.9744 | 0.9667 | 0.9596 | 0.9537 |
+| sift10M_auto | 0.9155 | 0.8993 | 0.8827 | 0.8710 |
+| sift100M_auto | 0.7491 | 0.7190 | 0.6973 | 0.6818 |
+
+**(b) final graph (degree 32, original ids), cuVS CAGRA search, recall@10 / QPS (10K queries)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9283 / 1945K | 0.9774 / 1036K | 0.9943 / 524K | 0.9988 / 188K | 0.9997 / 68K |
+| ours sift1M_large | 0.9138 / 2222K | 0.9708 / 1188K | 0.9921 / 561K | 0.9984 / 187K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8388 / 1873K | 0.9280 / 1051K | 0.9735 / 526K | 0.9915 / 186K | 0.9977 / 68K |
+| ours sift100M_auto | 0.7449 / 65K | 0.8519 / 64K | 0.9251 / 38K | 0.9680 / 22K | 0.9877 / 11K |
+
 ## Tried & rejected
 
 | # | idea | result | reason |

@@ -289,7 +289,7 @@ int main(int argc, char** argv)
         constexpr int32_t kBatch = 64;
         const size_t total_window_bytes = static_cast<size_t>(N) *
             (static_cast<size_t>(M_in) * sizeof(int32_t) + static_cast<size_t>(dataset_D_peek) * sizeof(float));
-        const bool batched = total_window_bytes <= (cache_mb << 20);
+        bool batched = total_window_bytes <= (cache_mb << 20);
         std::cout << "  mode=" << (batched ? "batched" : "per-position")
                   << " (window data " << total_window_bytes / 1e6 << " MB, cache budget " << cache_mb << " MB)\n";
         if (batched) {
@@ -455,6 +455,71 @@ int main(int argc, char** argv)
 
                 t_iter_total += std::chrono::duration<double>(Clock::now() - titer0).count();
             }
+        }
+
+        // 窗口数据放不进 host 预算 (batched 不成立) 时: u8 数据、M_in ≤ 64、有 GPU →
+        // 分块 GPU 剪枝 (prune_windowed_gpu::run_chunked)，每块只读窗口并集的行，
+        // 显存 / host 内存都只跟块大小有关。原来走下面的逐 position CPU 路径 +
+        // Belady cache: SIFT100M 窗口 76.8 GB vs 16 GB 预算，fetch 1181 s / 共 1453 s
+        // (缓存反复淘汰 720 万次)。BUCKET2_PRUNE_CHUNKED=0 关掉。
+        if (!batched && (dataset_ext == ".u8bin" || dataset_ext == ".i8bin") &&
+            !(std::getenv("BUCKET2_PRUNE_CHUNKED") && std::getenv("BUCKET2_PRUNE_CHUNKED")[0] == '0') &&
+            prune_windowed_gpu::available(1, M_in, dataset_D_peek, n_buckets, static_cast<int32_t>(ck.K) + 1, output_degree)) {
+            auto tg0 = Clock::now();
+            const int32_t D_all = dataset_D_peek;
+            const int32_t Wmax = static_cast<int32_t>(ck.K) + 1;
+            std::vector<int32_t> win(static_cast<size_t>(n_buckets) * Wmax, std::numeric_limits<int32_t>::max());
+            std::vector<int32_t> win_len(static_cast<size_t>(n_buckets), 0);
+            for (int32_t pos = 0; pos < n_buckets; ++pos) {
+                int32_t* wp = win.data() + static_cast<size_t>(pos) * Wmax;
+                int32_t len = 0;
+                wp[len++] = pos;
+                for (int32_t nbk : adj[static_cast<size_t>(order[static_cast<size_t>(pos)])]) {
+                    if (nbk < 0 || nbk >= n_buckets) continue;
+                    if (len >= Wmax) throw std::runtime_error("prune_windowed: window larger than K+1");
+                    wp[len++] = pos_of[static_cast<size_t>(nbk)];
+                }
+                std::sort(wp, wp + len);
+                len = static_cast<int32_t>(std::unique(wp, wp + len) - wp);
+                win_len[static_cast<size_t>(pos)] = len;
+            }
+            const int fd_k = ::open(vknn_path.c_str(), O_RDONLY);
+            const int fd_d = ::open(dataset_path.c_str(), O_RDONLY);
+            if (fd_k < 0 || fd_d < 0) throw std::runtime_error("prune_windowed: cannot open inputs for chunked GPU prune");
+            auto pread_all = [](int fd, char* p, size_t n, off_t off) {
+                while (n > 0) {
+                    ssize_t r = ::pread(fd, p, n, off);
+                    if (r <= 0) throw std::runtime_error("prune_windowed: short read (chunked GPU prune)");
+                    p += r; n -= static_cast<size_t>(r); off += r;
+                }
+            };
+            auto load_rows = [&](int64_t lo, int64_t n, int32_t* cand, uint8_t* vec) {
+                if (lo < 0 || lo + n > N) throw std::runtime_error("prune_windowed: chunk rows out of range");   // bounds check
+                pread_all(fd_k, reinterpret_cast<char*>(cand), static_cast<size_t>(n) * M_in * sizeof(int32_t),
+                          static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(lo) * M_in * sizeof(int32_t));
+                pread_all(fd_d, reinterpret_cast<char*>(vec), static_cast<size_t>(n) * D_all,
+                          static_cast<off_t>(2 * sizeof(int32_t)) + static_cast<off_t>(lo) * D_all);
+            };
+            // 块大小: cand + vec 行 ≤ host 预算的一半，且 ≤ 4 GB (显存另有 out / 窗口表)
+            const size_t budget = std::min<size_t>((cache_mb << 20) / 2, size_t(4) << 30);
+            double t_sink = 0;
+            prune_windowed_gpu::ChunkStats cst;
+            prune_windowed_gpu::run_chunked(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
+                                            output_degree, budget, load_rows,
+                                            [&](const uint32_t* rows, int64_t row0, int64_t n) {
+                                                auto tw0 = Clock::now();
+                                                writer.write_rows(rows, row0, n);
+                                                t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
+                                            }, &cst);
+            ::close(fd_k); ::close(fd_d);
+            t_write += t_sink;
+            t_compute += std::chrono::duration<double>(Clock::now() - tg0).count() - t_sink;
+            min_center_count = max_center_count = 0;
+            t_iter_total += std::chrono::duration<double>(Clock::now() - tg0).count();
+            std::cout << "  mode=chunked+GPU (" << cst.chunks << " chunks, " << cst.loaded_rows << " rows loaded = "
+                      << std::fixed << std::setprecision(2) << static_cast<double>(cst.loaded_rows) / N << " x N, budget "
+                      << budget / 1e6 << " MB)\n";
+            batched = true;   // 跳过下面的逐 position 路径
         }
 
 pruned_done:

@@ -64,8 +64,10 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     const uint32_t* __restrict__ offsets,  // (n_buckets + 1)
     const int32_t* __restrict__ win,       // (n_buckets, W) sorted window positions, padded INT32_MAX
     const int32_t* __restrict__ win_len,   // (n_buckets)
-    int64_t N, int M, int D, int n_buckets, int W, int out_deg,
-    uint32_t* __restrict__ out,            // (N, out_deg)
+    const int64_t* __restrict__ cbase,     // (n_buckets) row of position q's first point in cand/vec (-1: not loaded)
+    int64_t row0, int64_t n_rows,          // points to prune: [row0, row0 + n_rows) (new ids)
+    int M, int D, int n_buckets, int W, int out_deg,
+    uint32_t* __restrict__ out,            // (n_rows, out_deg)
     int* __restrict__ err)
 {
     __shared__ float   s_dist[kWarpsPerBlock][kMaxM];
@@ -77,13 +79,17 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     __shared__ int32_t s_stamp[kWarpsPerBlock][kMaxM];
 
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int64_t a = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + w;
-    if (a >= N) return;
+    const int64_t a = row0 + static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + w;
+    if (a >= row0 + n_rows) return;
     const uint32_t total = offsets[n_buckets];
     const int p = find_pos(offsets, n_buckets, static_cast<uint32_t>(a));
     const int32_t* wp = win + static_cast<int64_t>(p) * W;
     const int wl = win_len[p];
-    const uint8_t* va = vec + a * D;
+    // 点 id → cand/vec 里的行 (整份数据: cbase = offsets → 行 = id；分块: 只装了窗口并集)
+    auto row_of = [&](int q, uint32_t id) { return cbase[q] + (static_cast<int64_t>(id) - offsets[q]); };
+    const int64_t arow = row_of(p, static_cast<uint32_t>(a));
+    if (cbase[p] < 0) { if (lane == 0) atomicExch(err, 2); return; }   // bounds check: center not loaded
+    const uint8_t* va = vec + arow * D;
 
     // ---- 1. distances ----
     for (int k = lane; k < kMaxM; k += 32) {
@@ -91,12 +97,12 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
         int32_t id = -1;
         bool valid = false;
         if (k < M) {
-            id = cand[a * M + k];
+            id = cand[arow * M + k];
             if (id >= 0) {
                 valid = true;
-                if (static_cast<uint32_t>(id) < total &&
-                    in_window(wp, wl, find_pos(offsets, n_buckets, static_cast<uint32_t>(id)))) {
-                    const uint8_t* vc = vec + static_cast<int64_t>(id) * D;
+                const int q = (static_cast<uint32_t>(id) < total) ? find_pos(offsets, n_buckets, static_cast<uint32_t>(id)) : -1;
+                if (q >= 0 && in_window(wp, wl, q) && cbase[q] >= 0) {
+                    const uint8_t* vc = vec + row_of(q, static_cast<uint32_t>(id)) * D;
                     float acc = 0.f;
                     for (int d = 0; d < D; ++d) {
                         float df = static_cast<float>(va[d]) - static_cast<float>(vc[d]);
@@ -153,9 +159,10 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     for (int kAD = 0; kAD < M - 1; ++kAD) {
         const int32_t d_id = s_id[w][kAD];
         if (d_id < 0) break;   // padding is sorted last
-        if (static_cast<uint32_t>(d_id) >= total ||
-            !in_window(wp, wl, find_pos(offsets, n_buckets, static_cast<uint32_t>(d_id)))) continue;
-        const int32_t* drow = cand + static_cast<int64_t>(d_id) * M;
+        if (static_cast<uint32_t>(d_id) >= total) continue;
+        const int qd = find_pos(offsets, n_buckets, static_cast<uint32_t>(d_id));
+        if (!in_window(wp, wl, qd) || cbase[qd] < 0) continue;
+        const int32_t* drow = cand + row_of(qd, static_cast<uint32_t>(d_id)) * M;
         for (int kDB = lane; kDB < M; kDB += 32) {
             const int32_t b = drow[kDB];
             if (b < 0) continue;
@@ -183,7 +190,7 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
             const int cq = s_cnt[w][q];
             pos += (cq < cr) || (cq == cr && q < r);
         }
-        if (pos < out_deg) out[a * out_deg + pos] = static_cast<uint32_t>(s_id[w][r]);
+        if (pos < out_deg) out[(a - row0) * out_deg + pos] = static_cast<uint32_t>(s_id[w][r]);
     }
 }
 
@@ -273,9 +280,10 @@ void run(const int32_t* h_cand, const uint8_t* h_vec, int64_t N, int M, int D,
 {
     int32_t* d_cand = nullptr; uint8_t* d_vec = nullptr; uint32_t* d_off = nullptr;
     int32_t* d_win = nullptr; int32_t* d_wl = nullptr; uint32_t* d_out = nullptr; int* d_err = nullptr;
+    int64_t* d_cbase = nullptr;
     auto cleanup = [&] {
         cudaFree(d_cand); cudaFree(d_vec); cudaFree(d_off); cudaFree(d_win);
-        cudaFree(d_wl); cudaFree(d_out); cudaFree(d_err);
+        cudaFree(d_wl); cudaFree(d_out); cudaFree(d_err); cudaFree(d_cbase);
     };
     try {
         Staging stg;
@@ -291,10 +299,13 @@ void run(const int32_t* h_cand, const uint8_t* h_vec, int64_t N, int M, int D,
         stg.h2d(d_off,  h_offsets, (static_cast<size_t>(n_buckets) + 1) * sizeof(uint32_t));
         stg.h2d(d_win,  h_win.data(), h_win.size() * sizeof(int32_t));
         stg.h2d(d_wl,   h_win_len.data(), h_win_len.size() * sizeof(int32_t));
+        std::vector<int64_t> cbase(h_offsets, h_offsets + n_buckets);   // 整份数据: 行 = id
+        PWG_CHECK(cudaMalloc(&d_cbase, cbase.size() * sizeof(int64_t)));
+        stg.h2d(d_cbase, cbase.data(), cbase.size() * sizeof(int64_t));
         PWG_CHECK(cudaMemsetAsync(d_err, 0, sizeof(int), stg.st));
         const int64_t blocks = (N + kWarpsPerBlock - 1) / kWarpsPerBlock;
         prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
-            d_cand, d_vec, d_off, d_win, d_wl, N, M, D, n_buckets, W, out_deg, d_out, d_err);
+            d_cand, d_vec, d_off, d_win, d_wl, d_cbase, 0, N, M, D, n_buckets, W, out_deg, d_out, d_err);
         PWG_CHECK(cudaGetLastError());
         int h_err = 0;
         PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
@@ -309,5 +320,118 @@ void run(const int32_t* h_cand, const uint8_t* h_vec, int64_t N, int M, int D,
     }
     cleanup();
 }
+
+// 窗口数据整份放不进 host 预算 / 显存时 (SIFT100M: 76.8 GB float 窗口 > 16 GB；GPU 整份
+// 需 51 GB) 的分块版本: 按处理位置切块 [p0, p1)，每块只把这些位置窗口的并集
+// (bucket 在新 id 空间连续 → 合并成连续行段) 读进来、压紧上传，kernel 用 cbase 把
+// 点 id 映射到压紧后的行。每个点的窗口 / 剪枝语义跟整份版本完全一样；显存和 host
+// 内存都只跟块大小 (budget_bytes) 有关，不随 N 增长。
+void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_buckets,
+                 const std::vector<int32_t>& h_win, const std::vector<int32_t>& h_win_len, int W,
+                 int out_deg, size_t budget_bytes,
+                 const std::function<void(int64_t lo, int64_t n, int32_t* cand, uint8_t* vec)>& load_rows,
+                 const std::function<void(const uint32_t*, int64_t, int64_t)>& sink,
+                 ChunkStats* stats)
+{
+    const size_t row_bytes = static_cast<size_t>(M) * sizeof(int32_t) + static_cast<size_t>(D);
+    int64_t max_bucket = 0;
+    for (int q = 0; q < n_buckets; ++q) max_bucket = std::max<int64_t>(max_bucket, h_offsets[q + 1] - h_offsets[q]);
+    // 一个位置的窗口最多 W 个桶，块至少要装得下一个窗口
+    const int64_t cap_rows = std::max<int64_t>(static_cast<int64_t>(budget_bytes / row_bytes),
+                                               static_cast<int64_t>(W) * max_bucket);
+    int32_t* d_cand = nullptr; uint8_t* d_vec = nullptr; uint32_t* d_off = nullptr;
+    int32_t* d_win = nullptr; int32_t* d_wl = nullptr; uint32_t* d_out = nullptr; int* d_err = nullptr;
+    int64_t* d_cbase = nullptr;
+    auto cleanup = [&] {
+        cudaFree(d_cand); cudaFree(d_vec); cudaFree(d_off); cudaFree(d_win);
+        cudaFree(d_wl); cudaFree(d_out); cudaFree(d_err); cudaFree(d_cbase);
+    };
+    try {
+        Staging stg;
+        PWG_CHECK(cudaMalloc(&d_cand, static_cast<size_t>(cap_rows) * M * sizeof(int32_t)));
+        PWG_CHECK(cudaMalloc(&d_vec,  static_cast<size_t>(cap_rows) * D));
+        PWG_CHECK(cudaMalloc(&d_out,  static_cast<size_t>(cap_rows) * out_deg * sizeof(uint32_t)));
+        PWG_CHECK(cudaMalloc(&d_off,  (static_cast<size_t>(n_buckets) + 1) * sizeof(uint32_t)));
+        PWG_CHECK(cudaMalloc(&d_win,  h_win.size() * sizeof(int32_t)));
+        PWG_CHECK(cudaMalloc(&d_wl,   h_win_len.size() * sizeof(int32_t)));
+        PWG_CHECK(cudaMalloc(&d_cbase, static_cast<size_t>(n_buckets) * sizeof(int64_t)));
+        PWG_CHECK(cudaMalloc(&d_err,  sizeof(int)));
+        stg.h2d(d_off, h_offsets, (static_cast<size_t>(n_buckets) + 1) * sizeof(uint32_t));
+        stg.h2d(d_win, h_win.data(), h_win.size() * sizeof(int32_t));
+        stg.h2d(d_wl,  h_win_len.data(), h_win_len.size() * sizeof(int32_t));
+        PWG_CHECK(cudaMemsetAsync(d_err, 0, sizeof(int), stg.st));
+
+        std::vector<int32_t> h_cand(static_cast<size_t>(cap_rows) * M);
+        std::vector<uint8_t> h_vec(static_cast<size_t>(cap_rows) * D);
+        std::vector<int64_t> cbase(static_cast<size_t>(n_buckets), -1);
+        std::vector<int32_t> stamp(static_cast<size_t>(n_buckets), -1);
+        std::vector<int32_t> U;
+        int32_t chunk_id = 0;
+        for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
+            // ---- 并集 U(p0..p1): 加位置直到行数到上限 ----
+            for (int q : U) cbase[static_cast<size_t>(q)] = -1;
+            U.clear();
+            int64_t rows = 0;
+            int p1 = p0;
+            while (p1 < n_buckets) {
+                const int32_t* wp = h_win.data() + static_cast<size_t>(p1) * W;
+                const int wl = h_win_len[static_cast<size_t>(p1)];
+                int64_t add = 0;
+                for (int i = 0; i < wl; ++i)
+                    if (stamp[static_cast<size_t>(wp[i])] != chunk_id) add += h_offsets[wp[i] + 1] - h_offsets[wp[i]];
+                if (p1 > p0 && rows + add > cap_rows) break;
+                for (int i = 0; i < wl; ++i) {
+                    const int q = wp[i];
+                    if (q < 0 || q >= n_buckets) throw std::runtime_error("prune_windowed_gpu: window position out of range");
+                    if (stamp[static_cast<size_t>(q)] != chunk_id) { stamp[static_cast<size_t>(q)] = chunk_id; U.push_back(q); }
+                }
+                rows += add;
+                ++p1;
+            }
+            std::sort(U.begin(), U.end());
+            // ---- 压紧: 相邻位置的行在新 id 空间里首尾相接 → 合并成连续段并行读 ----
+            struct Run { int64_t lo, n, dst; };
+            std::vector<Run> runs;
+            int64_t dst = 0;
+            for (int q : U) {
+                const int64_t lo = h_offsets[q], n = static_cast<int64_t>(h_offsets[q + 1]) - lo;
+                cbase[static_cast<size_t>(q)] = dst;
+                if (!runs.empty() && runs.back().lo + runs.back().n == lo) runs.back().n += n;
+                else runs.push_back({lo, n, dst});
+                dst += n;
+            }
+            if (dst > cap_rows) throw std::runtime_error("prune_windowed_gpu: chunk rows exceed capacity");
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int64_t i = 0; i < static_cast<int64_t>(runs.size()); ++i) {
+                const Run& r = runs[static_cast<size_t>(i)];
+                load_rows(r.lo, r.n, h_cand.data() + static_cast<size_t>(r.dst) * M, h_vec.data() + static_cast<size_t>(r.dst) * D);
+            }
+            stg.h2d(d_cand, h_cand.data(), static_cast<size_t>(dst) * M * sizeof(int32_t));
+            stg.h2d(d_vec,  h_vec.data(),  static_cast<size_t>(dst) * D);
+            stg.h2d(d_cbase, cbase.data(), cbase.size() * sizeof(int64_t));
+            const int64_t row0 = h_offsets[p0], n_rows = static_cast<int64_t>(h_offsets[p1]) - row0;
+            const int64_t blocks = (n_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
+            if (blocks > 0)
+                prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
+                    d_cand, d_vec, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_out, d_err);
+            PWG_CHECK(cudaGetLastError());
+            int h_err = 0;
+            PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
+            PWG_CHECK(cudaStreamSynchronize(stg.st));
+            if (h_err)
+                throw std::runtime_error(h_err == 2 ? "prune_windowed_gpu: center bucket not loaded in chunk"
+                                                    : "prune_windowed_gpu: fewer than output_degree valid candidates "
+                                                      "(check --output-degree <= M_in and padding)");
+            stg.d2h_rows(d_out, n_rows, out_deg, [&](const uint32_t* r, int64_t r0, int64_t n) { sink(r, row0 + r0, n); });
+            if (stats) { stats->chunks++; stats->loaded_rows += dst; }
+            p0 = p1;
+        }
+    } catch (...) {
+        cleanup();
+        throw;
+    }
+    cleanup();
+}
+
 
 }  // namespace prune_windowed_gpu
