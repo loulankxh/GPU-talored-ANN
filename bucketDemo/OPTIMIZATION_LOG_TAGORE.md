@@ -169,7 +169,7 @@ SIFT100M 3–7% faster with everything else passing (rechecked later with multi-
 
 | # | idea | TAGORE source | SIFT100M | other configs | patch |
 |---|---|---|---|---|---|
-| — | (none open; #9 was accepted bundled with #7 in #10) | | | | |
+| 14 | Rounds 2..t: bucket records stay in RAM (`--bucket-mem-mb 16000` in `BUCKET2_EXTRA`; default budget cpu_limit/4 = 4 GB < 13.6 GB) instead of BucketWrite to disk; Step 6 copies GPU-cache misses (and the center bucket's gids) straight from the host blob into the pinned staging, without the host Belady cache (TAGORE `graph_pool` in RAM; cuVS-loop #75 idea). SIFT10M dev (2 rounds, 200 MB GPU cache): round-2 BucketWrite 2.68 → 0.24 s, host get 1.94 → 0.05 s, recall equal, RSS equal | 998.56 → 938.98 s (**+6.0 %**): Step 4 220 → 176 s (round-2 BucketWrite 68 → 28 s, write 51 → 11 s), Step 6 round-2 loop 140 → 114 s (host get 24 → 0.7 s); bucket2 735 → 676 s; RSS 40.1 → 43.0 GB (guard 48 GB); 1M auto +0.4 %, 1M large +2.8 %, 10M +0.5 %; recall unchanged | `bucketDemo/patches/tagore14_round2_records_in_ram.patch` |
 
 ## Tried & rejected
 
@@ -739,3 +739,8 @@ vs #0, 0.46× TAGORE)**; optimize_chunked 63 → 78 s and translate 57 → 47 s 
 | ours sift1M_large | 0.9137 / 2209K | 0.9707 / 1189K | 0.9919 / 561K | 0.9983 / 189K | 0.9996 / 68K |
 | ours sift10M_auto | 0.8338 / 1869K | 0.9249 / 1012K | 0.9713 / 490K | 0.9909 / 172K | 0.9976 / 68K |
 | ours sift100M_auto | 0.7317 / 98K | 0.8396 / 74K | 0.9156 / 43K | 0.9626 / 24K | 0.9856 / 13K |
+
+### #14 — REJECTED (possible gain +6.0 %): round 2..t bucket records in RAM + host-blob miss loader (2026-10-22)
+
+See **Possible gains** (#14). Real stage gains (Step 4 −44 s, Step 6 round 2 −26 s); to be bundled with the next change.
+Memory note: since #13 the large-path RSS guard is 1.2 × 40.1 = 48 GB; this change uses 43.0 GB.

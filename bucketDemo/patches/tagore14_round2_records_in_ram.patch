@@ -1,0 +1,122 @@
+diff --git a/.claude/skills/optimize-bucket2-tagore/scripts/params.sh b/.claude/skills/optimize-bucket2-tagore/scripts/params.sh
+index d99eea2..a7263e0 100755
+--- a/.claude/skills/optimize-bucket2-tagore/scripts/params.sh
++++ b/.claude/skills/optimize-bucket2-tagore/scripts/params.sh
+@@ -16,7 +16,7 @@ CHUNKED_GPU_BUDGET_MB=16000
+ CHUNKED_EDGE_BUFFER_MB=16000
+ 
+ # extra flags appended verbatim (keep empty unless an optimization needs them)
+-BUCKET2_EXTRA="--skip-npy --skip-dists --kmeans-train-fraction 0.10 --cache-mb 15000"   # #9: Step 6 host Belady cache holds a whole SIFT100M round (13.6 GB of records; default cpu_limit/2 = 8.6 GB)
++BUCKET2_EXTRA="--skip-npy --skip-dists --kmeans-train-fraction 0.10 --cache-mb 15000 --bucket-mem-mb 16000"   # #9: Step 6 host Belady cache holds a whole SIFT100M round (13.6 GB of records; default cpu_limit/2 = 8.6 GB); #14: round 2..t records stay in RAM (no BucketWrite to disk), Step 6 copies misses from them
+ OPTIMIZE_EXTRA="--skip-sort"
+ PRUNE_EXTRA=""
+ CHUNKED_EXTRA=""
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 38adca7..6ad55ad 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -131,6 +131,8 @@ struct LoadConfig {
+ 
+     // out-of-core Step 6: GPU 端 bucket 缓存预算 (MB, 0 = 关闭)，见 DevBucket
+     size_t gpu_bucket_cache_mb;
++    // round 2..t 的 bucket 记录 (BucketVectorAccumulator) 放内存的预算 (MB, 0 = cpu_limit/4)
++    size_t bucket_mem_mb = 0;
+ 
+     // Output
+     bool save_dists;               // 写 vector_dists.bin (default true)；流水线后续阶段不读它
+@@ -592,6 +594,9 @@ LoadConfig parse_load_config(const po::variables_map& vm) {
+     if (vm.count("gpu-bucket-cache-mb")) {
+         config.gpu_bucket_cache_mb = vm["gpu-bucket-cache-mb"].as<size_t>();
+     }
++    if (vm.count("bucket-mem-mb")) {
++        config.bucket_mem_mb = vm["bucket-mem-mb"].as<size_t>();
++    }
+     if (vm.count("skip-dists")) {
+         config.save_dists = !vm["skip-dists"].as<bool>();
+     }
+@@ -5513,11 +5518,26 @@ void build_vector_knn_with_tensorcore(
+                             t_dev_upload += diag_secs(tu0, diag_now());
+                             return db;   // d_buf 为空: 不拥有显存，淘汰时什么都不做
+                         }
+-                        const VecBucket<DataT>& hb = bucket_cache.get(pos, bid, bucket_loader);
++                        // 这一轮的记录整块在 host 内存里 (h_blob，但放不进 GPU 缓存，例如 SIFT100M round 2):
++                        // 直接从 blob 拷进 pinned 暂存，不经过 host Belady 缓存 (不重复占内存、不读盘)。
++                        // 参考 TAGORE largeIndex: graph_pool 常驻 host 内存，GPU 侧按需整块取 (cuVS-loop #75 的思路)。
++                        const VecBucket<DataT>* hbp = nullptr;
++                        size_t blob_off = 0; int64_t blob_gid0 = 0; size_t blob_row = 0;
++                        int64_t cnt_b = 0;
++                        if (h_blob) {
++                            bucket_vecs.blob_locate(bid, blob_off, blob_gid0);
++                            cnt_b = bucket_count[bid];
++                            blob_row = (blob_mode == 1) ? static_cast<size_t>(blob_stride) : static_cast<size_t>(D) * sizeof(DataT);
++                            if (blob_off + static_cast<size_t>(cnt_b) * blob_row > blob_bytes)   // bounds check
++                                throw std::runtime_error("VectorKNN: bucket " + std::to_string(bid) + " outside the host blob");
++                        } else {
++                            hbp = &bucket_cache.get(pos, bid, bucket_loader);
++                            cnt_b = static_cast<int64_t>(hbp->ids.size());
++                        }
+                         t_dev_hostget += diag_secs(tu0, diag_now());
+                         DevBucket db;
+                         db.ctx = &dev_ctx;
+-                        db.count = static_cast<int64_t>(hb.ids.size());
++                        db.count = cnt_b;
+                         const size_t ids_bytes = (static_cast<size_t>(db.count) * sizeof(int32_t) + 15) / 16 * 16;
+                         const size_t vec_bytes = static_cast<size_t>(db.count) * D * sizeof(DataT);
+                         const size_t real_bytes = ids_bytes + vec_bytes;
+@@ -5533,8 +5553,23 @@ void build_vector_knn_with_tensorcore(
+                                 throw std::runtime_error("VectorKNN: miss staging overflow at pos " + std::to_string(pos));
+                             char* hs = h_dstage[slot] + stage_off;
+                             int32_t* hs_ids = reinterpret_cast<int32_t*>(hs);
+-                            for (int64_t i = 0; i < db.count; ++i) hs_ids[i] = static_cast<int32_t>(hb.ids[static_cast<size_t>(i)]);
+-                            std::memcpy(hs + ids_bytes, hb.vecs.data(), vec_bytes);
++                            if (hbp) {
++                                for (int64_t i = 0; i < db.count; ++i) hs_ids[i] = static_cast<int32_t>(hbp->ids[static_cast<size_t>(i)]);
++                                std::memcpy(hs + ids_bytes, hbp->vecs.data(), vec_bytes);
++                            } else if (blob_mode == 1) {   // 交错记录 [int64 gid][D 个 DataT]
++                                const char* src = h_blob + blob_off;
++                                char* dv = hs + ids_bytes;
++                                for (int64_t i = 0; i < db.count; ++i) {
++                                    int64_t g; std::memcpy(&g, src + static_cast<size_t>(i) * blob_row, sizeof(int64_t));
++                                    if (g < 0 || g >= N) throw std::runtime_error("VectorKNN: blob gid out of range");   // bounds check
++                                    hs_ids[i] = static_cast<int32_t>(g);
++                                    std::memcpy(dv + static_cast<size_t>(i) * D * sizeof(DataT),
++                                                src + static_cast<size_t>(i) * blob_row + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
++                                }
++                            } else {                       // 连续行，gid = gid0 + i
++                                for (int64_t i = 0; i < db.count; ++i) hs_ids[i] = static_cast<int32_t>(blob_gid0 + i);
++                                std::memcpy(hs + ids_bytes, h_blob + blob_off, vec_bytes);
++                            }
+                             if (n_miss > static_cast<int>(K))   // bounds check (一个 position 最多 K+1 个桶)
+                                 throw std::runtime_error("VectorKNN: miss job table overflow at pos " + std::to_string(pos));
+                             h_mjobs[slot][n_miss++] = MissJob{base, static_cast<uint64_t>(stage_off), static_cast<uint64_t>(real_bytes)};
+@@ -5592,8 +5627,8 @@ void build_vector_knn_with_tensorcore(
+                     st.bucket_size = static_cast<int>(bucket_count[c]);
+                     st.actual_M    = std::min(M, st.pool_size - 1);
+                     if (st.actual_M > 0) {
+-                        // 自己桶的 gid，给 scatter 用 (blob 模式直接从 host blob 取)
+-                        if (d_blob) {
++                        // 自己桶的 gid，给 scatter 用 (记录在 host 内存里时直接从 host blob 取)
++                        if (h_blob) {
+                             size_t off = 0; int64_t gid0 = 0;
+                             bucket_vecs.blob_locate(c, off, gid0);
+                             for (int i = 0; i < st.bucket_size; ++i) {
+@@ -6790,7 +6825,8 @@ int run_pipeline_impl(
+             bucket_vecs_ptr = std::make_unique<BucketVectorAccumulator<DataT>>(
+                 BucketVectorAccumulator<DataT>::create(
+                     bucket_vec_dir, n_centroids, D, config.bucket_vec_buffer_bytes));
+-            bucket_vecs_ptr->set_in_memory_budget(config.cpu_limit_bytes / 4);
++            bucket_vecs_ptr->set_in_memory_budget(config.bucket_mem_mb > 0 ? (config.bucket_mem_mb << 20)
++                                                                           : config.cpu_limit_bytes / 4);
+         }
+         double t2_bucket_vec_create = std::chrono::duration<double>(Clock::now() - t2_bvc0).count();
+ 
+@@ -7605,6 +7641,9 @@ int main(int argc, char** argv) {
+             ("kmeans-train-fraction", po::value<float>(),
+                 "Step 2 (dataset fits on GPU): train KMeans|| on this random fraction of the points "
+                 "(centroid count stays N*centroid-ratio; default 1.0 = all points)")
++            ("bucket-mem-mb", po::value<size_t>(),
++                "Rounds 2..t: keep the bucket records (Step 4 → Step 6) in host memory when they fit this budget in MB "
++                "(default 0 = cpu-limit/4); Step 6 then copies GPU-cache misses straight from it")
+             ("gpu-bucket-cache-mb", po::value<size_t>(),
+                 "Out-of-core Step 6: GPU-side bucket cache budget in MB (Belady eviction; default 2048, 0 = off "
+                 "→ pools assembled on the host and uploaded per bucket)")
