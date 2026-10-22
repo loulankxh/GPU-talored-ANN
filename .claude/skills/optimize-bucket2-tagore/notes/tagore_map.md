@@ -157,3 +157,6 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
 - **#7 (rejected, +2.1%):** CSR part alone gives optimize_chunked −33 s (Phase 2 116 → 82 s) with reads at page-cache
   speed → #6's slow reads came from leaving the *read* buffers uninitialized. Next for optimize_chunked: B10 (user plan,
   bounded streaming top-K_out per destination; exact by the protected-set argument), measured first (step 1).
+- **#8 (rejected, +2.6%):** 6 slots fix round 1 of Step 6 (stream_sync −34 s) but round 2 is producer-bound (host get
+  ~63 s, wait_producer 103 s). Next Step 6 step must be the host side (B1c / B3: records in one pinned arena / RAM),
+  then re-apply the slot patch. Single-run gains of 2–3% are below the gates — the remaining easy wins are that size.

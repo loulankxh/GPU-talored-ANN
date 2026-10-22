@@ -178,6 +178,7 @@ SIFT100M 3–7% faster with everything else passing (rechecked later with multi-
 |---|---|---|---|
 | 6 | `optimize_chunked -m E` Phase 2: cache-friendly CSR (per-thread block histograms, 64-bit keys (row<<5|rank)<<32|src, per-block sort; byte-identical, fallback to the old build) + no-zero-fill allocator for the edge / key / CSR buffers + Phase 2 sub-timers (`EdgeChunkAccumulator`, `build_rank_ordered_csr_fast`; TAGORE `reorder` / `order_merge_new` block-wise processing) | SIFT100M 1463.29 s vs best 1336.36 (**−9.5 %**): Phase 2 116 → 203 s with breakdown read_fwd 49.4 / read_edges 123.6 / csr 11.3 / merge 2.7 / write 12.1 s — the CSR part improved (~53 → 11 s estimated from SIFT10M ×10) but both reads ran at ~260 MB/s = raw disk speed (files not in page cache in this run; 207 GB free afterwards, cause unknown: environment or the untouched buffers). SIFT10M forced disk path: Phase 2 14.6–17.8 → 10.1–10.6 s, byte-identical. 1M auto −0.2 %, 1M large −1.0 % (rerun; first run 8.96 s was −4.1 % vs the optimistic #5 best, difference only in untouched bucket2), 10M +1.6 %; recall unchanged | judge: SIFT100M regression > 7 % | `bucketDemo/patches/tagore6_csr_radix_noinit.patch` — recheck: CSR part alone (keep zero-fill) and a multi-run SIFT100M |
 | 7 | #6 retried with the CSR part only: radix CSR build, only the 64-bit key array left uninitialized (edge / src buffers stay zero-filled `std::vector`) + Phase 2 sub-timers; byte-identical | SIFT100M 1336.36 → 1308.83 s (**+2.1 %**): optimize_chunked 191.9 → 158.6 s, Phase 2 116 → 82.2 s (read_fwd 11.0 / read_edges 32.7 / csr 21.5 / merge 2.6 / write 11.5 s — reads at page-cache speed this time, unlike #6's 49 / 124 s, which points at #6's uninitialized read buffers); bucket2 942 → 953 s (noise); 1M ±0 %, 10M −0.3 %; recall unchanged | below 3 % → not even a possible gain; superseded by B10 step 3 (bounded streaming top-K_out per destination) | `bucketDemo/patches/tagore7_csr_radix.patch` |
+| 8 | Step 6 out-of-core GPU-cache miss path (non-blob): at least 6 slots instead of the SM-fill heuristic's 2 (TAGORE `largeIndex` multiple `graph_pool` slots). SIFT10M thrash test (`BUCKET2_BLOB=0`, 200 MB cache, 1 round): loop 2 slots 12.8 s, 4: 10.4, 6: 9.4, 8: 9.2 s | SIFT100M 1336.36 → 1301.17 s (**+2.6 %**): Step 6 348 → 320 s; round 1 loop 174 → 141 s (stream_sync 67 → 33 s), round 2 166 → 171 s (now producer-bound: wait_producer 103 s, host get ~63 s); 1M +0.6 / −0.5 %, 10M +2.1 % (blob mode, unchanged code path); recall / memory unchanged | below 3 %; round 2 needs the producer (host get) fixed first (B1c / B3) | `bucketDemo/patches/tagore8_step6_min6_slots.patch` |
 
 ## Iterations
 
@@ -547,3 +548,10 @@ See **Tried & rejected** (#7). optimize_chunked 192 → 159 s, but the SIFT100M 
 noise. Reads ran at page-cache speed this time, so #6's regression was most likely its uninitialized read buffers.
 The user-approved B10 plan (bounded streaming top-K_out per destination, recorded in the backlog together with the
 corrected A3 note) replaces this CSR path anyway.
+
+### #8 — REJECTED (+2.6 %): Step 6 miss path with ≥ 6 slots (2026-10-22)
+
+See **Tried & rejected** (#8). Round 1 gained 33 s, round 2 is bound by the host side of the miss path (host Belady get).
+Note for the user: #7 (+2.1 %, optimize_chunked −33 s) and #8 (+2.6 %, Step 6 −28 s) are both real stage gains below
+the single-run 3 % / 7 % thresholds; with SIFT100M single-run noise of ±20–30 s, multi-run medians (planned by the
+user) would let such changes be accepted; combined they are ~5 %.

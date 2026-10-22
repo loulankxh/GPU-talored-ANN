@@ -1,0 +1,18 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index f22f00f..02816a3 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -5032,6 +5032,13 @@ void build_vector_knn_with_tensorcore(
+     int target_streams = std::max(2,
+         static_cast<int>(std::ceil(num_sm * OVERSUB / est_blocks_per_kernel)));
+     target_streams = std::min(target_streams, MAX_SLOTS);
++    // GPU bucket 缓存逐桶加载 (非 blob) 时 producer 是瓶颈: slot 少了 producer 最多只能领先 GPU
++    // 两个 position，主线程在 stream_sync / wait_producer 上来回等。多给几个 slot 加深流水 (参考 TAGORE
++    // largeIndex: graph_pool 多个缓冲槽，GPU 构建和 CPU 合并互不等待)。#3 的 dots 行分块后每个 slot
++    // 只要 ~0.2 GB。SIFT10M 非 blob 实测 (缓存 200 MB): 2 slot 12.8 s/轮, 4: 10.4, 6: 9.4, 8: 9.2。
++    // blob 模式 (数据整块在显存) 没有这个瓶颈，保持原来的 slot 数。
++    constexpr int kMinSlotsCacheMiss = 6;
++    if (use_dev_cache && !d_blob) target_streams = std::min(MAX_SLOTS, std::max(target_streams, kMinSlotsCacheMiss));
+ 
+     // 内存上限：从 target_streams 往下试，挑能装下的最大值
+     int num_slots = 1;
