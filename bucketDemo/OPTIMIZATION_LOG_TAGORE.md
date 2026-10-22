@@ -30,34 +30,34 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#1 (Step 6 GPU-cache misses: pinned staging + one H2D + scatter kernel per position)**, 2026-10-22 (`runs/tagore1`):
+After **#2 (Step 6: deferred eviction frees + reuse of freed device blocks)**, 2026-10-22 (`runs/tagore2`):
 
 **Build time (s, median; sum of all stages)**
 
 | config | path | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
 |---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | resident | 6.27 | -0.2% | -0.2% | 0.68x | 0.54x | bucket2 6.27 | 3876 | 1.71 |
-| sift1M_large | large | 9.44 | +2.6% | +2.6% | 1.03x | 0.82x | bucket2 7.64, prune 0.72, optimize_chunked 0.72, translate 0.37 | 1662 | 2.04 |
-| sift10M_auto | large | 82.20 | +0.3% | +0.3% | 0.38x | 0.67x | bucket2 71.76, prune 4.03, optimize_chunked 2.87, translate 3.54 | 8996 | 12.65 |
-| sift100M_auto | large | 2978.78 | +7.3% | +7.3% | 1.38x | — | bucket2 2414.86, prune 155.29, optimize_chunked 339.86, translate 68.77 | 14588 | 79.41 |
+| sift1M_auto | resident | 6.27 | +0.0% | -0.2% | 0.68x | 0.54x | bucket2 6.27 | 3812 | 1.71 |
+| sift1M_large | large | 9.61 | -1.8% | +0.8% | 1.05x | 0.83x | bucket2 7.78, prune 0.71, optimize_chunked 0.72, translate 0.40 | 1590 | 2.04 |
+| sift10M_auto | large | 82.22 | -0.0% | +0.3% | 0.38x | 0.67x | bucket2 71.83, prune 3.96, optimize_chunked 2.87, translate 3.56 | 8996 | 12.65 |
+| sift100M_auto | large | 2506.89 | +15.8% | +22.0% | 1.17x | — | bucket2 2023.02, prune 133.15, optimize_chunked 286.79, translate 63.93 | 15492 | 79.41 |
 
 **bucket2 step breakdown (s)**
 
 | config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | 0.63 | 0.26 | 0.18 | 0.00 | 0.61 | 0.36 | 0.02 | 2.76 | 0.00 | 0.89 |
-| sift1M_large | 0.14 | 0.62 | 0.35 | 0.00 | 1.01 | 0.29 | 0.04 | 4.00 | 0.51 | 0.00 |
-| sift10M_auto | 1.38 | 7.32 | 2.39 | 0.00 | 18.40 | 1.75 | 0.33 | 35.14 | 3.89 | 0.00 |
-| sift100M_auto | 71.59 | 372.24 | 97.35 | 0.00 | 251.74 | 175.12 | 7.22 | 1401.27 | 25.14 | 0.00 |
+| sift1M_auto | 0.63 | 0.26 | 0.17 | 0.00 | 0.62 | 0.36 | 0.02 | 2.75 | 0.00 | 0.89 |
+| sift1M_large | 0.14 | 0.60 | 0.35 | 0.00 | 0.99 | 0.26 | 0.04 | 4.21 | 0.49 | 0.00 |
+| sift10M_auto | 1.45 | 7.43 | 2.37 | 0.00 | 18.52 | 1.76 | 0.38 | 34.79 | 4.00 | 0.00 |
+| sift100M_auto | 72.31 | 371.49 | 97.43 | 0.00 | 252.26 | 170.64 | 7.47 | 1016.61 | 26.76 | 0.00 |
 
 **(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
 
 | config | recall@1 | recall@10 | recall@32 | recall@64 |
 |---|---|---|---|---|
-| sift1M_auto | 0.9746 | 0.9665 | 0.9595 | 0.9539 |
-| sift1M_large | 0.9739 | 0.9646 | 0.9583 | 0.9525 |
-| sift10M_auto | 0.9211 | 0.8994 | 0.8838 | 0.8717 |
-| sift100M_auto | 0.7457 | 0.7201 | 0.6966 | 0.6808 |
+| sift1M_auto | 0.9741 | 0.9668 | 0.9590 | 0.9532 |
+| sift1M_large | 0.9754 | 0.9663 | 0.9592 | 0.9535 |
+| sift10M_auto | 0.9162 | 0.8989 | 0.8832 | 0.8711 |
+| sift100M_auto | 0.7511 | 0.7208 | 0.6970 | 0.6814 |
 
 **(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); sift1M/10M: cuVS CAGRA search, sift100M: DiskANN CPU search (itopk = L)**
 
@@ -68,10 +68,10 @@ After **#1 (Step 6 GPU-cache misses: pinned staging + one H2D + scatter kernel p
 | TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
 | CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
 | CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
-| ours sift1M_auto | 0.9278 / 1944K | 0.9775 / 1036K | 0.9942 / 490K | 0.9987 / 186K | 0.9997 / 68K |
-| ours sift1M_large | 0.9140 / 1946K | 0.9707 / 1034K | 0.9918 / 493K | 0.9981 / 180K | 0.9995 / 68K |
-| ours sift10M_auto | 0.8377 / 1871K | 0.9281 / 1012K | 0.9735 / 526K | 0.9922 / 186K | 0.9980 / 68K |
-| ours sift100M_auto | 0.7467 / 62K | 0.8525 / 61K | 0.9253 / 37K | 0.9683 / 20K | 0.9884 / 11K |
+| ours sift1M_auto | 0.9280 / 1950K | 0.9769 / 1048K | 0.9944 / 501K | 0.9987 / 187K | 0.9996 / 68K |
+| ours sift1M_large | 0.9147 / 2224K | 0.9708 / 1188K | 0.9922 / 561K | 0.9983 / 189K | 0.9995 / 68K |
+| ours sift10M_auto | 0.8393 / 1868K | 0.9292 / 1011K | 0.9735 / 489K | 0.9916 / 176K | 0.9980 / 68K |
+| ours sift100M_auto | 0.7458 / 69K | 0.8518 / 64K | 0.9252 / 39K | 0.9680 / 23K | 0.9880 / 13K |
 
 ## Baseline verification
 
@@ -100,8 +100,7 @@ under the bench lock, page cache dropped, wall clock incl. load (like our `build
 
 **TAGORE does not run correctly on the V100 (sm_70) as published** — three bugs, fixed in a *copy*
 (`build-v100/patched-src`, built in `build-v100/patched-build`; the clone's sources are untouched;
-diff: `.claude/skills/optimize-bucket2-tagore/scripts/tagore_v100_fix.patch`). **User: please confirm this is OK** (else the
-TAGORE numbers below are "not runnable on V100"):
+diff: `.claude/skills/optimize-bucket2-tagore/scripts/tagore_v100_fix.patch`). **Confirmed by user 2026-10-22 (fixes stay in the copy)** (decision relayed from the user's other session):
 1. `nn_descent_opt_reverse_sample`: binary search reads `old_nn[old_num]` (one past the 32-entry shared array) →
    "Warp Out-of-range Address" on sm_70 (found with compute-sanitizer + cuda-gdb). Fix: `res_id < num &&` bounds check.
 2. `nn_descent_opt_cal` (both GEMMs): indexes `acc_frag.x[i]` with the sm_80 `mma.m16n8k16` element order
@@ -144,7 +143,8 @@ SIFT100M Step 6 = 1687 s of 3215 s, and ~1000 s of it is the producer waiting on
 | id | idea | TAGORE source | target stage (SIFT100M s) | expected gain |
 |---|---|---|---|---|
 | ~~B1~~ | done in #1 (pinned staging + one H2D + scatter kernel; SIFT100M −236 s) | | | |
-| B1b | Step 6 miss path, what #1 left: device arena for cached buckets instead of per-bucket `cudaMallocAsync` / `cudaFreeAsync` (67–75 s + eviction frees per round), int32 ids kept in the host cache (no per-miss conversion) | `gpu_construct` buffers allocated once | Step 6 malloc 67 / 75 s + free | −100…−150 s |
+| ~~B1b~~ | done in #2 (deferred eviction frees + reuse of freed device blocks; SIFT100M −472 s) | | | |
+| B1c | Step 6 host get (139 / 192 s per round): host Belady cache of int32-id records in one pinned arena (no per-bucket vectors, H2D-ready), budget so 13.6 GB of records fit (`--cache-mb`, RSS guard ≤ 1.2× 79.4 GB) — cf. B3 | `graph_pool` in host RAM | Step 6 host get | −100…−250 s |
 | B2 | GPU bucket cache budget vs dots slot buffers (resource params: `--gpu-cache-mb`, dots slot cap): fewer evictions | `largeIndex` `buffer_size` / `max_points` sizing, `reorder` slot choice | Step 6 wait_producer 660 + 735 | −100…−400 s |
 | B3 | Host side of the miss path: round bucket records held in RAM (bucket2 host budget so the Belady cache / blob holds 13.6 GB; RSS guard ≤ 1.2× 79.4 GB) — cf. cuVS-loop #75 | `graph_pool` kept in host RAM | Step 6 cache_get − upload ≈ 230 + 250 | −100…−300 s |
 | B4 | KMeans|| d(x, C): fused tensor-core GEMM + row-min with precomputed norms (cuVS-loop `iter73` patch, maybe + `iter72`) — at SIFT100M kmeans_parallel is 180 s / round | `nn_descent_opt_cal` + `cal_power` | Step 2 368 | −100…−170 s |
@@ -156,8 +156,8 @@ SIFT100M Step 6 = 1687 s of 3215 s, and ~1000 s of it is the producer waiting on
 | id | idea | TAGORE source | target stage | expected gain | what changes semantically | status |
 |---|---|---|---|---|---|---|
 | A1 | GNN-Descent local join (resident: TAGORE GNN-Descent; large path: fused prune + local join, RNG test + insertion, tensor-core GEMM) | `nn_descent_opt_*`, `sample_kernel6`, `merge_reverse_plus` | Step 6 (via lower NPROBE / ITERATIONS) + prune | see `docs/A1_local_join.md` §2.7 | adds a refinement stage, RNG prune on the large path | **APPROVED 2026-10-21** — `.claude/skills/optimize-bucket2-tagore/docs/A1_local_join.md`, split §2.8 |
-| A2 | Coarser large-path buckets: ~10–20K points per bucket (instead of ~100) with a small nprobe, so a bucket pair is one big GEMM and the GPU cache holds whole working sets (TAGORE clusters of ~2M points processed whole on the GPU) | `largeIndex` clusters + `gpu_construct` | Step 6 (1687 s), Step 2 (fewer centroids: 368 s) | Step 6 cache traffic largely gone; −500…−1000 s if quality holds with lower nprobe | bucketing (centroid count, `CENTROID_RATIO`) and the candidate set (`NPROBE`) change → pre-prune recall changes | awaiting user |
-| A3 | Bounded per-node reverse list on the GPU (TAGORE RESERVENUM: keep the d best-detour reverse candidates, drop overflow) so `optimize_chunked` is one GPU pass without the disk edge accumulator | `filter_cagra` reverse push (`tmp % d` replacement) + `filter_reverse_1hop` | optimize_chunked 280 s | −150…−200 s | reverse edges beyond the bound are dropped (CAGRA keeps all and ranks them) | awaiting user |
+| A2 | Coarser large-path buckets: ~10–20K points per bucket (instead of ~100) with a small nprobe, so a bucket pair is one big GEMM and the GPU cache holds whole working sets (TAGORE clusters of ~2M points processed whole on the GPU) | `largeIndex` clusters + `gpu_construct` | Step 6 (1687 s), Step 2 (fewer centroids: 368 s) | Step 6 cache traffic largely gone; −500…−1000 s if quality holds with lower nprobe | bucketing (centroid count, `CENTROID_RATIO`) and the candidate set (`NPROBE`) change → pre-prune recall changes | **APPROVED 2026-10-22 (restricted: params only, avg bucket size 128–512)** — `CENTROID_RATIO` ≈ 1/512…1/128 (SIFT100M ≈ 195K–780K centroids) + smaller / retuned `NPROBE` (and `KNN_K` if needed); same bucketing algorithm, bucket order, bucket-pair candidate rule, prune, reverse edges; applied the same way to SIFT1M/10M unless logged otherwise; ~10K-point buckets only for truly huge datasets (SIFT1B), not now (relayed from the user's other session) |
+| A3 | Bounded per-node reverse list on the GPU (TAGORE RESERVENUM: keep the d best-detour reverse candidates, drop overflow) so `optimize_chunked` is one GPU pass without the disk edge accumulator | `filter_cagra` reverse push (`tmp % d` replacement) + `filter_reverse_1hop` | optimize_chunked 280 s | −150…−200 s | reverse edges beyond the bound are dropped (CAGRA keeps all and ranks them) | **deferred by user 2026-10-22 (not to be tried until the user reopens it)**; B6 (exact GPU reverse collection, same CAGRA rule) stays a normal implementation idea (relayed from the user's other session) |
 
 ## Possible gains
 
@@ -254,3 +254,77 @@ total 3214.58 → **2978.78 s (+7.3%)**; optimize_chunked 280 → 340 s and tran
 
 **Remaining in the miss path (next):** host get 139–201 s/round (Belady host cache 8.6 GB < 13.6 GB records → disk
 reads), `cudaMallocAsync` + eviction `cudaFreeAsync` ~5 µs per miss, and ≈20 misses per bucket (cache size / order).
+
+### User decisions 2026-10-22 (relayed from the user's other session)
+
+1. TAGORE V100 fixes: approved; they stay only in `build-v100/patched-src` + `scripts/tagore_v100_fix.patch`, the
+   `/home/lanlu/Tagore` sources are never modified.
+2. A2 approved in a restricted form: parameters only (`CENTROID_RATIO` for bigger buckets, smaller / retuned `NPROBE`,
+   `KNN_K` if needed), no change of semantics; average bucket size 128–512 points (SIFT100M `CENTROID_RATIO` ≈
+   0.002–0.0078); same ratio for SIFT1M/10M unless a reason is logged. ~10K-point buckets only for SIFT1B-scale data.
+3. A3 deferred (not to be tried until the user reopens it); B6 stays a normal implementation idea.
+
+### #2 — Step 6: deferred eviction frees + reuse of freed device blocks (2026-10-22)
+
+**Idea:** what #1 left in the SIFT100M miss path was `cache_get − upload` ≈ 228 / 257 s per round (eviction:
+`before_free` blocked the producer until the main thread had submitted the victim's last position — Belady often
+evicts a bucket used 1–3 not-yet-submitted positions ago — then `cudaFreeAsync`) and `cudaMallocAsync` 67 / 75 s.
+(1) Eviction hands `(d_buf, last_pos, bytes)` to a pending list; the producer drains it without blocking at each
+position (copy stream waits the gather event of each drained position, as before). (2) Drained blocks go to per-size
+free lists (1 KB granularity, a miss takes the same size or up to +50 %) and are reused by later misses instead of
+`cudaFreeAsync` + `cudaMallocAsync`; the lists are capped at `gpu_cache_bytes / 8` (beyond that: real free), so device
+memory ≤ cache budget + 1/8; cache accounting uses the block size. Writes into a reused block are on the copy stream
+after the wait → stream-ordered. (A fixed 2 GB arena was tried first in the dev test: 22 % fallback allocations from
+size-class fragmentation, i.e. memory beyond the budget → replaced by the capped free lists.)
+**TAGORE source:** `large_index.cu::gpu_construct` (all device buffers allocated once and reused for every cluster;
+no allocation in the hot loop) + the `has_merged` hand-off (the GPU thread never waits on the merge for a slot it does
+not need yet). **Class:** implementation.
+**Dev test** (SIFT10M, 1 round, `BUCKET2_BLOB=0`, `--gpu-bucket-cache-mb 200`, GPU 2): loop 30.2 → 28.9 (deferred
+frees) → 26.8 (fixed arena) → **25.4 s** (capped free lists; 7.6 % of misses allocate); recall@10 0.6459 (noise).
+**SIFT100M:** Step 6 1401.3 → **1016.6 s**; per round loop 614 / 745 → 438 / 533 s, cache_get 524 / 644 → 349 / 432 s,
+upload 296 / 386 → 230 / 304 s (host get 139 / 192, malloc 7 / 10, h2d call 17 / 18, deferred free 16 / 20 s; device
+allocs 0.63M / 0.88M of 20.9M / 21.8M misses); total 2978.78 → **2506.89 s (+15.8 %, +22.0 % vs #0)**. DiskANN
+recall@10 0.7458 / 0.8518 / 0.9252 / 0.9680 / 0.9880, 0 defects, RSS 79.4 GB. **GPU peak 14588 → 15492 MiB** (free
+lists + allocation churn; ~0.6 GB left on the 16 GB V100 — watch it in later Step 6 changes).
+SIFT1M / 10M unchanged (blob mode; 1M large −1.8 % = noise).
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 6.27 | +0.0% | -0.2% | 0.68x | 0.54x | bucket2 6.27 | 3812 | 1.71 |
+| sift1M_large | large | 9.61 | -1.8% | +0.8% | 1.05x | 0.83x | bucket2 7.78, prune 0.71, optimize_chunked 0.72, translate 0.40 | 1590 | 2.04 |
+| sift10M_auto | large | 82.22 | -0.0% | +0.3% | 0.38x | 0.67x | bucket2 71.83, prune 3.96, optimize_chunked 2.87, translate 3.56 | 8996 | 12.65 |
+| sift100M_auto | large | 2506.89 | +15.8% | +22.0% | 1.17x | — | bucket2 2023.02, prune 133.15, optimize_chunked 286.79, translate 63.93 | 15492 | 79.41 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.63 | 0.26 | 0.17 | 0.00 | 0.62 | 0.36 | 0.02 | 2.75 | 0.00 | 0.89 |
+| sift1M_large | 0.14 | 0.60 | 0.35 | 0.00 | 0.99 | 0.26 | 0.04 | 4.21 | 0.49 | 0.00 |
+| sift10M_auto | 1.45 | 7.43 | 2.37 | 0.00 | 18.52 | 1.76 | 0.38 | 34.79 | 4.00 | 0.00 |
+| sift100M_auto | 72.31 | 371.49 | 97.43 | 0.00 | 252.26 | 170.64 | 7.47 | 1016.61 | 26.76 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9741 | 0.9668 | 0.9590 | 0.9532 |
+| sift1M_large | 0.9754 | 0.9663 | 0.9592 | 0.9535 |
+| sift10M_auto | 0.9162 | 0.8989 | 0.8832 | 0.8711 |
+| sift100M_auto | 0.7511 | 0.7208 | 0.6970 | 0.6814 |
+
+**(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); sift1M/10M: cuVS CAGRA search, sift100M: DiskANN CPU search (itopk = L)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| TAGORE GNN-Descent k=96 + CAGRA prune, sift1M | 0.9220 / 1947K | 0.9752 / 1033K | 0.9936 / 497K | 0.9985 / 186K | 0.9996 / 68K |
+| TAGORE largeIndex Vamana, sift10M | 0.8448 / 1875K | 0.9238 / 1014K | 0.9662 / 482K | 0.9863 / 185K | 0.9950 / 68K |
+| TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9280 / 1950K | 0.9769 / 1048K | 0.9944 / 501K | 0.9987 / 187K | 0.9996 / 68K |
+| ours sift1M_large | 0.9147 / 2224K | 0.9708 / 1188K | 0.9922 / 561K | 0.9983 / 189K | 0.9995 / 68K |
+| ours sift10M_auto | 0.8393 / 1868K | 0.9292 / 1011K | 0.9735 / 489K | 0.9916 / 176K | 0.9980 / 68K |
+| ours sift100M_auto | 0.7458 / 69K | 0.8518 / 64K | 0.9252 / 39K | 0.9680 / 23K | 0.9880 / 13K |

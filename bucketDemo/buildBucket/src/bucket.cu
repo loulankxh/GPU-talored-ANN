@@ -4646,6 +4646,9 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
 struct DevCacheCtx {
     cudaStream_t copy_stream = nullptr;
     std::function<void(int32_t last_pos)> before_free;   // 在 producer 线程上调用
+    // 设置后淘汰不再当场等待/释放，只把 (d_buf, last_pos) 交出去延迟释放 (见 Step 6 producer 的
+    // drain_pending_free)：被淘汰的桶常常刚在 1-3 个还没提交的 position 里用过，当场等会卡住 producer
+    std::function<void(void* d_buf, int32_t last_pos, size_t bytes)> defer_free;
 };
 
 struct DevBucket {
@@ -4678,8 +4681,12 @@ private:
     }
     void release() {
         if (!d_buf) return;
-        if (ctx && ctx->before_free) ctx->before_free(last_pos);
-        cudaFreeAsync(d_buf, ctx ? ctx->copy_stream : nullptr);
+        if (ctx && ctx->defer_free) {
+            ctx->defer_free(d_buf, last_pos, bytes);
+        } else {
+            if (ctx && ctx->before_free) ctx->before_free(last_pos);
+            cudaFreeAsync(d_buf, ctx ? ctx->copy_stream : nullptr);
+        }
         d_buf = nullptr; d_ids = nullptr; d_vecs = nullptr; count = 0; bytes = 0;
     }
 };
@@ -5287,6 +5294,63 @@ void build_vector_knn_with_tensorcore(
     // 未命中桶的 pinned 暂存区 (每 slot 一块，按 d_buf 布局 [int32 ids 16B 对齐][vecs] 写好，一次
     // 异步 H2D)。参考 TAGORE gpu_construct: 缓冲区按上界一次分配、整块拷贝，不走 pageable 小拷贝。
     // 一个 position 的未命中最多就是整个 pool，所以按 pool 上界 + 每桶 16B 对齐余量分配。
+    // 淘汰的 device 桶: 等最后读它的 position 提交后 (copy_stream 等那个 gather 事件) 再 cudaFreeAsync。
+    // 只在 producer 线程上读写 (淘汰都发生在 producer 的 get() 里)；收尾时 dev_cache.reset() 在主线程，
+    // 那时 producer 已结束。缓存的字节账不变，最多多占几个 position 的淘汰量。
+    std::vector<std::tuple<void*, int32_t, size_t>> pending_free;
+    double t_free_drain = 0;
+    // device 桶块复用 (参考 TAGORE gpu_construct: 显存分配一次、反复复用，不在热循环里 malloc/free)：
+    // 桶按 1 KB 粒度取整，淘汰的块进同尺寸类的空闲链表 (copy_stream 已等过最后一个读者，之后对它的写
+    // 都在 copy_stream 上，按流顺序安全)，下次同尺寸 (或最多大 50%) 的未命中直接拿来用；链表里的总量
+    // 超过 gpu_cache_bytes/8 时才真的 cudaFreeAsync，显存占用 ≤ 缓存预算 + 1/8。
+    constexpr size_t kArenaGran = 1024;
+    std::unordered_map<size_t, std::vector<char*>> arena_free;   // 尺寸 (字节, kArenaGran 的倍数) → 空闲块
+    size_t arena_free_bytes = 0;
+    const size_t arena_free_cap = gpu_cache_bytes / 8;
+    int64_t n_arena_fallback = 0;
+    // bytes 已按 kArenaGran 取整；返回块地址，bytes 改成块的实际大小 (淘汰时按它回到对应链表，缓存记账也用它)
+    auto arena_alloc = [&](size_t& bytes) -> char* {
+        // 同尺寸类优先，其次最多大 50% 的空闲块 (尺寸类之间不合并，靠这个减少 arena 碎片导致的退回)
+        for (size_t sz = bytes; sz <= bytes + bytes / 2; sz += kArenaGran) {
+            auto it = arena_free.find(sz);
+            if (it != arena_free.end() && !it->second.empty()) {
+                char* b = it->second.back(); it->second.pop_back(); bytes = sz; arena_free_bytes -= sz; return b;
+            }
+        }
+        void* b = nullptr;
+        CUDA_CHECK(cudaMallocAsync(&b, bytes, copy_stream));
+        ++n_arena_fallback;
+        return static_cast<char*>(b);
+    };
+    auto arena_release = [&](void* buf, size_t bytes) {   // 调用前 copy_stream 已等过最后的读者
+        if (arena_free_bytes + bytes <= arena_free_cap) {
+            arena_free[bytes].push_back(static_cast<char*>(buf));
+            arena_free_bytes += bytes;
+        } else {
+            cudaFreeAsync(buf, copy_stream);
+        }
+    };
+    auto drain_pending_free = [&](bool all) {
+        if (pending_free.empty()) return;
+        auto td0 = std::chrono::high_resolution_clock::now();
+        size_t keep = 0;
+        {
+            std::lock_guard<std::mutex> lk(stage_mtx);
+            int32_t waited = -1;
+            for (size_t i = 0; i < pending_free.size(); ++i) {
+                auto [buf, lp, nbytes] = pending_free[i];
+                if (!all && lp > submitted_pos) { pending_free[keep++] = pending_free[i]; continue; }
+                if (lp >= 0 && lp != waited) {
+                    const PosEvent& pe = pos_ring[static_cast<size_t>(lp % kPosRing)];
+                    if (pe.pos == lp) cudaStreamWaitEvent(copy_stream, pe.ev, 0);
+                    waited = lp;
+                }
+                arena_release(buf, nbytes);
+            }
+        }
+        pending_free.resize(keep);
+        t_free_drain += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - td0).count();
+    };
     char* h_dstage[MAX_SLOTS] = {nullptr};
     char* d_dstage[MAX_SLOTS] = {nullptr};
     MissJob* h_mjobs[MAX_SLOTS] = {nullptr};
@@ -5313,6 +5377,7 @@ void build_vector_knn_with_tensorcore(
             const PosEvent& pe = pos_ring[static_cast<size_t>(last_pos % kPosRing)];
             if (pe.pos == last_pos) cudaStreamWaitEvent(copy_stream, pe.ev, 0);
         };
+        dev_ctx.defer_free = [&](void* buf, int32_t last_pos, size_t bytes) { pending_free.emplace_back(buf, last_pos, bytes); };
         dev_cache = std::make_unique<bucket_order::BeladyBucketCache<DevBucket>>(
             std::move(future_access_dev), gpu_cache_bytes,
             [](const DevBucket& b) { return b.bytes; });
@@ -5368,6 +5433,7 @@ void build_vector_knn_with_tensorcore(
                     int n_miss = 0;
                     // 这个 slot 上一次 (num_slots 个 position 之前) 的未命中拷贝完成后才能重写暂存区
                     if (h_dstage[slot]) CUDA_CHECK(cudaEventSynchronize(ev_load[slot]));
+                    drain_pending_free(false);   // 已提交 position 的淘汰桶在这里释放 (不阻塞)
                     auto dev_loader = [&](int32_t bid) {
                         auto tu0 = diag_now();
                         if (d_blob) {
@@ -5393,15 +5459,16 @@ void build_vector_knn_with_tensorcore(
                         db.count = static_cast<int64_t>(hb.ids.size());
                         const size_t ids_bytes = (static_cast<size_t>(db.count) * sizeof(int32_t) + 15) / 16 * 16;
                         const size_t vec_bytes = static_cast<size_t>(db.count) * D * sizeof(DataT);
-                        db.bytes = ids_bytes + vec_bytes;
+                        const size_t real_bytes = ids_bytes + vec_bytes;
+                        db.bytes = (std::max<size_t>(real_bytes, 16) + kArenaGran - 1) / kArenaGran * kArenaGran;
                         auto tm0 = diag_now();
-                        CUDA_CHECK(cudaMallocAsync(&db.d_buf, std::max<size_t>(db.bytes, 16), copy_stream));
+                        db.d_buf = arena_alloc(db.bytes);
                         t_dev_malloc += diag_secs(tm0, diag_now());
                         char* base = static_cast<char*>(db.d_buf);
                         db.d_ids  = reinterpret_cast<const int32_t*>(base);
                         db.d_vecs = base + ids_bytes;
                         if (db.count > 0) {
-                            if (stage_off + db.bytes > dstage_cap)   // bounds check (未命中总量 ≤ pool 上界)
+                            if (stage_off + real_bytes > dstage_cap)   // bounds check (未命中总量 ≤ pool 上界)
                                 throw std::runtime_error("VectorKNN: miss staging overflow at pos " + std::to_string(pos));
                             char* hs = h_dstage[slot] + stage_off;
                             int32_t* hs_ids = reinterpret_cast<int32_t*>(hs);
@@ -5409,8 +5476,8 @@ void build_vector_knn_with_tensorcore(
                             std::memcpy(hs + ids_bytes, hb.vecs.data(), vec_bytes);
                             if (n_miss > static_cast<int>(K))   // bounds check (一个 position 最多 K+1 个桶)
                                 throw std::runtime_error("VectorKNN: miss job table overflow at pos " + std::to_string(pos));
-                            h_mjobs[slot][n_miss++] = MissJob{base, static_cast<uint64_t>(stage_off), static_cast<uint64_t>(db.bytes)};
-                            stage_off += (db.bytes + 15) / 16 * 16;   // 下一块 16B 对齐 (余量已算进 dstage_cap)
+                            h_mjobs[slot][n_miss++] = MissJob{base, static_cast<uint64_t>(stage_off), static_cast<uint64_t>(real_bytes)};
+                            stage_off += (real_bytes + 15) / 16 * 16;   // 下一块 16B 对齐 (余量已算进 dstage_cap)
                         }
                         ++n_dev_loads;
                         t_dev_upload += diag_secs(tu0, diag_now());
@@ -5886,9 +5953,12 @@ void build_vector_knn_with_tensorcore(
     if (use_dev_cache) {
         std::cout << "  [VectorKNN] GPU bucket cache: " << n_dev_loads << " bucket uploads, upload "
                   << std::fixed << std::setprecision(3) << t_dev_upload << "s (host get " << t_dev_hostget
-                  << "s, malloc " << t_dev_malloc << "s, h2d call " << t_dev_copy << "s), evictions "
+                  << "s, malloc " << t_dev_malloc << "s, h2d call " << t_dev_copy << "s, deferred free " << t_free_drain << "s, device allocs " << n_arena_fallback << "), evictions "
                   << dev_cache->evictions() << "\n";
         dev_cache.reset();                       // 释放全部 device 桶 (都已提交)
+        drain_pending_free(true);
+        for (auto& kv : arena_free) for (char* b : kv.second) cudaFreeAsync(b, copy_stream);
+        arena_free.clear(); arena_free_bytes = 0;
         CUDA_CHECK(cudaStreamSynchronize(copy_stream));
         CUDA_CHECK(cudaStreamDestroy(copy_stream));
         for (auto& pe : pos_ring) cudaEventDestroy(pe.ev);

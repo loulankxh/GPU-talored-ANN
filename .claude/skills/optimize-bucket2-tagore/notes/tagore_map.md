@@ -131,3 +131,9 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   calls are now negligible (17 s); what remains per miss is the host Belady get (139 / 201 s: host cache 8.6 GB <
   13.6 GB of records), `cudaMallocAsync` (67 / 75 s) + eviction `cudaFreeAsync`, and ~20 misses per bucket. TAGORE's
   lesson holds: allocate once, move big blocks. Next: B1b (device arena), then B2 / B3 for the miss count and host get.
+- **#2 (accepted, +15.8% SIFT100M → 2506.9 s):** deferred eviction frees (no producer stall on unsubmitted
+  positions) + capped per-size free lists for device blocks: Step 6 1401 → 1017 s. A fixed arena fragmented (22%
+  fallback allocations) — capped free lists over `cudaMallocAsync` work better. GPU peak 15.5 GB (watch). Left per
+  round: host get 139 / 192 s, Belady + drain ≈ 120 s, ~21M misses (≈21 per bucket). Next candidates: B1c / B3 (host
+  get), B2 (miss count, but GPU memory is tight now), A2 (approved, params only: bigger buckets → fewer, larger
+  transfers and fewer pool entries; directly reduces per-bucket overheads), B4 (Step 2 371 s).
