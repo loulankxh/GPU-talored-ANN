@@ -3236,12 +3236,14 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
     // (resident_merge_kernel 取两者并集去重后的前 M)，拿它当行阈值初值
     const float* __restrict__ seed_d = nullptr,
     // 非空 (out-of-core round 2..t): 按 gid 索引的 running 第 M 个距离 (ChunkedKnnAccumulator::kth)
-    const float* __restrict__ seed_gid = nullptr, int64_t seed_n = 0)
+    const float* __restrict__ seed_gid = nullptr, int64_t seed_n = 0,
+    // 行分块 (out-of-core Step 6): dots 只装 bucket 的 [row0, row0 + gridDim.x) 行，q 仍是 bucket 内行号
+    int row0 = 0)
 {
     constexpr int LANES = 32;
     constexpr int K_PER_LANE = K_OUT / LANES;
     constexpr unsigned ALL = 0xFFFFFFFFu;
-    const int q    = blockIdx.x;
+    const int q    = blockIdx.x + row0;
     const int warp = threadIdx.x / LANES;
     const int lane = threadIdx.x & (LANES - 1);
 
@@ -3280,7 +3282,7 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
 
     // 每 lane 每次读 4 个候选 (float4)，提高在途访存量——一个 bucket 只有
     // bucket_size 个 block，占用率天然不高，标量读时这个 kernel 是延迟瓶颈。
-    const DotT* row = dots + static_cast<int64_t>(q) * ldd;
+    const DotT* row = dots + static_cast<int64_t>(blockIdx.x) * ldd;   // dots 行是分块内行号
     for (int jb = warp * LANES * 4; jb < pool_size; jb += G * LANES * 4) {
         threshold = fminf(threshold, key2f(*reinterpret_cast<volatile unsigned*>(&s_th)));
         int j0 = jb + lane * 4;
@@ -3416,13 +3418,13 @@ template <typename DotT>
 static inline bool launch_block_topM_bucket(
     cudaStream_t stream, const DotT* d_dots, const float* d_norms_pool, const int32_t* d_ids_pool,
     int32_t* d_out_neighbors, float* d_out_dists,
-    int bucket_size, int pool_size, int ldd, int actual_M, int out_ld,
-    const float* d_seed_gid = nullptr, int64_t seed_n = 0)
+    int rows, int pool_size, int ldd, int actual_M, int out_ld,
+    const float* d_seed_gid = nullptr, int64_t seed_n = 0, int row0 = 0)
 {
     constexpr int G = 8;
-#define LAUNCH_BUCKET_KOUT(KV) block_topK_from_dots_kernel<(KV), G, DotT, true><<<bucket_size, G * 32, 0, stream>>>( \
+#define LAUNCH_BUCKET_KOUT(KV) block_topK_from_dots_kernel<(KV), G, DotT, true><<<rows, G * 32, 0, stream>>>( \
         d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld, \
-        nullptr, d_seed_gid, seed_n)
+        nullptr, d_seed_gid, seed_n, row0)
     if      (actual_M <= 32)  LAUNCH_BUCKET_KOUT(32);
     else if (actual_M <= 64)  LAUNCH_BUCKET_KOUT(64);
     else if (actual_M <= 128) LAUNCH_BUCKET_KOUT(128);
@@ -4936,7 +4938,12 @@ void build_vector_knn_with_tensorcore(
     size_t bytes_B_raw        = max_pool_size_ub * D * sizeof(DataT);
     size_t bytes_B            = max_pool_size_ub * D * sizeof(GemmInT);
     // dots 行宽对齐到 4 (block top-M kernel 按 16 B 向量读)
-    size_t bytes_dots         = max_bucket_size * ((max_pool_size_ub + 3) / 4 * 4) * sizeof(GemmOutT);
+    // dots 按 bucket 行分块 (每行的 top-M 互相独立，分块结果完全一样)：dots buffer 只要
+    // kDotsRowTile 行，不随最大 bucket 变大 (参考 TAGORE gpu_construct: 缓冲区按固定上界分配)。
+    // M > 256 的 raft 回退路径不分块 (只在 bucket ≤ 分块行数时可用，见 3e 的检查)。
+    constexpr size_t kDotsRowTile = 256;
+    const size_t dots_rows    = std::min(max_bucket_size, kDotsRowTile);
+    size_t bytes_dots         = dots_rows * ((max_pool_size_ub + 3) / 4 * 4) * sizeof(GemmOutT);
     size_t bytes_norms_pool   = max_pool_size_ub * sizeof(float);
     size_t bytes_ids_bucket   = max_bucket_size * sizeof(int32_t);
     size_t bytes_ids_pool     = max_pool_size_ub * sizeof(int32_t);
@@ -5787,8 +5794,13 @@ void build_vector_knn_with_tensorcore(
         const int ldd_c = (actual_M <= 256) ? (pool_size + 3) / 4 * 4 : pool_size;
 
         // ---- 3e: cuBLAS GEMM 在 slot stream 上 (event 包夹做纯 GEMM 计时) ----
+        // bucket 行按 dots_rows 分块: 每块一个 GEMM (A = pool 的 [r0, r0+rows) 行) + 一个 top-M
+        if (bucket_size > static_cast<int>(dots_rows) && actual_M > 256)   // raft 回退不分块
+            throw std::runtime_error("VectorKNN: M > 256 needs bucket_size <= dots row tile");
         cublasSetStream(cublas_handle, streams[slot]);
         if (gemm_timing) CUDA_CHECK(cudaEventRecord(ev_gemm_start[slot], streams[slot]));
+        for (int r0 = 0; r0 < bucket_size; r0 += static_cast<int>(dots_rows)) {
+        const int rows = std::min(static_cast<int>(dots_rows), bucket_size - r0);
         {
             cublasStatus_t stat;
             if constexpr (kIsInt8Path) {
@@ -5800,10 +5812,10 @@ void build_vector_knn_with_tensorcore(
                 stat = cublasGemmEx(
                     cublas_handle,
                     CUBLAS_OP_T, CUBLAS_OP_N,
-                    pool_size, bucket_size, D,
+                    pool_size, rows, D,
                     &alpha,
                     d_B[slot], CUDA_R_16F, D,
-                    d_B[slot], CUDA_R_16F, D,
+                    d_B[slot] + static_cast<size_t>(r0) * D, CUDA_R_16F, D,
                     &beta,
                     d_dots[slot], CUDA_R_32F, ldd_c,
                     CUBLAS_COMPUTE_32F,
@@ -5816,10 +5828,10 @@ void build_vector_knn_with_tensorcore(
                 stat = cublasSgemm(
                     cublas_handle,
                     CUBLAS_OP_T, CUBLAS_OP_N,
-                    pool_size, bucket_size, D,
+                    pool_size, rows, D,
                     &alpha,
                     reinterpret_cast<const float*>(d_B[slot]), D,
-                    reinterpret_cast<const float*>(d_B[slot]), D,
+                    reinterpret_cast<const float*>(d_B[slot]) + static_cast<size_t>(r0) * D, D,
                     &beta,
                     reinterpret_cast<float*>(d_dots[slot]), ldd_c);
                 if (stat != CUBLAS_STATUS_SUCCESS)
@@ -5847,8 +5859,8 @@ void build_vector_knn_with_tensorcore(
                     streams[slot], d_dots[slot], d_norms_pool[slot], d_ids_pool[slot],
                     d_out_neighbors[slot],
                     reinterpret_cast<float*>(d_out_neighbors[slot] + static_cast<size_t>(bucket_size) * actual_M),
-                    bucket_size, pool_size, ldd_c, actual_M, /*out_ld=*/actual_M,
-                    d_seed_kth, d_seed_kth ? N : 0);
+                    rows, pool_size, ldd_c, actual_M, /*out_ld=*/actual_M,
+                    d_seed_kth, d_seed_kth ? N : 0, r0);
             if (!fused_out)
             // d_dots 被 dots_to_dist_inplace_kernel 原地改写为 float dist,
             // RAFT 输出落 d_select_idx/dist scratch, 最后 gather 到 d_out_neighbors
@@ -5876,6 +5888,7 @@ void build_vector_knn_with_tensorcore(
         #endif
             CUDA_CHECK(cudaGetLastError());
         }
+        }   // r0 行分块
 
         // ---- 3g: 异步 D2H, 不 sync ----
         // block top-M 路径: ids + dists 在同一块连续 buffer 里，一次拷回

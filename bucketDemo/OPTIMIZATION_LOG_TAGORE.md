@@ -30,34 +30,34 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#2 (Step 6: deferred eviction frees + reuse of freed device blocks)**, 2026-10-22 (`runs/tagore2`):
+After **#3 (A2 params: CENTROID_RATIO 0.004 / NPROBE 80 + Step 6 dots row tiling)**, 2026-10-22 (`runs/tagore3`):
 
 **Build time (s, median; sum of all stages)**
 
 | config | path | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
 |---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | resident | 6.27 | +0.0% | -0.2% | 0.68x | 0.54x | bucket2 6.27 | 3812 | 1.71 |
-| sift1M_large | large | 9.61 | -1.8% | +0.8% | 1.05x | 0.83x | bucket2 7.78, prune 0.71, optimize_chunked 0.72, translate 0.40 | 1590 | 2.04 |
-| sift10M_auto | large | 82.22 | -0.0% | +0.3% | 0.38x | 0.67x | bucket2 71.83, prune 3.96, optimize_chunked 2.87, translate 3.56 | 8996 | 12.65 |
-| sift100M_auto | large | 2506.89 | +15.8% | +22.0% | 1.17x | — | bucket2 2023.02, prune 133.15, optimize_chunked 286.79, translate 63.93 | 15492 | 79.41 |
+| sift1M_auto | resident | 5.16 | +17.7% | +17.6% | 0.56x | 0.45x | bucket2 5.16 | 5244 | 1.68 |
+| sift1M_large | large | 9.02 | +6.1% | +6.9% | 0.98x | 0.78x | bucket2 7.21, prune 0.69, optimize_chunked 0.71, translate 0.48 | 1286 | 1.96 |
+| sift10M_auto | large | 78.14 | +5.0% | +5.2% | 0.36x | 0.64x | bucket2 67.95, prune 3.72, optimize_chunked 2.89, translate 3.58 | 8996 | 12.25 |
+| sift100M_auto | large | 1666.75 | +33.5% | +48.2% | 0.77x | — | bucket2 1107.95, prune 145.90, optimize_chunked 354.85, translate 58.05 | 14588 | 79.13 |
 
 **bucket2 step breakdown (s)**
 
 | config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | 0.63 | 0.26 | 0.17 | 0.00 | 0.62 | 0.36 | 0.02 | 2.75 | 0.00 | 0.89 |
-| sift1M_large | 0.14 | 0.60 | 0.35 | 0.00 | 0.99 | 0.26 | 0.04 | 4.21 | 0.49 | 0.00 |
-| sift10M_auto | 1.45 | 7.43 | 2.37 | 0.00 | 18.52 | 1.76 | 0.38 | 34.79 | 4.00 | 0.00 |
-| sift100M_auto | 72.31 | 371.49 | 97.43 | 0.00 | 252.26 | 170.64 | 7.47 | 1016.61 | 26.76 | 0.00 |
+| sift1M_auto | 0.64 | 0.23 | 0.09 | 0.00 | 0.39 | 0.23 | 0.02 | 2.06 | 0.00 | 0.93 |
+| sift1M_large | 0.14 | 0.48 | 0.26 | 0.00 | 0.96 | 0.17 | 0.04 | 3.71 | 0.51 | 0.00 |
+| sift10M_auto | 1.40 | 3.63 | 0.52 | 0.00 | 17.96 | 1.72 | 0.23 | 37.52 | 4.03 | 0.00 |
+| sift100M_auto | 72.62 | 121.79 | 14.59 | 0.00 | 231.78 | 133.20 | 5.74 | 477.38 | 42.70 | 0.00 |
 
 **(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
 
 | config | recall@1 | recall@10 | recall@32 | recall@64 |
 |---|---|---|---|---|
-| sift1M_auto | 0.9741 | 0.9668 | 0.9590 | 0.9532 |
-| sift1M_large | 0.9754 | 0.9663 | 0.9592 | 0.9535 |
-| sift10M_auto | 0.9162 | 0.8989 | 0.8832 | 0.8711 |
-| sift100M_auto | 0.7511 | 0.7208 | 0.6970 | 0.6814 |
+| sift1M_auto | 0.9547 | 0.9436 | 0.9341 | 0.9268 |
+| sift1M_large | 0.9557 | 0.9448 | 0.9336 | 0.9261 |
+| sift10M_auto | 0.8827 | 0.8587 | 0.8394 | 0.8257 |
+| sift100M_auto | 0.6833 | 0.6560 | 0.6311 | 0.6155 |
 
 **(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); sift1M/10M: cuVS CAGRA search, sift100M: DiskANN CPU search (itopk = L)**
 
@@ -68,10 +68,10 @@ After **#2 (Step 6: deferred eviction frees + reuse of freed device blocks)**, 2
 | TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
 | CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
 | CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
-| ours sift1M_auto | 0.9280 / 1950K | 0.9769 / 1048K | 0.9944 / 501K | 0.9987 / 187K | 0.9996 / 68K |
-| ours sift1M_large | 0.9147 / 2224K | 0.9708 / 1188K | 0.9922 / 561K | 0.9983 / 189K | 0.9995 / 68K |
-| ours sift10M_auto | 0.8393 / 1868K | 0.9292 / 1011K | 0.9735 / 489K | 0.9916 / 176K | 0.9980 / 68K |
-| ours sift100M_auto | 0.7458 / 69K | 0.8518 / 64K | 0.9252 / 39K | 0.9680 / 23K | 0.9880 / 13K |
+| ours sift1M_auto | 0.9268 / 1947K | 0.9770 / 1034K | 0.9943 / 533K | 0.9988 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9136 / 2219K | 0.9703 / 1190K | 0.9924 / 561K | 0.9982 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8335 / 1872K | 0.9247 / 1010K | 0.9713 / 501K | 0.9911 / 185K | 0.9977 / 68K |
+| ours sift100M_auto | 0.7331 / 61K | 0.8401 / 63K | 0.9157 / 38K | 0.9627 / 22K | 0.9856 / 13K |
 
 ## Baseline verification
 
@@ -328,3 +328,82 @@ SIFT1M / 10M unchanged (blob mode; 1M large −1.8 % = noise).
 | ours sift1M_large | 0.9147 / 2224K | 0.9708 / 1188K | 0.9922 / 561K | 0.9983 / 189K | 0.9995 / 68K |
 | ours sift10M_auto | 0.8393 / 1868K | 0.9292 / 1011K | 0.9735 / 489K | 0.9916 / 176K | 0.9980 / 68K |
 | ours sift100M_auto | 0.7458 / 69K | 0.8518 / 64K | 0.9252 / 39K | 0.9680 / 23K | 0.9880 / 13K |
+
+### #3 — A2 (approved, params only): CENTROID_RATIO 0.01 → 0.004, NPROBE 200 → 80 + Step 6 dots row tiling (2026-10-22)
+
+**Idea:** A2 as restricted by the user: bigger buckets by parameters only (avg ~100 → ~250 points, inside 128–512),
+`NPROBE` lowered so the pool ((NPROBE+1) × bucket ≈ 20K rows) stays about the same; same bucketing algorithm, order,
+candidate rule, prune, reverse edges; applied to all datasets. Fewer centroids make Step 2 (KMeans||), Step 3
+(centroid KNN), Step 4 and every per-bucket overhead of Step 6 (cache entries, misses, launches) cheaper.
+`params.sh` now takes env overrides (`: "${X:=default}"`) for `CENTROID_RATIO`, `KNN_K`, `NPROBE` (exploration only;
+benchmark runs set none).
+**Exploration** (SIFT10M, 1 run each, under the bench lock, `runs/tagore3/explore10M_*`):
+
+| `CENTROID_RATIO` / `NPROBE` | avg bucket | SIFT10M build (s) | CAGRA recall@10 itopk 32 / 64 / 128 | pre-prune recall@10 |
+|---|---|---|---|---|
+| 0.01 / 200 (best #2) | 100 | 82.22 | 0.8377 / 0.9281 / 0.9735 | 0.8994 |
+| **0.004 / 80** | 250 | 73.38 | 0.8333 / 0.9255 / 0.9720 | 0.8577 |
+| 0.004 / 64 | 250 | 70.58 | 0.8302 / 0.9223 / 0.9698 | 0.8335 |
+| 0.0025 / 50 | 400 | 77.43 | 0.8304 / 0.9227 / 0.9710 | 0.8319 |
+| 0.0025 / 40 | 400 | 65.80 | 0.8265 / 0.9186 / 0.9686 | 0.8079 |
+| 0.002 / 32 | 500 | 69.18 | 0.8231 / 0.9174 / 0.9680 | 0.7950 |
+
+0.004 / 80 kept the pool size and lost the least quality → benchmarked.
+**First benchmark (`runs/tagore3/try1_untiled`): rejected by the memory guard** — sift1M_large GPU peak 2230 MiB >
+1.2 × 1590: the out-of-core Step 6 `dots` buffer is max_bucket × max_pool per slot (0.19 → 0.77 GB), and at SIFT100M
+(15.5 GB peak already) it would not have fit. (Speed was 1M auto +18.0 %, 1M large +8.4 %, 10M +5.0 %.)
+**Fix bundled into this iteration (implementation, exact):** Step 6 computes each bucket in row tiles of ≤ 256 rows
+(one GEMM with A = pool rows [r0, r0+rows) + one block top-M per tile; the kernel takes `row0`, q stays the bucket
+row; rows are independent, so results are identical). `dots` = min(max_bucket, 256) × max_pool → 0.06 GB per slot on
+SIFT1M large (GPU peak 1286 MiB), 0.14 / 0.17 GB on SIFT100M (peak 14588 MiB). Raft fallback (M > 256) only for buckets
+≤ 256 rows (checked). TAGORE source for the tiling: `gpu_construct` (fixed-size device buffers).
+**Class:** A2 (approved 2026-10-22, restricted) + implementation (tiling).
+**Results:** SIFT1M auto 5.16 s (+17.7 %), 1M large 9.02 s (+6.1 %), 10M 78.14 s (+5.0 %), **SIFT100M 2506.89 →
+1666.75 s (+33.5 %, +48.2 % vs #0; now 0.77× TAGORE's 2151 s)**: Step 2 371 → 122, Step 3 97 → 15, Step 4 252 → 232,
+Step 4.5 171 → 133, Step 6 1017 → 477 s (400K buckets; per round 4.17M uploads, loop 163 / 302 s).
+**Quality cost (for the user):** DiskANN recall@10 SIFT100M 0.7458 / 0.8518 / 0.9252 / 0.9680 / 0.9880 →
+0.7331 / 0.8401 / 0.9157 / 0.9627 / 0.9856 (−0.013 … −0.002, gate −0.05); pre-prune recall@10 0.720 → 0.656
+(100M), 0.899 → 0.859 (10M); CAGRA-search recall@10 @32 1M auto 0.9278 → 0.9268, 1M large 0.9140 → 0.9136, 10M 0.8377 →
+0.8335 (TAGORE floors 0.912 / 0.872 / 0.795). GPU peak 1M auto 3812 → 5244 MiB (resident path, not gated; bigger
+resident buckets), others ≤ best. optimize_chunked 287 → 355 s on SIFT100M (single-run noise; investigate if it stays).
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 5.16 | +17.7% | +17.6% | 0.56x | 0.45x | bucket2 5.16 | 5244 | 1.68 |
+| sift1M_large | large | 9.02 | +6.1% | +6.9% | 0.98x | 0.78x | bucket2 7.21, prune 0.69, optimize_chunked 0.71, translate 0.48 | 1286 | 1.96 |
+| sift10M_auto | large | 78.14 | +5.0% | +5.2% | 0.36x | 0.64x | bucket2 67.95, prune 3.72, optimize_chunked 2.89, translate 3.58 | 8996 | 12.25 |
+| sift100M_auto | large | 1666.75 | +33.5% | +48.2% | 0.77x | — | bucket2 1107.95, prune 145.90, optimize_chunked 354.85, translate 58.05 | 14588 | 79.13 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.64 | 0.23 | 0.09 | 0.00 | 0.39 | 0.23 | 0.02 | 2.06 | 0.00 | 0.93 |
+| sift1M_large | 0.14 | 0.48 | 0.26 | 0.00 | 0.96 | 0.17 | 0.04 | 3.71 | 0.51 | 0.00 |
+| sift10M_auto | 1.40 | 3.63 | 0.52 | 0.00 | 17.96 | 1.72 | 0.23 | 37.52 | 4.03 | 0.00 |
+| sift100M_auto | 72.62 | 121.79 | 14.59 | 0.00 | 231.78 | 133.20 | 5.74 | 477.38 | 42.70 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9547 | 0.9436 | 0.9341 | 0.9268 |
+| sift1M_large | 0.9557 | 0.9448 | 0.9336 | 0.9261 |
+| sift10M_auto | 0.8827 | 0.8587 | 0.8394 | 0.8257 |
+| sift100M_auto | 0.6833 | 0.6560 | 0.6311 | 0.6155 |
+
+**(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); sift1M/10M: cuVS CAGRA search, sift100M: DiskANN CPU search (itopk = L)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| TAGORE GNN-Descent k=96 + CAGRA prune, sift1M | 0.9220 / 1947K | 0.9752 / 1033K | 0.9936 / 497K | 0.9985 / 186K | 0.9996 / 68K |
+| TAGORE largeIndex Vamana, sift10M | 0.8448 / 1875K | 0.9238 / 1014K | 0.9662 / 482K | 0.9863 / 185K | 0.9950 / 68K |
+| TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9268 / 1947K | 0.9770 / 1034K | 0.9943 / 533K | 0.9988 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9136 / 2219K | 0.9703 / 1190K | 0.9924 / 561K | 0.9982 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8335 / 1872K | 0.9247 / 1010K | 0.9713 / 501K | 0.9911 / 185K | 0.9977 / 68K |
+| ours sift100M_auto | 0.7331 / 61K | 0.8401 / 63K | 0.9157 / 38K | 0.9627 / 22K | 0.9856 / 13K |

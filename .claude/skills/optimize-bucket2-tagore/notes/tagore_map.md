@@ -137,3 +137,8 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   round: host get 139 / 192 s, Belady + drain ≈ 120 s, ~21M misses (≈21 per bucket). Next candidates: B1c / B3 (host
   get), B2 (miss count, but GPU memory is tight now), A2 (approved, params only: bigger buckets → fewer, larger
   transfers and fewer pool entries; directly reduces per-bucket overheads), B4 (Step 2 371 s).
+- **#3 (accepted, +33.5% SIFT100M → 1666.8 s, faster than TAGORE 2151 s):** A2 params 0.004 / 80 (avg bucket 250)
+  + Step 6 row tiling of the dots buffer (fixed 256-row tile). Biggest wins: Step 2 (KMeans|| scales with the
+  centroid count), Step 3, Step 6 per-bucket overheads. Cost: pre-prune recall 0.72 → 0.66 at 100M, final DiskANN
+  −0.013 @ L32. Round 2 Step 6 loop is 302 s vs 163 s in round 1 — check why (stream_sync / producer). Remaining big
+  stages: Step 6 477, optimize_chunked 355, Step 4 232, prune 146, Step 4.5 133, Step 2 122.

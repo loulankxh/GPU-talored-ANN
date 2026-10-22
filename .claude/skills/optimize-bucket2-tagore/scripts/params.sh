@@ -5,10 +5,10 @@
 NEIGHBORS_M=64
 OUTPUT_DEGREE=32
 
-CENTROID_RATIO=0.01
+: "${CENTROID_RATIO:=0.004}"   # A2 (user-approved, params only): avg bucket ~250 points
 SEED=42
-KNN_K=32
-NPROBE=200
+: "${KNN_K:=32}"
+: "${NPROBE:=80}"   # A2: pool (NPROBE+1) x bucket kept ~20K rows
 ITERATIONS=3
 
 PRUNE_CACHE_MB=16000
