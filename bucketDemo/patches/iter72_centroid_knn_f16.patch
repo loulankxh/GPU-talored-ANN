@@ -1,0 +1,103 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index cc48b78..ed6432a 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -2407,11 +2407,87 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
+  * KNN 图 (bucket 顺序 / 重排 / 窗口)，前 nprobe 列直接当 Step 6 的近邻表。
+  * 返回 host (n_centroids, k_out) row-major, 按距离升序; 越界 id 直接报错。
+  */
++// dist[r][j] = ‖c_j‖² − 2·dot[r][j] (行常数 ‖c_r‖² 不影响排序)；自己 (j == row0 + r) 置 +inf
++__global__ void centroid_self_dist_kernel(float* __restrict__ dots, const float* __restrict__ cn,
++                                          int64_t rows, int64_t n, int64_t row0)
++{
++    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (i >= rows * n) return;
++    const int64_t r = i / n, j = i - r * n;
++    dots[i] = (j == row0 + r) ? INFINITY : cn[j] - 2.0f * dots[i];
++}
++
+ std::vector<uint32_t> centroid_self_knn_bf(const float* d_centroids_f32, int64_t n_centroids,
+-                                           int64_t D, uint32_t k_out)
++                                           int64_t D, uint32_t k_out, bool exact8 = false)
+ {
+     if (static_cast<int64_t>(k_out) >= n_centroids)
+         throw std::runtime_error("centroid_self_knn_bf: k_out must be < n_centroids");
++    // 8-bit 数据: centroid 就是数据点 (整数值)，fp16 表示精确、fp32 累加
++    // (D·255² < 2^24) 也精确 → Tensor Core fp16 GEMM 得到跟 fp32 一样的距离
++    // (同 step4_top2_kernel / KmeansMinDistF16)。分块 GEMM + 原地转距离 (自己
++    // 置 +inf) + select_k，即 cuVS detail/knn_brute_force.cuh 的结构，只是 GEMM
++    // 换成 fp16 Tensor Core (V100 fp32 brute force 走 CUDA core)。
++    if (exact8 && D <= 128) {
++        const int64_t n = n_centroids;
++        cudaStream_t st = nullptr;
++        CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
++        cublasHandle_t h = nullptr;
++        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("centroid_self_knn_bf: cublasCreate failed");
++        cublasSetStream(h, st);
++        cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH);
++        const int64_t tile = std::max<int64_t>(1, std::min<int64_t>(n, (512ll << 20) / (n * 4)));
++        __half* d_ch = nullptr; float* d_cn = nullptr; float* d_dots = nullptr;
++        float* d_sd = nullptr; int32_t* d_si = nullptr;
++        CUDA_CHECK(cudaMalloc(&d_ch, n * D * sizeof(__half)));
++        CUDA_CHECK(cudaMalloc(&d_cn, n * sizeof(float)));
++        CUDA_CHECK(cudaMalloc(&d_dots, tile * n * sizeof(float)));
++        CUDA_CHECK(cudaMalloc(&d_sd, tile * k_out * sizeof(float)));
++        CUDA_CHECK(cudaMalloc(&d_si, n * k_out * sizeof(int32_t)));
++        step4_f32_to_f16_kernel<<<static_cast<unsigned>((n * D + 255) / 256), 256, 0, st>>>(d_centroids_f32, d_ch, n * D);
++        step4_row_norms_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(d_centroids_f32, d_cn, n, static_cast<int>(D));
++        CUDA_CHECK(cudaGetLastError());
++        raft::resources res;
++        raft::resource::set_cuda_stream(res, st);
++        const float alpha = 1.0f, beta = 0.0f;
++        for (int64_t t0 = 0; t0 < n; t0 += tile) {
++            const int64_t tn = std::min(tile, n - t0);
++            cublasStatus_t cs = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N,
++                static_cast<int>(n), static_cast<int>(tn), static_cast<int>(D), &alpha,
++                d_ch, CUDA_R_16F, static_cast<int>(D), d_ch + t0 * D, CUDA_R_16F, static_cast<int>(D), &beta,
++                d_dots, CUDA_R_32F, static_cast<int>(n),
++                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
++            if (cs != CUBLAS_STATUS_SUCCESS)
++                throw std::runtime_error("centroid_self_knn_bf: fp16 GEMM failed, status=" + std::to_string(cs));
++            const int64_t tot = tn * n;
++            centroid_self_dist_kernel<<<static_cast<unsigned>((tot + 255) / 256), 256, 0, st>>>(d_dots, d_cn, tn, n, t0);
++            CUDA_CHECK(cudaGetLastError());
++            raft::matrix::select_k<float, int32_t>(res,
++                raft::make_device_matrix_view<const float, int64_t, raft::row_major>(d_dots, tn, n),
++                std::nullopt,
++                raft::make_device_matrix_view<float, int64_t, raft::row_major>(d_sd, tn, k_out),
++                raft::make_device_matrix_view<int32_t, int64_t, raft::row_major>(d_si + t0 * k_out, tn, k_out),
++                /*select_min=*/true, /*sorted=*/true);
++        }
++        std::vector<int32_t> h_si(static_cast<size_t>(n) * k_out);
++        CUDA_CHECK(cudaMemcpyAsync(h_si.data(), d_si, h_si.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
++        CUDA_CHECK(cudaStreamSynchronize(st));
++        cudaFree(d_ch); cudaFree(d_cn); cudaFree(d_dots); cudaFree(d_sd); cudaFree(d_si);
++        cublasDestroy(h);
++        cudaStreamDestroy(st);
++        std::vector<uint32_t> out(h_si.size());
++        int64_t n_bad = 0;
++        #pragma omp parallel for schedule(static) reduction(+:n_bad)
++        for (int64_t c = 0; c < n; ++c) {
++            for (uint32_t j = 0; j < k_out; ++j) {
++                const int32_t v = h_si[static_cast<size_t>(c) * k_out + j];
++                if (v < 0 || v >= n || v == c) { ++n_bad; out[static_cast<size_t>(c) * k_out + j] = 0; continue; }
++                out[static_cast<size_t>(c) * k_out + j] = static_cast<uint32_t>(v);
++            }
++        }
++        if (n_bad > 0)
++            throw std::runtime_error("centroid_self_knn_bf: " + std::to_string(n_bad) + " bad ids (fp16 path)");
++        return out;
++    }
+     const int64_t ks = static_cast<int64_t>(k_out) + 1;   // 多取 1 个，剥掉自己
+     raft::resources res;
+     auto cview = raft::make_device_matrix_view<const float, int64_t>(d_centroids_f32, n_centroids, D);
+@@ -6571,7 +6647,8 @@ int run_pipeline_impl(
+         uint32_t exact_knn_k = 0;
+         if (!mem_est.need_pq) {
+             exact_knn_k = std::max<uint32_t>(K, (nprobe > 0) ? nprobe : K);
+-            centroid_exact_knn = centroid_self_knn_bf(d_centroids_f32, n_centroids, D, exact_knn_k);
++            centroid_exact_knn = centroid_self_knn_bf(d_centroids_f32, n_centroids, D, exact_knn_k,
++                std::is_same<DataT, uint8_t>::value || std::is_same<DataT, int8_t>::value);
+             std::vector<uint32_t> g(static_cast<size_t>(n_centroids) * K);
+             for (int64_t c = 0; c < n_centroids; ++c)
+                 std::memcpy(g.data() + static_cast<size_t>(c) * K,
