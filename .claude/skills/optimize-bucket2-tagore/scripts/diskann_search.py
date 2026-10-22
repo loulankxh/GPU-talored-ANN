@@ -22,6 +22,7 @@ SEARCH = "/home/lanlu/DiskANN/build/apps/search_memory_index"
 ap = argparse.ArgumentParser()
 ap.add_argument("base"); ap.add_argument("graph"); ap.add_argument("query"); ap.add_argument("gt"); ap.add_argument("work")
 ap.add_argument("--L", default="32,64,128,256,512"); ap.add_argument("--K", type=int, default=10)
+ap.add_argument("--entry", type=int, default=None)   # entry point override (TAGORE step B: its own ep); default medoid
 a = ap.parse_args()
 os.makedirs(a.work, exist_ok=True)
 log = lambda *x: print(*x, file=sys.stderr, flush=True)
@@ -63,17 +64,20 @@ log(f"[diskann_search] graph N={N} K={K} bad={bad} self={selfl} dup={dup} conver
 
 # ---- medoid
 t1 = time.time()
-mean = np.zeros(bd, dtype=np.float64)
-for s in range(0, N, CH):
+if a.entry is not None:
+    start = a.entry
+else:
+  mean = np.zeros(bd, dtype=np.float64)
+  for s in range(0, N, CH):
     mean += np.asarray(B[s:s + CH], dtype=np.float64).sum(0)
-mean /= N
-best_d, start = np.inf, 0
-for s in range(0, N, CH):
+  mean /= N
+  best_d, start = np.inf, 0
+  for s in range(0, N, CH):
     x = np.asarray(B[s:s + CH], dtype=np.float32)
     d = ((x - mean.astype(np.float32)) ** 2).sum(1)
     i = int(d.argmin())
     if d[i] < best_d: best_d, start = float(d[i]), s + i
-log(f"[diskann_search] medoid {start} ({time.time() - t1:.1f}s)")
+log(f"[diskann_search] entry {start} ({'given' if a.entry is not None else 'medoid'}) ({time.time() - t1:.1f}s)")
 with open(idx_path, "r+b") as f:
     f.write(np.uint64(size).tobytes()); f.write(np.uint32(K).tobytes())
     f.write(np.uint32(start).tobytes()); f.write(np.uint64(0).tobytes())

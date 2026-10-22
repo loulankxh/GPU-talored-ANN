@@ -1,0 +1,246 @@
+{
+ "note": "TAGORE (/home/lanlu/Tagore 110d480) built for sm_70 from a patched copy (build-v100/patched-src, scripts/tagore_v100_fix.patch: shared-array bounds check in nn_descent_opt_reverse_sample, wmma accumulator re-layout to the sm_80 element order nn_descent_opt_cal assumes, dis_func pointer fix in gpu_construct); V100 GPU 0 under the bench lock, page cache dropped; 2026-10-22. sift1M/sift10M search = same cagra_eval sweep as ours; sift100M search = diskann_search.py (DiskANN L, medoid entry).",
+ "sift1M": {
+  "label": "GNN-Descent k=96 + CAGRA prune",
+  "index_type": "CAGRA",
+  "status": "ok",
+  "config": "GNN_descent(k=96, iters=10) + Pruning(final_degree=32, m=64, 'CAGRA'); in-memory, fvecs input",
+  "build_s": [
+   9.18,
+   9.22,
+   9.16
+  ],
+  "build_median_s": 9.18,
+  "gnn_descent_s": 3.065,
+  "pruning_s": 0.742,
+  "prep_s": 1.34,
+  "prep_note": "u8bin -> fvecs conversion (not in build_s)",
+  "search": {
+   "32": 0.92197,
+   "64": 0.97521,
+   "128": 0.99361,
+   "256": 0.9985,
+   "512": 0.99957
+  },
+  "qps": {
+   "32": 1946951.5,
+   "64": 1033188.2,
+   "128": 496954.2,
+   "256": 186170.7,
+   "512": 68259.9
+  },
+  "defects": {
+   "bad_ids": 0,
+   "self_loops": 0,
+   "dup_edges": 440096
+  },
+  "gpu_peak_mib": 2878,
+  "peak_rss_gb": 1.21,
+  "knn_similarity": {
+   "recall@1": 0.9771,
+   "recall@10": 0.97261,
+   "recall@32": 0.96398,
+   "recall@64": 0.94711
+  },
+  "note": "pre-prune kNN similarity from an untimed GPU-2 run of the same config (--dump-knn)",
+  "alt_k64": {
+   "label": "GNN-Descent k=64 + CAGRA prune",
+   "index_type": "CAGRA",
+   "status": "ok",
+   "config": "GNN_descent(k=64, iters=10) + Pruning(final_degree=32, m=64, 'CAGRA'); in-memory, fvecs input",
+   "build_s": [
+    8.62,
+    8.6,
+    8.6
+   ],
+   "build_median_s": 8.6,
+   "gnn_descent_s": 2.827,
+   "pruning_s": 0.519,
+   "prep_s": 1.34,
+   "prep_note": "u8bin -> fvecs conversion (not in build_s)",
+   "search": {
+    "32": 0.92318,
+    "64": 0.97478,
+    "128": 0.9932,
+    "256": 0.99828,
+    "512": 0.99953
+   },
+   "qps": {
+    "32": 2224436.7,
+    "64": 1192409.0,
+    "128": 562446.5,
+    "256": 189047.8,
+    "512": 68173.2
+   },
+   "defects": {
+    "bad_ids": 0,
+    "self_loops": 0,
+    "dup_edges": 412328
+   },
+   "gpu_peak_mib": 2604,
+   "peak_rss_gb": 1.09,
+   "knn_similarity": {
+    "recall@1": 0.9739,
+    "recall@10": 0.9727,
+    "recall@32": 0.96243,
+    "recall@64": 0.94482
+   },
+   "note": "pre-prune kNN similarity from an untimed GPU-2 run of the same config (--dump-knn)"
+  }
+ },
+ "sift10M": {
+  "label": "largeIndex Vamana",
+  "index_type": "Vamana (alpha 1.2, variable degree <= 32)",
+  "status": "ok",
+  "config": "largeIndex(devicelist=[0], k=64, m=64, final_degree=32, max_degree=32, alpha=1.2, max_points=2.5M, buffer=6, clusters 10 k-means -> 10 after split; GNN-Descent 8+8 iterations hardcoded in gpu_construct)",
+  "build_s": [
+   214.47
+  ],
+  "build_median_s": 214.47,
+  "prep_s": 35.46,
+  "largeindex_s": 179.01,
+  "prep_detail": {
+   "n": 10000000,
+   "dim": 128,
+   "clusters_kmeans": 10,
+   "clusters": 10,
+   "max_points": 2500000,
+   "size_min": 1575210,
+   "size_max": 2340782,
+   "size_mean": 2000000.0,
+   "norm_factor": 0.1,
+   "kmeans_s": 1.59,
+   "assign_s": 3.89,
+   "split_s": 2.27,
+   "write_s": 26.7,
+   "total_s": 34.45
+  },
+  "defects": {
+   "bad_ids": 0,
+   "self_loops": 791,
+   "dup_edges": 0,
+   "short_row_slots": 5621059
+  },
+  "gpu_peak_mib": 7242,
+  "peak_rss_gb": 5.76,
+  "search": {
+   "32": 0.84484,
+   "64": 0.92377,
+   "128": 0.96619,
+   "256": 0.98634,
+   "512": 0.99503
+  },
+  "qps": {
+   "32": 1874851.2,
+   "64": 1014495.3,
+   "128": 481964.1,
+   "256": 184672.6,
+   "512": 68365.1
+  },
+  "search_note": "search = cagra_eval with short rows repeat-padded to 32 (padding adds duplicates, not counted in defects)",
+  "diskann_medoid": {
+   "search": {
+    "32": 0.8611,
+    "64": 0.9284,
+    "128": 0.9673999999999999,
+    "256": 0.9867,
+    "512": 0.9952
+   },
+   "qps": {
+    "32": 14968.39,
+    "64": 15863.47,
+    "128": 24276.13,
+    "256": 21070.32,
+    "512": 15084.25
+   }
+  },
+  "diskann_tagore_ep": {
+   "entry": 5977830,
+   "search": {
+    "32": 0.8611,
+    "64": 0.9281,
+    "128": 0.9675,
+    "256": 0.9867,
+    "512": 0.9952
+   },
+   "qps": {
+    "32": 13824.32,
+    "64": 14499.06,
+    "128": 14065.2,
+    "256": 19495.53,
+    "512": 14591.2
+   }
+  },
+  "inmemory_attempt": {
+   "status": "failed: GNN_descent k=64 on 10M needs >16 GB (unchecked cudaMalloc -> illegal memory access, GPU peak 15778 MiB)"
+  }
+ },
+ "sift100M": {
+  "label": "largeIndex Vamana",
+  "index_type": "Vamana (alpha 1.2, variable degree <= 32)",
+  "status": "ok",
+  "config": "largeIndex(devicelist=[0], k=64, m=64, final_degree=32, max_degree=32, alpha=1.2, max_points=2.5M, buffer=30, clusters 100 k-means -> 103 after split; GNN-Descent 8+8 iterations hardcoded in gpu_construct)",
+  "build_s": [
+   2151.25
+  ],
+  "build_median_s": 2151.25,
+  "prep_s": 326.29,
+  "largeindex_s": 1824.96,
+  "prep_detail": {
+   "n": 100000000,
+   "dim": 128,
+   "clusters_kmeans": 100,
+   "clusters": 103,
+   "max_points": 2500000,
+   "size_min": 1410990,
+   "size_max": 2494828,
+   "size_mean": 1941747.572815534,
+   "norm_factor": 0.1,
+   "kmeans_s": 2.52,
+   "assign_s": 48.71,
+   "split_s": 38.41,
+   "write_s": 235.29,
+   "total_s": 324.92
+  },
+  "defects": {
+   "bad_ids": 0,
+   "self_loops": 18780,
+   "dup_edges": 0,
+   "short_row_slots": 31861802
+  },
+  "gpu_peak_mib": 14768,
+  "peak_rss_gb": 30.69,
+  "search": {
+   "32": 0.7691,
+   "64": 0.8615,
+   "128": 0.9238,
+   "256": 0.9616,
+   "512": 0.982
+  },
+  "qps": {
+   "32": 61270.45,
+   "64": 55079.46,
+   "128": 33953.08,
+   "256": 19590.95,
+   "512": 11137.94
+  },
+  "search_note": "search keys = DiskANN L, medoid entry",
+  "diskann_tagore_ep": {
+   "entry": 25035291,
+   "search": {
+    "32": 0.7651,
+    "64": 0.8592,
+    "128": 0.9233,
+    "256": 0.9614,
+    "512": 0.982
+   },
+   "qps": {
+    "32": 58228.1,
+    "64": 54257.59,
+    "128": 33600.89,
+    "256": 19464.43,
+    "512": 11059.02
+   }
+  }
+ }
+}

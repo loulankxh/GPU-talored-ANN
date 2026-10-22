@@ -88,7 +88,49 @@ sift1M_large GPU peak 1760 vs 1558 MiB (not gated).
 
 ## TAGORE baseline
 
-(filled by step B)
+Step B, 2026-10-22 (`state/tagore_baseline.json`, runs in `runs/tagoreB`). TAGORE = `/home/lanlu/Tagore` @ 110d480, GPU 0
+under the bench lock, page cache dropped, wall clock incl. load (like our `build_total`).
+
+**Build setup.** conda env `tagore` (python 3.11, numpy, pybind11); nvcc 12.9 (`cuvs-bench`); build dirs under
+`/home/lanlu/Tagore/build-v100`. Allowed build-config edit in the clone (`CMakeLists.txt`):
+`pybind11_DIR` → `/home/lanlu/miniconda3/envs/tagore/share/cmake/pybind11`, `CMAKE_CUDA_ARCHITECTURES 89` → `70`.
+
+**TAGORE does not run correctly on the V100 (sm_70) as published** — three bugs, fixed in a *copy*
+(`build-v100/patched-src`, built in `build-v100/patched-build`; the clone's sources are untouched;
+diff: `.claude/skills/optimize-bucket2-tagore/scripts/tagore_v100_fix.patch`). **User: please confirm this is OK** (else the
+TAGORE numbers below are "not runnable on V100"):
+1. `nn_descent_opt_reverse_sample`: binary search reads `old_nn[old_num]` (one past the 32-entry shared array) →
+   "Warp Out-of-range Address" on sm_70 (found with compute-sanitizer + cuda-gdb). Fix: `res_id < num &&` bounds check.
+2. `nn_descent_opt_cal` (both GEMMs): indexes `acc_frag.x[i]` with the sm_80 `mma.m16n8k16` element order
+   (row lane/4, col (lane%4)·2 …); the Volta wmma accumulator order differs, so every distance was paired with the wrong
+   (new, old) ids → kNN recall@10 ≈ 0.00. Fix: `store_matrix_sync` the tile to (free) shared memory and reload `x[0..7]`
+   in the sm_80 order; same values, an extra 1 KB/warp shared round trip.
+3. `gpu_construct` (largeIndex): `cudaMemcpyFromSymbol(&dis_func, dis_filter_new)` on a value that is not a symbol fails
+   silently, `dis_func` stays uninitialized → call through a null device function pointer. Fix: `dis_func = dis_filter_new`.
+Also: `StoreCAGRA`'s `i * degree` indexing is correct (`filter_reverse_1hop` writes final rows with stride `d`).
+
+| dataset | TAGORE config | index | build (s) | stages | recall@10 32 / 64 / 128 / 256 / 512 | QPS @32 / @64 | defects | GPU peak MiB / RSS GB | ours (best) |
+|---|---|---|---|---|---|---|---|---|---|
+| SIFT1M | GNN_descent k=96, 10 it + Pruning CAGRA (m=64, d=32), median of 3 | CAGRA | **9.18** (9.18 / 9.22 / 9.16) | GNN-Descent 3.07, pruning 0.74, rest = fvecs load + fp16 convert (host) | 0.9220 / 0.9752 / 0.9936 / 0.9985 / 0.9996 (cagra_eval) | 1947K / 1033K | 440,096 dup edges | 2878 / 1.2 | auto 6.26 s, 0.9276@32; large 9.69 s, 0.9135@32 |
+| SIFT1M | same, k=64 | CAGRA | 8.60 | GNN-Descent 2.83, pruning 0.52 | 0.9232 / 0.9748 / 0.9932 / 0.9983 / 0.9995 | 2224K / 1192K | 412,328 dup edges | 2604 / 1.1 | |
+| SIFT10M | in-memory GNN_descent k=64 | — | **failed** | needs > 16 GB device memory (unchecked cudaMalloc → illegal access, peak 15778 MiB) | — | — | — | — | |
+| SIFT10M | largeIndex k=64, m=64, d=32, α=1.2, 10 clusters (2 per point), max_points 2.5M, buffer 6, 1 run | Vamana | **214.47** | prep 35.46 (k-means 1.6, assign 3.9, split 2.3, write cluster files 26.7) + largeIndex 179.01 | 0.8448 / 0.9238 / 0.9662 / 0.9863 / 0.9950 (cagra_eval, short rows repeat-padded); DiskANN medoid: 0.8611 / 0.9284 / 0.9674 / 0.9867 / 0.9952 | 1875K / 1014K | 791 self loops, 0 dup; 5.6M empty slots (rows < 32) | 7242 / 5.8 | 82.44 s, 0.8374@32 |
+| SIFT100M | largeIndex, same params, 100 k-means clusters → 103 after split, buffer 30, 1 run | Vamana | **2151.25** | prep 326.29 (k-means 2.5, assign 48.7, split 38.4, write 235.3) + largeIndex 1824.96 | DiskANN medoid: 0.7691 / 0.8615 / 0.9238 / 0.9616 / 0.9820; TAGORE ep: 0.7651 / 0.8592 / 0.9233 / 0.9614 / 0.9820 | 61K / 55K (DiskANN) | 18,780 self loops, 0 dup; 31.9M empty slots | 14768 (prep) / 7242 (build) / 30.7 | 3214.58 s, 0.7472 / 0.8536 / 0.9257 / 0.9686 / 0.9881 |
+
+Notes:
+- SIFT1M input: u8bin → fvecs conversion 1.34 s (not in build time); SIFT100M prep reads the u8bin directly.
+- largeIndex's `f2h` has no fp16 scaling (GNN_descent's `norm_factor`): raw SIFT values overflow fp16 in `cal_power`.
+  Prep (`scripts/tagore_prep_clusters.py`) writes the cluster files pre-scaled by the same power-of-10 factor (0.1),
+  which leaves neighbor order and the α test unchanged. Prep also does largeIndex's oversized-cluster split itself
+  (same round-robin rule), because largeIndex's own split references data files that do not exist.
+- largeIndex hardcodes GNN-Descent 8 + 8 iterations per cluster; the merge only concatenates the two clusters'
+  pruned lists (no re-prune) and truncates to max_degree.
+- Headline: SIFT100M TAGORE 2151 s vs ours 3215 s (**ours 1.49× slower**) at similar DiskANN recall (TAGORE +0.02 at
+  L 32, −0.006 at L 512); SIFT10M TAGORE 214 s vs ours 82 s (ours 2.6× faster); SIFT1M TAGORE 9.2 s vs ours 6.3 s.
+  TAGORE's SIFT100M per-cluster cost: ~1825 s / 103 clusters ≈ 17.7 s per ~1.94M-point subgraph (GNN-Descent + Vamana prune
+  on GPU, overlapped with the CPU merge).
+- Judge reference (`judge.py`): SIFT1M → TAGORE k=96 row (resident ≥ TAGORE − 0.01, large ≥ TAGORE − 0.05);
+  SIFT10M → TAGORE largeIndex cagra_eval row (≥ TAGORE − 0.05). Current best passes both.
 
 ## Ideas backlog
 

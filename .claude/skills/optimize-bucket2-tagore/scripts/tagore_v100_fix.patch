@@ -1,0 +1,75 @@
+--- /home/lanlu/Tagore/src/Tagore_src.cu	2026-10-21 22:40:56.880656566 -0400
++++ src/Tagore_src.cu	2026-10-22 06:15:50.433970323 -0400
+@@ -632,7 +632,7 @@
+             tmp -= halfsize;
+         }
+         res_id += (new_nn[res_id] < val);
+-        if(new_nn[res_id] == val){
++        if(res_id < new_num && new_nn[res_id] == val){  // V100 fix: bounds check (res_id can be new_num)
+             reverse_graph[bid * K + i] = 0xFFFFFFFF;
+             // hybrid_list[bid][2 * SAMPLE + i] = 0xFFFFFFFF;
+         }
+@@ -660,7 +660,7 @@
+             tmp -= halfsize;
+         }
+         res_id += (old_nn[res_id] < val);
+-        if(old_nn[res_id] == val){
++        if(res_id < old_num && old_nn[res_id] == val){  // V100 fix: bounds check (res_id can be old_num)
+             // reverse_graph_old[bid][i] = 0xFFFFFFFF;
+             reverse_graph[bid * K + SAMPLE + i] = 0xFFFFFFFF;
+         }
+@@ -744,6 +744,21 @@
+         __syncthreads();
+     }
+     __syncthreads();
++    // V100 port: re-layout the wmma accumulator into the sm_80 mma.m16n8k16 element order the code below
++    // assumes (x[0]: row lane/4, col (lane%4)*2; x[1] col+1; x[2/3] row+8; x[4..7] col+8). new_data (16 KB)
++    // is free here and holds 16 warps x one 16x16 float tile.
++    {
++        float* acc_tile = reinterpret_cast<float*>(new_data) + threadIdx.y * BLK_H * BLK_W;
++        __syncthreads();
++        wmma::store_matrix_sync(acc_tile, acc_frag, BLK_W, wmma::mem_row_major);
++        __syncwarp();
++        unsigned r_ = laneid / 4, c_ = (laneid % 4) * 2;
++        acc_frag.x[0] = acc_tile[r_ * BLK_W + c_];           acc_frag.x[1] = acc_tile[r_ * BLK_W + c_ + 1];
++        acc_frag.x[2] = acc_tile[(r_ + 8) * BLK_W + c_];     acc_frag.x[3] = acc_tile[(r_ + 8) * BLK_W + c_ + 1];
++        acc_frag.x[4] = acc_tile[r_ * BLK_W + c_ + 8];       acc_frag.x[5] = acc_tile[r_ * BLK_W + c_ + 9];
++        acc_frag.x[6] = acc_tile[(r_ + 8) * BLK_W + c_ + 8]; acc_frag.x[7] = acc_tile[(r_ + 8) * BLK_W + c_ + 9];
++        __syncthreads();
++    }
+ 
+     for(unsigned i = 0; i < acc_frag.num_elements; i++){
+         if(acc_frag.x[i] < 0.01f) acc_frag.x[i] = -INF_DIS;
+@@ -944,6 +959,21 @@
+         __syncthreads();
+     }
+     __syncthreads();
++    // V100 port: re-layout the wmma accumulator into the sm_80 mma.m16n8k16 element order the code below
++    // assumes (x[0]: row lane/4, col (lane%4)*2; x[1] col+1; x[2/3] row+8; x[4..7] col+8). new_data (16 KB)
++    // is free here and holds 16 warps x one 16x16 float tile.
++    {
++        float* acc_tile = reinterpret_cast<float*>(new_data) + threadIdx.y * BLK_H * BLK_W;
++        __syncthreads();
++        wmma::store_matrix_sync(acc_tile, acc_frag, BLK_W, wmma::mem_row_major);
++        __syncwarp();
++        unsigned r_ = laneid / 4, c_ = (laneid % 4) * 2;
++        acc_frag.x[0] = acc_tile[r_ * BLK_W + c_];           acc_frag.x[1] = acc_tile[r_ * BLK_W + c_ + 1];
++        acc_frag.x[2] = acc_tile[(r_ + 8) * BLK_W + c_];     acc_frag.x[3] = acc_tile[(r_ + 8) * BLK_W + c_ + 1];
++        acc_frag.x[4] = acc_tile[r_ * BLK_W + c_ + 8];       acc_frag.x[5] = acc_tile[r_ * BLK_W + c_ + 9];
++        acc_frag.x[6] = acc_tile[(r_ + 8) * BLK_W + c_ + 8]; acc_frag.x[7] = acc_tile[(r_ + 8) * BLK_W + c_ + 9];
++        __syncthreads();
++    }
+     if(warp_id_x <= warp_id_y){
+         // if(bid == 0 && warp_id_x == 0) printf("AA %f %f %f %f\n", acc_frag.x[0], acc_frag.x[1], acc_frag.x[2], acc_frag.x[3]);
+         for(unsigned i = 0; i < acc_frag.num_elements; i++){
+--- /home/lanlu/Tagore/src/large_index.cu	2026-10-21 22:40:56.880656566 -0400
++++ src/large_index.cu	2026-10-22 06:20:49.513984719 -0400
+@@ -221,7 +221,7 @@
+         dim3 grid_one(1, 1, 1);
+ 
+         funcFormat dis_func;
+-        cudaMemcpyFromSymbol(&dis_func,dis_filter_new,sizeof(funcFormat));
++        dis_func = dis_filter_new;  // port fix: dis_filter_new is already the device function pointer (fetched in largeIndex); MemcpyFromSymbol on it fails and leaves dis_func uninitialized
+ 
+         unsigned all_it = 8, all_it2 = 8;
+ 
