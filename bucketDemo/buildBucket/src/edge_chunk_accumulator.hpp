@@ -181,80 +181,39 @@ public:
     // BucketVectorAccumulator::finish_iteration: bandwidth-bound sequential
     // copy instead of paying per-file open() overhead in Phase 2), then
     // open a persistent read handle.
+    // 每个 chunk 的文件写完就是完整的 (只追加、记录数已知)，不再把它们拷进一个合并文件
+    // (SIFT100M: 32 GB 读 + 32 GB 写, acc.finish 107 s)，read_chunk 直接读 chunk 自己的文件。
+    // 参考 TAGORE order_merge_new: 每个局部图一个文件，最后一趟逐个流式读。
     void finish() {
+        merged_count.assign(static_cast<size_t>(num_chunks), 0);
         for (int32_t c = 0; c < num_chunks; ++c) {
             flush_chunk(c);
             bufs[static_cast<size_t>(c)].file.close();
+            merged_count[static_cast<size_t>(c)] = bufs[static_cast<size_t>(c)].total_count;
         }
-
-        merged_offset.assign(static_cast<size_t>(num_chunks), 0);
-        merged_count.assign(static_cast<size_t>(num_chunks), 0);
-        std::ofstream mout(merged_path, std::ios::binary | std::ios::trunc);
-        if (!mout.is_open())
-            throw std::runtime_error("EdgeChunkAccumulator: cannot open " + merged_path + " for write");
-
-        int64_t pos = 0;
-        std::vector<char> copy_buf;
-        for (int32_t c = 0; c < num_chunks; ++c) {
-            merged_offset[static_cast<size_t>(c)] = pos;
-            int64_t cnt = bufs[static_cast<size_t>(c)].total_count;
-            merged_count[static_cast<size_t>(c)] = cnt;
-            if (cnt == 0) continue;
-
-            std::string p = chunk_path(dir, c);
-            size_t nbytes = static_cast<size_t>(cnt) * sizeof(EdgeRecord);
-            copy_buf.resize(nbytes);
-            {
-                std::ifstream in(p, std::ios::binary);
-                if (!in.is_open())
-                    throw std::runtime_error("EdgeChunkAccumulator: cannot open " + p + " for merge");
-                in.read(copy_buf.data(), static_cast<std::streamsize>(nbytes));
-                if (!in.good())
-                    throw std::runtime_error("EdgeChunkAccumulator: merge-read failed for chunk " + std::to_string(c));
-            }
-            mout.write(copy_buf.data(), static_cast<std::streamsize>(nbytes));
-            if (!mout.good())
-                throw std::runtime_error("EdgeChunkAccumulator: merge-write failed for chunk " + std::to_string(c));
-            pos += static_cast<int64_t>(nbytes);
-
-            std::filesystem::remove(p);
-        }
-        mout.close();
-
-        merged_in.open(merged_path, std::ios::binary);
-        if (!merged_in.is_open())
-            throw std::runtime_error("EdgeChunkAccumulator: cannot open " + merged_path + " for read");
     }
 
+    // 读回 chunk c 的全部记录 (只读一次: 读完删掉它的文件)
     void read_chunk(int32_t c, std::vector<EdgeRecord>& out) {
         int64_t cnt = merged_count[static_cast<size_t>(c)];
         out.resize(static_cast<size_t>(cnt));
         if (cnt == 0) return;
-        merged_in.seekg(static_cast<std::streamoff>(merged_offset[static_cast<size_t>(c)]));
-        merged_in.read(reinterpret_cast<char*>(out.data()),
-                       static_cast<std::streamsize>(static_cast<size_t>(cnt) * sizeof(EdgeRecord)));
-        if (!merged_in.good())
+        std::string p = chunk_path(dir, c);
+        std::ifstream in(p, std::ios::binary | std::ios::ate);
+        if (!in.is_open())
+            throw std::runtime_error("EdgeChunkAccumulator: cannot open " + p + " for read");
+        const size_t nbytes = static_cast<size_t>(cnt) * sizeof(EdgeRecord);
+        if (static_cast<size_t>(in.tellg()) != nbytes)   // bounds check: 文件大小必须跟计数一致
+            throw std::runtime_error("EdgeChunkAccumulator: chunk " + std::to_string(c) + " file size mismatch");
+        in.seekg(0);
+        in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(nbytes));
+        if (!in.good())
             throw std::runtime_error("EdgeChunkAccumulator: read_chunk failed for chunk " + std::to_string(c));
+        in.close();
+        std::filesystem::remove(p);
     }
 };
 
-// ---------------------------------------------------------------------
-// Phase 2, step 1: group one chunk's edges by destination node (CSR) and,
-// within each node's segment, sort ascending by rank -- so index 0 is the
-// closest (rank 0, highest-priority) candidate and index (count-1) is the
-// weakest. merge_rank_ordered_into_row below then walks each segment from
-// the end backward, which is exactly optimize_chunked.cu's existing
-// "process weakest first, closest last so it wins the slot" loop, just
-// fed from this sorted-by-rank order instead of raw write order.
-//
-// Deliberately NOT a K_out-bucket counting sort over the whole chunk: that
-// would force resetting a K_out-sized histogram per node regardless of how
-// many edges that node actually has, which is wasteful once K_out reaches
-// the hundreds. Sorting each node's own (typically much smaller) segment
-// independently costs O(edges_for_that_node * log(that count)), summing to
-// O(E_c * log(avg segment size)) overall -- cheaper in the common case and
-// with no K_out-sized fixed cost per node.
-// ---------------------------------------------------------------------
 struct ChunkCsr {
     std::vector<uint32_t> row_offsets;  // size chunk_size+1
     std::vector<uint32_t> src;          // size row_offsets.back(), rank-ascending per row
