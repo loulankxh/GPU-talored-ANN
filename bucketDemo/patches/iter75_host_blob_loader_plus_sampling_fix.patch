@@ -1,0 +1,157 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index ce19b3f..1fea7aa 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -442,22 +442,28 @@ void print_memory_estimate(const MemoryEstimate& est) {
+ // ============== Phase 2: Sampling Functions ==============
+ 
+ /**
+- * Sample using fast random sampling (with replacement)
++ * n_samples 个互不相同的行号 (升序)。原来名字叫 without_replacement、实际是有放回
++ * 抽样：SIFT100M 抽 10M/100M 会有 ~50 万个重复行 → KMeans|| 可能把同一个点选成两个
++ * centroid → 两个 bucket 的 centroid 是同一个 gid，只有一个能拿到它的分配，另一个
++ * bucket 直方图为 0，round 2 的 BucketVectorAccumulator::add 直接报错。
++ * 先有放回地抽、排序去重，再补抽不够的部分 (每轮补的期望重复率 ≈ n/N，几轮收敛)。
+  */
+ std::vector<int64_t> sample_without_replacement(
+     int64_t N,
+     int64_t n_samples,
+     uint32_t seed) {
+ 
+-    std::mt19937 rng(seed);
++    if (n_samples > N) throw std::runtime_error("sample_without_replacement: n_samples > N");
++    std::mt19937_64 rng(seed);
+     std::uniform_int_distribution<int64_t> dist(0, N - 1);
+-    std::vector<int64_t> indices(n_samples);
+-
+-    // Fast random sampling: directly generate random indices
+-    for (int64_t i = 0; i < n_samples; ++i) {
+-        indices[i] = dist(rng);
++    std::vector<int64_t> indices;
++    indices.reserve(static_cast<size_t>(n_samples));
++    while (static_cast<int64_t>(indices.size()) < n_samples) {
++        const int64_t need = n_samples - static_cast<int64_t>(indices.size());
++        for (int64_t i = 0; i < need; ++i) indices.push_back(dist(rng));
++        std::sort(indices.begin(), indices.end());
++        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+     }
+-
+     return indices;
+ }
+ 
+@@ -4807,6 +4813,32 @@ void build_vector_knn_with_tensorcore(
+                              std::chrono::high_resolution_clock::now() - tb0).count() << "s\n";
+         }
+     }
++    // host-blob 模式: 桶数据整块在 host 内存里、但放不进 GPU 缓存 (SIFT100M: 12.8 GB vs
++    // 2 GB)。GPU Belady 缓存照旧，但未命中时直接从 host blob 经 pinned 双缓冲上传
++    // (每个 position 一块)，不再经 host Belady 缓存 (read_bucket 拷进 vector) + ids
++    // 转 int32 + 两次 pageable H2D。SIFT100M round 1: 2000 万次上传 (每桶 ~20 次)，
++    // producer 上 cache_get 690 s / 每次 ~23 µs，主线程 wait_producer 641 s。
++    // 记录 / 行布局跟 blob 模式一样 (DevPoolJob mode 1/2，d_ids 为空)。BUCKET2_HOST_BLOB=0 关掉。
++    const bool host_blob = use_dev_cache && !d_blob && h_blob && blob_bytes > 0 &&
++                           !(std::getenv("BUCKET2_HOST_BLOB") && std::getenv("BUCKET2_HOST_BLOB")[0] == '0');
++    const size_t hb_row_bytes = (blob_mode == 1) ? static_cast<size_t>(blob_stride)
++                                                 : static_cast<size_t>(D) * sizeof(DataT);
++    char* hb_pin[2] = {nullptr, nullptr};
++    cudaEvent_t hb_ev[2] = {nullptr, nullptr};
++    size_t hb_cap = 0, hb_off = 0;
++    int hb_cur = 0;
++    if (host_blob) {
++        int64_t max_cnt = 0;
++        for (int64_t c = 0; c < n_centroids; ++c) max_cnt = std::max(max_cnt, bucket_count[c]);
++        // 一个 position 最多 K+1 个桶全部未命中
++        hb_cap = (static_cast<size_t>(K) + 1) * (static_cast<size_t>(max_cnt) * hb_row_bytes + 16);
++        for (int i = 0; i < 2; ++i) {
++            CUDA_CHECK(cudaMallocHost(&hb_pin[i], hb_cap));
++            CUDA_CHECK(cudaEventCreateWithFlags(&hb_ev[i], cudaEventDisableTiming));
++        }
++        std::cout << "  [VectorKNN] host-blob loader: " << blob_bytes / 1e6 << " MB host blob (mode " << blob_mode
++                  << "), pinned staging 2 x " << hb_cap / 1e6 << " MB\n";
++    }
+     // blob 模式下两个 Belady 缓存都不用 (job 直接指向 blob，中心桶 gid 也从 host blob
+     // 取)，未来访问表 (SIFT10M 每轮 0.8 s) 和缓存构造 (拷表 0.5 s) 都省掉: 给空表
+     std::vector<std::vector<int32_t>> future_access;
+@@ -5336,6 +5368,29 @@ void build_vector_knn_with_tensorcore(
+                             t_dev_upload += diag_secs(tu0, diag_now());
+                             return db;   // d_buf 为空: 不拥有显存，淘汰时什么都不做
+                         }
++                        if (host_blob) {
++                            DevBucket db;
++                            db.ctx = &dev_ctx;
++                            db.count = bucket_count[bid];
++                            size_t off = 0; int64_t gid0 = 0;
++                            bucket_vecs.blob_locate(bid, off, gid0);
++                            const size_t nb = static_cast<size_t>(db.count) * hb_row_bytes;
++                            if (off + nb > blob_bytes || hb_off + nb > hb_cap)   // bounds check
++                                throw std::runtime_error("VectorKNN: host-blob bucket " + std::to_string(bid) + " out of range");
++                            db.bytes = std::max<size_t>(nb, 16);
++                            CUDA_CHECK(cudaMallocAsync(&db.d_buf, db.bytes, copy_stream));
++                            if (nb > 0) {
++                                std::memcpy(hb_pin[hb_cur] + hb_off, h_blob + off, nb);
++                                CUDA_CHECK(cudaMemcpyAsync(db.d_buf, hb_pin[hb_cur] + hb_off, nb,
++                                                           cudaMemcpyHostToDevice, copy_stream));
++                            }
++                            hb_off += (nb + 15) / 16 * 16;
++                            db.d_vecs = db.d_buf;
++                            db.gid0 = gid0; db.stride = blob_stride; db.mode = blob_mode;
++                            ++n_dev_loads;
++                            t_dev_upload += diag_secs(tu0, diag_now());
++                            return db;
++                        }
+                         const VecBucket<DataT>& hb = bucket_cache.get(pos, bid, bucket_loader);
+                         DevBucket db;
+                         db.ctx = &dev_ctx;
+@@ -5385,11 +5440,17 @@ void build_vector_knn_with_tensorcore(
+                                                         static_cast<int32_t>(dofs), db.gid0, db.stride, db.mode};
+                         dofs += static_cast<size_t>(db.count);
+                     };
++                    if (host_blob) {   // 这个 position 用另一块 pinned 缓冲；等它上一次的 H2D 读完
++                        hb_cur ^= 1;
++                        CUDA_CHECK(cudaEventSynchronize(hb_ev[hb_cur]));
++                        hb_off = 0;
++                    }
+                     add_dev(c);
+                     for (uint32_t k = 0; k < K; ++k) {
+                         uint32_t nb_c = centroid_knn_graph[c * K + k];
+                         if (nb_c < static_cast<uint32_t>(n_centroids)) add_dev(static_cast<int64_t>(nb_c));
+                     }
++                    if (host_blob) CUDA_CHECK(cudaEventRecord(hb_ev[hb_cur], copy_stream));
+                     CUDA_CHECK(cudaEventRecord(ev_load[slot], copy_stream));
+                     n_jobs_staged[slot] = nj;
+                     Staged& st = staged[slot];
+@@ -5397,8 +5458,8 @@ void build_vector_knn_with_tensorcore(
+                     st.bucket_size = static_cast<int>(bucket_count[c]);
+                     st.actual_M    = std::min(M, st.pool_size - 1);
+                     if (st.actual_M > 0) {
+-                        // 自己桶的 gid，给 scatter 用 (blob 模式直接从 host blob 取)
+-                        if (d_blob) {
++                        // 自己桶的 gid，给 scatter 用 (blob / host-blob 模式直接从 host blob 取)
++                        if (d_blob || host_blob) {
+                             size_t off = 0; int64_t gid0 = 0;
+                             bucket_vecs.blob_locate(c, off, gid0);
+                             for (int i = 0; i < st.bucket_size; ++i) {
+@@ -5829,6 +5890,10 @@ void build_vector_knn_with_tensorcore(
+             if (sl == 0 && d_blob) { cudaFree(d_blob); d_blob = nullptr; }
+         }
+     }
++    for (int i = 0; i < 2; ++i) {
++        if (hb_pin[i]) cudaFreeHost(hb_pin[i]);
++        if (hb_ev[i]) cudaEventDestroy(hb_ev[i]);
++    }
+     cudaFree(d_seed_kth);
+     cudaFree(d_identity_idx);
+     for (int s = 0; s < num_slots; ++s) {
+@@ -6557,6 +6622,12 @@ int run_pipeline_impl(
+         }
+ 
+         n_centroids = static_cast<int64_t>(centroid_global_indices.size());
++        {   // 每个 centroid 必须是不同的数据点 (重复 → 某个 bucket 拿不到自己的 centroid)
++            std::vector<int64_t> chk(centroid_global_indices);
++            std::sort(chk.begin(), chk.end());
++            if (std::adjacent_find(chk.begin(), chk.end()) != chk.end())
++                throw std::runtime_error("Step 2: duplicate centroid ids");
++        }
+         double t2_idx_map = std::chrono::duration<double>(Clock::now() - t2).count() - t2_select_call;
+ 
+         // bucket 磁盘缓存跟着这一轮的 n_centroids 重建 (bufs 大小依赖它)——但

@@ -11,6 +11,8 @@ usage:
     --update : on ACCEPT (or when best.json does not exist yet) write the
                candidate as the new state/best.json
     --md     : also print the markdown result tables for OPTIMIZATION_LOG.md
+    --add-new: with --update, record configs that best.json does not have yet (e.g. the first
+               sift100M baseline) even when the verdict is REJECT; existing entries stay untouched
 
 Rules (agreed with the user):
   correctness  every run produced a graph; final graph has 0 bad ids / self loops /
@@ -20,11 +22,13 @@ Rules (agreed with the user):
                sift10M-auto is >= 3% faster than best, and no config is > 3% slower than
                best (user 2026-10-21: a >= 3% SIFT10M gain is accepted as long as neither
                SIFT1M config is > 3% slower and search passes).
-  sift100M     (4-arg form, user 2026-10-22) speed is judged on sift100M only: its
-               build_total must be >= 3% faster than best; sift1M / sift10M build times are
-               reported but not gated (they are quality checks: correctness, search vs CAGRA,
-               memory). sift100M search (no CAGRA reference) must stay >= best - 0.01 at every
-               itopk; sift100M memory follows the large-path 1.2x guard.
+  sift100M     (4-arg form, user decision 2026-10-22, 2nd): SIFT100M is built with 2 rounds and
+               searched with DiskANN's CPU in-memory searcher (points[].itopk = DiskANN L); it is
+               compared with its own best (no CAGRA reference): >= 3% faster = gain, > 7% slower =
+               regression; search recall@10 >= own best - 0.01 at every L; large-path 1.2x memory
+               guard. sift1M / sift10M keep the old rules (>= 3% = gain, > 3% slower = regression,
+               search vs CAGRA). ACCEPT iff at least one config gains, none regresses, and search
+               passes on all of them.
   quality      CAGRA-search recall@10 at every itopk, every config:
                  resident path: >= CAGRA - 0.01
                  large path   : >= CAGRA - 0.05   (user decision 2026-10-21: compare with CAGRA only)
@@ -48,7 +52,8 @@ flags = {a for a in sys.argv[1:] if a.startswith("--")}
 if len(args) not in (2, 3, 4):
     sys.exit(__doc__)
 KEYS = KEYS[:len(args)]
-SPEED_KEYS = ["sift100M_auto"] if "sift100M_auto" in KEYS else KEYS
+SPEED_KEYS = KEYS
+SLOW_TOL = {"sift100M_auto": 0.07}   # per-config regression threshold (default SPEED_TOL)
 LARGE_KEYS = [k for k in LARGE_KEYS if k in KEYS]
 cand = {k: json.load(open(os.path.join(d, "metrics.json"))) for k, d in zip(KEYS, args)}
 cand_dirs = dict(zip(KEYS, map(os.path.abspath, args)))
@@ -94,7 +99,7 @@ if best:
             continue
         b, c = best["runs"][k]["build_total_s"], cand[k]["build_total_s"]
         speed[k] = (b - c) / b
-        if k in SPEED_KEYS and speed[k] < -SPEED_TOL:
+        if k in SPEED_KEYS and speed[k] < -SLOW_TOL.get(k, SPEED_TOL):
             fail.append(f"{k}: {(-speed[k]) * 100:.1f}% slower than best ({c:.2f}s vs {b:.2f}s)")
     gated = {k: v for k, v in speed.items() if k in SPEED_KEYS}
     if gated and max(gated.values()) < SPEED_GAIN:
@@ -134,7 +139,15 @@ verdict = "ACCEPT" if not fail else "REJECT"
 print(json.dumps({"verdict": verdict, "fail": fail, "notes": notes,
                   "speedup_vs_best": {k: round(v * 100, 2) for k, v in speed.items()}}, indent=1))
 
-if "--update" in flags and (verdict == "ACCEPT" or best is None):
+if "--update" in flags and "--add-new" in flags and best and verdict != "ACCEPT":
+    new_keys = [k for k in cand if k not in best["runs"]]
+    for k in new_keys:
+        best["runs"][k] = cand[k]
+        best.setdefault("dirs", {})[k] = cand_dirs[k]
+        best.setdefault("baseline_runs", dict(best["runs"])).setdefault(k, cand[k])
+    json.dump(best, open(BEST, "w"), indent=1)
+    print(f"state/best.json: added {new_keys}", file=sys.stderr)
+elif "--update" in flags and (verdict == "ACCEPT" or best is None):
     runs = dict(best["runs"]) if best else {}
     runs.update(cand)   # a 2-config judge keeps the stored sift10M entry
     dirs = dict(best.get("dirs", {})) if best else {}

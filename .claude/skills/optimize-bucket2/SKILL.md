@@ -28,16 +28,19 @@ user stops it. Never stop the loop on your own.
 
 ## Goal
 
-**Current focus (user decision 2026-10-22): make the SIFT100M build faster.** Speed is judged
-on `sift100M_auto` only (large path, 1 rep, ~1 h): an idea is accepted when SIFT100M
-build_total is >= 3% faster than best. `sift1M_auto`, `sift1M_large` and `sift10M_auto` still
-run every iteration but only as **quality checks** (correctness, search recall vs CAGRA,
-large-path memory guard); their build times are reported, not gated. SIFT100M search (no CAGRA
-reference) must stay >= its own best - 0.01 at every itopk. Ideas must scale with N: the large
-path must stay out-of-core (never hold the full dataset / graph in GPU memory). Keep improving
-until the user stops the loop.
+**Current focus (user decision 2026-10-22, 2nd): make the SIFT100M build faster** while SIFT1M /
+SIFT10M keep their old standards. `sift100M_auto` is built with **2 rounds** (run_pipeline sets
+ITERATIONS=2 for sift100M), 1 rep, and searched with **DiskANN's CPU in-memory searcher**
+(`scripts/diskann_search.py`: converts final_graph.bin to DiskANN's graph format, medoid entry point,
+L = 32..512, recall@10) — no CAGRA reference at this size. Judging (judge.py 4-arg form):
+- SIFT100M vs its own best (2-round build + search): >= 3% faster = gain, > 7% slower = regression;
+  recall@10 >= own best - 0.01 at every L; large-path memory guard.
+- SIFT1M auto / large, SIFT10M: >= 3% faster = gain, > 3% slower = regression, search vs CAGRA as before.
+- ACCEPT iff at least one config gains, none regresses, and search passes on all of them.
+Ideas must scale with N: the large path stays out-of-core (never the full dataset / graph in GPU
+memory). Keep improving until the user stops the loop.
 
-(History: until 2026-10-22 the goal was SIFT1M auto / large + SIFT10M, with a >= 3% gain on any
+(History: 2026-10-22 1st version gated speed on SIFT100M only; until 2026-10-22 the goal was SIFT1M auto / large + SIFT10M, with a >= 3% gain on any
 of them and no config > 3% slower.)
 
 ## Design invariants — never violate
@@ -84,7 +87,7 @@ R=/home/lanlu/microBenchmark/bucketDemo/buildBucket/runs/iter<N>
 bash $S/run_pipeline.sh -d sift1M -m auto  -r 3 -o $R/sift1M_auto     # GPU-resident path: timing median of 3 + quality
 bash $S/run_pipeline.sh -d sift1M -m large -r 3 -o $R/sift1M_large    # large-dataset path (out-of-core + prune_windowed + optimize_chunked -m E): median of 3 + quality + memory
 bash $S/run_pipeline.sh -d sift10M -m auto -r 1 -o $R/sift10M_auto    # SIFT10M (auto → large path), 1 run (~3 min): timing + quality + memory
-bash $S/run_pipeline.sh -d sift100M -m auto -r 1 -o $R/sift100M_auto  # SIFT100M (large path), 1 run (~1 h): the gated speed target + search + memory
+bash $S/run_pipeline.sh -d sift100M -m auto -r 1 -o $R/sift100M_auto  # SIFT100M (large path, 2 rounds), 1 run: timing + DiskANN search + memory
 ```
 Run the quick SIFT1M / SIFT10M quality checks first and skip the SIFT100M run when they already fail.
 Launch long runs detached (`setsid nohup ... &`) so a harness restart cannot kill them, and make sure no
@@ -96,7 +99,7 @@ Quality measured per run: (a) `knn_similarity` — pre-prune degree-64 `vector_k
 ```bash
 python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/sift100M_auto --md
 ```
-Rules are in judge.py's docstring (4-arg form: speed gated on SIFT100M only, >= 3% faster than best; SIFT1M / SIFT10M are quality checks. Older 3-arg form: ≥3% faster on SIFT1M-auto, SIFT1M-large or SIFT10M-auto, no config >3% slower; search recall@10 at every itopk compared with CAGRA only: GPU-resident path ≥ CAGRA−1%, large-dataset path ≥ CAGRA−5% (pre-prune KNN similarity is logged, not gated); large-path memory ≤ 1.2× best; no graph defects).
+Rules are in judge.py's docstring (4-arg form: see Goal — gain on any config (SIFT100M >= 3% vs its own best), no regression (SIFT100M > 7%, others > 3%), search passes everywhere; first SIFT100M baseline is recorded with `--update --add-new`. Older 3-arg form: ≥3% faster on SIFT1M-auto, SIFT1M-large or SIFT10M-auto, no config >3% slower; search recall@10 at every itopk compared with CAGRA only: GPU-resident path ≥ CAGRA−1%, large-dataset path ≥ CAGRA−5% (pre-prune KNN similarity is logged, not gated); large-path memory ≤ 1.2× best; no graph defects).
 - If a gain is borderline (3–5%), rerun that config once more into `<dir>_b` and judge with it too; accept only if both pass.
 
 ### 5a. ACCEPT

@@ -38,6 +38,9 @@ case $DS in
   *) echo "-d sift1M|sift10M|sift100M required"; exit 1 ;;
 esac
 DSDIR=$(dirname "$BASE")
+# SIFT100M (user decision 2026-10-22): 2 build rounds instead of 3, and search with DiskANN's
+# CPU in-memory searcher (cuVS CAGRA search does not fit 100M on the 16 GB GPU)
+[[ $DS == sift100M ]] && ITERATIONS=2
 : "${OUT:=$BB/runs/$(date +%Y%m%d_%H%M%S)_${DS}_${MODE}}"
 mkdir -p "$OUT"
 export CUDA_VISIBLE_DEVICES=0
@@ -107,9 +110,16 @@ for ((R = 0; R < REPS; R++)); do
     "$PY" -I "$SKILL/scripts/knn_similarity.py" "$O/vector_knn.bin" "$O/inverse_perm.bin" \
       "$DSDIR/base_knn_sample10K_k64.ibin" > "$RD/knn_similarity.json" || echo "knn_similarity FAILED"
     # final-graph structural check + recall/QPS through the cuVS CAGRA searcher
+    # (SIFT100M: DiskANN CPU in-memory search, same JSON format; points[].itopk = DiskANN L)
+    if [[ $DS == sift100M ]]; then
+      "$PY" -I "$SKILL/scripts/diskann_search.py" "$BASE" "$O/final_graph.bin" \
+        "$DSDIR/query.public.10K.u8bin" "$DSDIR/groundtruth.ibin" "$W/diskann" \
+        2> "$RD/search.err" | grep '^{' > "$RD/search.json" || echo "search FAILED (see search.err)"
+    else
     "$EVAL" search --data "$BASE" --graph "$O/final_graph.bin" \
       --query "$DSDIR/query.public.10K.u8bin" --gt "$DSDIR/groundtruth.ibin" \
       2> "$RD/search.err" | grep '^{' > "$RD/search.json" || echo "search FAILED (see search.err)"
+    fi
   fi
   [[ $KEEP -eq 1 ]] || rm -rf "$W"
 done

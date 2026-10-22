@@ -442,22 +442,28 @@ void print_memory_estimate(const MemoryEstimate& est) {
 // ============== Phase 2: Sampling Functions ==============
 
 /**
- * Sample using fast random sampling (with replacement)
+ * n_samples 个互不相同的行号 (升序)。原来名字叫 without_replacement、实际是有放回
+ * 抽样：SIFT100M 抽 10M/100M 会有 ~50 万个重复行 → KMeans|| 可能把同一个点选成两个
+ * centroid → 两个 bucket 的 centroid 是同一个 gid，只有一个能拿到它的分配，另一个
+ * bucket 直方图为 0，round 2 的 BucketVectorAccumulator::add 直接报错。
+ * 先有放回地抽、排序去重，再补抽不够的部分 (每轮补的期望重复率 ≈ n/N，几轮收敛)。
  */
 std::vector<int64_t> sample_without_replacement(
     int64_t N,
     int64_t n_samples,
     uint32_t seed) {
 
-    std::mt19937 rng(seed);
+    if (n_samples > N) throw std::runtime_error("sample_without_replacement: n_samples > N");
+    std::mt19937_64 rng(seed);
     std::uniform_int_distribution<int64_t> dist(0, N - 1);
-    std::vector<int64_t> indices(n_samples);
-
-    // Fast random sampling: directly generate random indices
-    for (int64_t i = 0; i < n_samples; ++i) {
-        indices[i] = dist(rng);
+    std::vector<int64_t> indices;
+    indices.reserve(static_cast<size_t>(n_samples));
+    while (static_cast<int64_t>(indices.size()) < n_samples) {
+        const int64_t need = n_samples - static_cast<int64_t>(indices.size());
+        for (int64_t i = 0; i < need; ++i) indices.push_back(dist(rng));
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
     }
-
     return indices;
 }
 
@@ -6557,6 +6563,12 @@ int run_pipeline_impl(
         }
 
         n_centroids = static_cast<int64_t>(centroid_global_indices.size());
+        {   // 每个 centroid 必须是不同的数据点 (重复 → 某个 bucket 拿不到自己的 centroid)
+            std::vector<int64_t> chk(centroid_global_indices);
+            std::sort(chk.begin(), chk.end());
+            if (std::adjacent_find(chk.begin(), chk.end()) != chk.end())
+                throw std::runtime_error("Step 2: duplicate centroid ids");
+        }
         double t2_idx_map = std::chrono::duration<double>(Clock::now() - t2).count() - t2_select_call;
 
         // bucket 磁盘缓存跟着这一轮的 n_centroids 重建 (bufs 大小依赖它)——但

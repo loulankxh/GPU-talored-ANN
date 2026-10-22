@@ -1500,6 +1500,17 @@ static void run_method_E(
 
     size_t remaining = (gpu_budget_bytes > chunk_buf_bytes)
         ? (gpu_budget_bytes - chunk_buf_bytes) : (256ULL << 20);
+    // --gpu-budget-mb 可能比卡上实际空闲显存还大 (16000 MB vs V100 ~15.5 GB 可用)：
+    // chunk buffer 之外的 fwd_batch + overflow 再按实际空闲显存 (留 10%) 封顶。
+    // SIFT100M: 2 × 4.2 GB chunk buffer + 18.7M 行 batch (8.4 GB) → cudaMalloc OOM；
+    // SIFT10M 的 batch (一批整图) 远在这个上限之下，不变。
+    {
+        size_t free_b = 0, total_b = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
+        const size_t usable = static_cast<size_t>(free_b * 0.9);
+        const size_t cap = (usable > chunk_buf_bytes) ? (usable - chunk_buf_bytes) : (256ULL << 20);
+        remaining = std::min(remaining, cap);
+    }
     // 每行成本：fwd_batch (K_out*4) + overflow worst-case (K_out * sizeof(EdgeRecord))
     size_t per_row_bytes = K_out * sizeof(uint32_t) + static_cast<size_t>(K_out) * sizeof(edge_chunk::EdgeRecord);
     uint32_t batch_rows = static_cast<uint32_t>(std::max<size_t>(4096, remaining / per_row_bytes));
