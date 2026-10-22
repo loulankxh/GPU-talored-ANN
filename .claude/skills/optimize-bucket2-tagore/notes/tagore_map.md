@@ -142,3 +142,9 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   centroid count), Step 3, Step 6 per-bucket overheads. Cost: pre-prune recall 0.72 → 0.66 at 100M, final DiskANN
   −0.013 @ L32. Round 2 Step 6 loop is 302 s vs 163 s in round 1 — check why (stream_sync / producer). Remaining big
   stages: Step 6 477, optimize_chunked 355, Step 4 232, prune 146, Step 4.5 133, Step 2 122.
+- **#4 (accepted, +13.9% SIFT100M → 1434.6 s):** the disk (258 MB/s direct) is the bottleneck once Step 6 is fast:
+  round 2's scatter was blocked by writeback of the round-1 running files. Not writing running before the final merge
+  (TAGORE: one final merge pass) removed it. Variable-length arrival records save only ~15% (most rows keep many valid
+  candidates under the running threshold). User ideas B7–B9 (change ratio, sparse rewrite, generalized deferral) are
+  for ITERATIONS ≥ 3. Remaining SIFT100M: Step 6 335, optimize_chunked 293, Step 4 221, prune 141, Step 4.5 132,
+  Step 2 128, Step 1 72, translate 58.

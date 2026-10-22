@@ -3938,11 +3938,20 @@ struct ChunkedKnnAccumulator {
     static constexpr size_t record_bytes(int M) {
         return sizeof(int64_t) + static_cast<size_t>(M) * (sizeof(int32_t) + sizeof(float));
     }
+    // arrival 文件里的变长记录: [int64 gid][uint32 cnt][cnt × int32 nbr][cnt × float dist]，
+    // cnt = 最后一个有效 (nbr ≥ 0) 位置 + 1。后面全是 -1/+inf sentinel，merge 读回时补齐成 M 宽，
+    // 合并结果跟定长记录完全一样。round 2..t 的 top-M 用 running 第 M 个距离做阈值，大部分行
+    // 只剩少数有效候选 → 写盘量大减 (SIFT100M round 2 的 scatter 卡在 ~250 MB/s 的盘写上)。
+    static constexpr size_t kVarHdr = sizeof(int64_t) + sizeof(uint32_t);
+    static size_t var_record_bytes(uint32_t cnt) {
+        return kVarHdr + static_cast<size_t>(cnt) * (sizeof(int32_t) + sizeof(float));
+    }
+    uint64_t arrival_bytes = 0;   // 本轮写出的 arrival 字节 (统计；只在写 arrival 的线程上累加)
 
     struct ChunkBuf {
-        std::vector<char> data;     // capacity_records * record_bytes(M)
+        std::vector<char> data;     // ≥ 一条最长的变长记录
         size_t capacity_records = 0;
-        size_t count = 0;
+        size_t count = 0;           // data 里已用的字节数
         std::ofstream file;
     };
     std::vector<ChunkBuf> bufs;
@@ -3964,6 +3973,12 @@ struct ChunkedKnnAccumulator {
     // dirty 页顶满，这些写都是按磁盘带宽限速的)。
     std::string final_knn_path, final_dist_path;
     int final_iter = -1;
+    // 倒数第二轮的 merge 只算 kth (下一轮 top-M 的阈值)，不写 running 文件，arrival 文件留着给最终
+    // merge 再合一遍 (结果完全一样)：省掉一整份 running (N·M·8 B，SIFT100M 51 GB) 的写盘——它在下一轮
+    // Step 6 期间还在回写，把 scatter 的 arrival 写卡在 ~250 MB/s 的盘上。参考 TAGORE order_merge_new:
+    // 子图留在缓冲/磁盘里，最后一趟才统一合并输出。
+    int deferred_iter = -1;
+    int planned_final_iter = -1;   // 最后一轮的 iter (每次 merge 前由调用方设置)
     bool final_written = false;
     // 非最终轮 merge 完之后每个点 running 第 M 个距离 (真实 L2²，不足 M 个为 inf)，
     // 下一轮 Step 6 拿来当 block top-M 的行阈值初值 (见 #61/#62)
@@ -4049,7 +4064,7 @@ struct ChunkedKnnAccumulator {
         acc.bufs.resize(static_cast<size_t>(acc.num_chunks));
         for (auto& b : acc.bufs) {
             b.capacity_records = cap_records;
-            b.data.resize(cap_records * rec_bytes);
+            b.data.resize(std::max(cap_records * rec_bytes, var_record_bytes(static_cast<uint32_t>(M))));
         }
 
         std::cout << "[ChunkedKNN] N=" << N << " M=" << M
@@ -4074,8 +4089,8 @@ struct ChunkedKnnAccumulator {
     void flush_chunk(int64_t c) {
         auto& b = bufs[static_cast<size_t>(c)];
         if (b.count == 0) return;
-        size_t rec_bytes = record_bytes(M);
-        b.file.write(b.data.data(), static_cast<std::streamsize>(b.count * rec_bytes));
+        b.file.write(b.data.data(), static_cast<std::streamsize>(b.count));
+        arrival_bytes += b.count;
         if (!b.file.good())
             throw std::runtime_error("ChunkedKnnAccumulator: flush failed for chunk " + std::to_string(c));
         b.count = 0;
@@ -4087,14 +4102,17 @@ struct ChunkedKnnAccumulator {
     void add(int64_t gid, const int32_t* nbrs, const float* dists) {
         int64_t c = std::min(gid / chunk_size, num_chunks - 1);
         auto& b = bufs[static_cast<size_t>(c)];
-        size_t rec_bytes = record_bytes(M);
-        size_t off = b.count * rec_bytes;
-        std::memcpy(b.data.data() + off, &gid, sizeof(int64_t));
-        std::memcpy(b.data.data() + off + sizeof(int64_t), nbrs,
-                   static_cast<size_t>(M) * sizeof(int32_t));
-        std::memcpy(b.data.data() + off + sizeof(int64_t) + static_cast<size_t>(M) * sizeof(int32_t),
-                   dists, static_cast<size_t>(M) * sizeof(float));
-        if (++b.count == b.capacity_records) flush_chunk(c);
+        uint32_t cnt = static_cast<uint32_t>(M);
+        while (cnt > 0 && nbrs[cnt - 1] < 0) --cnt;
+        const size_t need = var_record_bytes(cnt);
+        if (b.count + need > b.data.size()) flush_chunk(c);
+        char* dst = b.data.data() + b.count;
+        std::memcpy(dst, &gid, sizeof(int64_t));
+        std::memcpy(dst + sizeof(int64_t), &cnt, sizeof(uint32_t));
+        std::memcpy(dst + kVarHdr, nbrs, static_cast<size_t>(cnt) * sizeof(int32_t));
+        std::memcpy(dst + kVarHdr + static_cast<size_t>(cnt) * sizeof(int32_t), dists,
+                    static_cast<size_t>(cnt) * sizeof(float));
+        b.count += need;
     }
 
     void finish_iteration_writes() {
@@ -4102,6 +4120,9 @@ struct ChunkedKnnAccumulator {
             flush_chunk(c);
             bufs[static_cast<size_t>(c)].file.close();
         }
+        std::cout << "  [ChunkedKNN] arrival records written: " << arrival_bytes / 1e9 << " GB (fixed-width would be "
+                  << static_cast<double>(N) * record_bytes(M) / 1e9 << " GB)\n";
+        arrival_bytes = 0;
     }
 
     // 把新算出的 M 个候选(new_*)就地合并进 running 位置的 M 个候选(run_*)，
@@ -4202,6 +4223,10 @@ struct ChunkedKnnAccumulator {
         int actual_num_threads = 0;
 
         const bool is_final = (iter == final_iter);
+        const bool defer = !is_final && planned_final_iter >= 0 && iter + 1 == planned_final_iter;
+        const int kept_iter = (deferred_iter == iter - 1) ? iter - 1 : -1;   // 上一轮留下的 arrival
+        // running 文件里是第 base_iter 轮 merge 后的状态 (没有 = 全 sentinel)
+        const int base_iter = (kept_iter >= 0) ? kept_iter - 1 : iter - 1;
         int fd_knn = -1, fd_dist = -1;
         const off_t hdr = static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t));
         if (is_final) {
@@ -4273,7 +4298,7 @@ struct ChunkedKnnAccumulator {
 
                 std::string np = running_nbrs_path(dir, c);
                 std::string dp = running_dists_path(dir, c);
-                if (iter == 0) {
+                if (base_iter < 0) {
                     std::fill(run_nbrs.begin(), run_nbrs.end(), -1);
                     std::fill(run_dists.begin(), run_dists.end(),
                               std::numeric_limits<float>::infinity());
@@ -4294,9 +4319,15 @@ struct ChunkedKnnAccumulator {
 
                 // 整个 arrival 文件一次性读进内存 (一次 read 系统调用，而不是
                 // 每条记录一次)，读磁盘和后面逐条 merge 的 CPU 计算彻底分开计时。
-                std::string ip = iter_path(dir, c, iter);
-                std::ifstream in(ip, std::ios::binary);
+                // 先合上一轮留下的 arrival (kept_iter)，再合这一轮的。
                 size_t n_records = 0;
+                auto t3 = now();
+                for (int ai : {kept_iter, iter}) {
+                if (ai < 0) continue;
+                auto ta0 = now();
+                std::string ip = iter_path(dir, c, ai);
+                std::ifstream in(ip, std::ios::binary);
+                size_t n_file = 0;
                 if (in.is_open()) {
                     in.seekg(0, std::ios::end);
                     std::streamoff sz = in.tellg();
@@ -4304,21 +4335,29 @@ struct ChunkedKnnAccumulator {
                     arrival_buf.resize(static_cast<size_t>(sz));
                     in.read(arrival_buf.data(), sz);
                     in.close();
-                    n_records = arrival_buf.size() / rec_bytes;
+                } else {
+                    arrival_buf.clear();
                 }
-                tm.n_records = static_cast<int64_t>(n_records);
-                auto t3 = now();
-                tm.read_arrival = secs_between(t2, t3);
+                auto ta1 = now();
+                tm.read_arrival += secs_between(ta0, ta1);
+                t3 = ta1;
 
-                for (size_t r = 0; r < n_records; ++r) {
-                    const char* rp = arrival_buf.data() + r * rec_bytes;
-                    int64_t gid;
+                for (size_t off = 0; off < arrival_buf.size(); ++n_file) {
+                    // 变长记录 (见 var_record_bytes)，读回后补齐成 M 宽 (-1/+inf)
+                    if (off + kVarHdr > arrival_buf.size())   // bounds check
+                        throw std::runtime_error("ChunkedKnnAccumulator: truncated arrival record in chunk " + std::to_string(c));
+                    const char* rp = arrival_buf.data() + off;
+                    int64_t gid; uint32_t cnt;
                     std::memcpy(&gid, rp, sizeof(int64_t));
-                    std::memcpy(new_nbrs.data(), rp + sizeof(int64_t),
-                               static_cast<size_t>(M) * sizeof(int32_t));
-                    std::memcpy(new_dists.data(),
-                               rp + sizeof(int64_t) + static_cast<size_t>(M) * sizeof(int32_t),
-                               static_cast<size_t>(M) * sizeof(float));
+                    std::memcpy(&cnt, rp + sizeof(int64_t), sizeof(uint32_t));
+                    if (cnt > static_cast<uint32_t>(M) || off + var_record_bytes(cnt) > arrival_buf.size())   // bounds check
+                        throw std::runtime_error("ChunkedKnnAccumulator: bad arrival record in chunk " + std::to_string(c));
+                    std::memcpy(new_nbrs.data(), rp + kVarHdr, static_cast<size_t>(cnt) * sizeof(int32_t));
+                    std::memcpy(new_dists.data(), rp + kVarHdr + static_cast<size_t>(cnt) * sizeof(int32_t),
+                                static_cast<size_t>(cnt) * sizeof(float));
+                    std::fill(new_nbrs.begin() + cnt, new_nbrs.end(), -1);
+                    std::fill(new_dists.begin() + cnt, new_dists.end(), std::numeric_limits<float>::infinity());
+                    off += var_record_bytes(cnt);
                     int64_t pos = gid - chunk_start;
                     if (pos < 0 || pos >= chunk_c_size) continue;  // 不应该发生，保险起见
                     merge_one_record(
@@ -4327,7 +4366,11 @@ struct ChunkedKnnAccumulator {
                         new_nbrs.data(), new_dists.data(), M,
                         scratch, id_sort_buf);
                 }
-                if (n_records > 0) std::filesystem::remove(ip);
+                n_records += n_file;
+                // 这一轮要留给最终 merge 的 arrival 文件不删
+                if (n_file > 0 && !(defer && ai == iter)) std::filesystem::remove(ip);
+                }   // ai
+                tm.n_records = static_cast<int64_t>(n_records);
                 if (!is_final) {
                     for (int64_t pos = 0; pos < chunk_c_size; ++pos)
                         kth_work[static_cast<size_t>(chunk_start + pos)] =
@@ -4342,7 +4385,9 @@ struct ChunkedKnnAccumulator {
                     if (!pwrite_all(fd_knn, run_nbrs.data(), run_nbrs.size() * sizeof(int32_t), ofs) ||
                         (fd_dist >= 0 && !pwrite_all(fd_dist, run_dists.data(), run_dists.size() * sizeof(float), ofs)))
                         throw std::runtime_error("ChunkedKnnAccumulator: final pwrite failed for chunk " + std::to_string(c));
-                    if (iter > 0) { std::filesystem::remove(np); std::filesystem::remove(dp); }
+                    if (base_iter >= 0) { std::filesystem::remove(np); std::filesystem::remove(dp); }
+                } else if (defer) {
+                    // 不写 running: 旧 running 文件 (base_iter ≥ 0 时) 和这一轮的 arrival 都留着
                 } else {
                     std::ofstream nout(np, std::ios::binary | std::ios::trunc);
                     std::ofstream dout(dp, std::ios::binary | std::ios::trunc);
@@ -4371,6 +4416,7 @@ struct ChunkedKnnAccumulator {
                 throw std::runtime_error("ChunkedKnnAccumulator: close failed for final outputs");
             final_written = true;
         }
+        deferred_iter = defer ? iter : -1;
         double secs = std::chrono::duration<double>(
             std::chrono::high_resolution_clock::now() - t_merge_start).count();
         size_t running_rw_bytes = static_cast<size_t>(M) * sizeof(int32_t) * 2;  // nbrs+dists 各 M*4B
@@ -4392,6 +4438,7 @@ struct ChunkedKnnAccumulator {
             mx.read_arrival = std::max(mx.read_arrival, t.read_arrival); mx.merge_cpu = std::max(mx.merge_cpu, t.merge_cpu);
             mx.write_running = std::max(mx.write_running, t.write_running); mx.total = std::max(mx.total, t.total);
         }
+        if (defer) std::cout << "[ChunkedKNN] merge_iteration(iter=" << iter << "): running not written (deferred to the final merge)\n";
         std::cout << "[ChunkedKNN] merge_iteration(iter=" << iter << "): "
                   << total_gb << " GB moved, wall=" << secs << "s "
                   << "(num_chunks=" << num_chunks << ", merge_parallelism=" << merge_parallelism
@@ -7343,6 +7390,7 @@ int run_pipeline_impl(
             }
             {
                 ChunkedKnnAccumulator* acc_ptr = knn_acc.get();
+                acc_ptr->planned_final_iter = iterations - 1;
                 if (iter == iterations - 1)
                     acc_ptr->set_final_output(output_dir + "/vector_knn.bin",
                                               config.save_dists ? output_dir + "/vector_dists.bin" : std::string(), iter);

@@ -30,34 +30,34 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#3 (A2 params: CENTROID_RATIO 0.004 / NPROBE 80 + Step 6 dots row tiling)**, 2026-10-22 (`runs/tagore3`):
+After **#4 (penultimate merge does not write running + variable-length arrival records)**, 2026-10-22 (`runs/tagore4`):
 
 **Build time (s, median; sum of all stages)**
 
 | config | path | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
 |---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | resident | 5.16 | +17.7% | +17.6% | 0.56x | 0.45x | bucket2 5.16 | 5244 | 1.68 |
-| sift1M_large | large | 9.02 | +6.1% | +6.9% | 0.98x | 0.78x | bucket2 7.21, prune 0.69, optimize_chunked 0.71, translate 0.48 | 1286 | 1.96 |
-| sift10M_auto | large | 78.14 | +5.0% | +5.2% | 0.36x | 0.64x | bucket2 67.95, prune 3.72, optimize_chunked 2.89, translate 3.58 | 8996 | 12.25 |
-| sift100M_auto | large | 1666.75 | +33.5% | +48.2% | 0.77x | — | bucket2 1107.95, prune 145.90, optimize_chunked 354.85, translate 58.05 | 14588 | 79.13 |
+| sift1M_auto | resident | 5.13 | +0.6% | +18.1% | 0.56x | 0.44x | bucket2 5.13 | 5332 | 1.68 |
+| sift1M_large | large | 8.88 | +1.6% | +8.4% | 0.97x | 0.77x | bucket2 6.96, prune 0.72, optimize_chunked 0.72, translate 0.46 | 1286 | 2.00 |
+| sift10M_auto | large | 74.30 | +4.9% | +9.9% | 0.35x | 0.61x | bucket2 64.12, prune 3.85, optimize_chunked 2.90, translate 3.43 | 8996 | 11.72 |
+| sift100M_auto | large | 1434.63 | +13.9% | +55.4% | 0.67x | — | bucket2 943.15, prune 140.80, optimize_chunked 292.89, translate 57.79 | 14588 | 79.13 |
 
 **bucket2 step breakdown (s)**
 
 | config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | 0.64 | 0.23 | 0.09 | 0.00 | 0.39 | 0.23 | 0.02 | 2.06 | 0.00 | 0.93 |
-| sift1M_large | 0.14 | 0.48 | 0.26 | 0.00 | 0.96 | 0.17 | 0.04 | 3.71 | 0.51 | 0.00 |
-| sift10M_auto | 1.40 | 3.63 | 0.52 | 0.00 | 17.96 | 1.72 | 0.23 | 37.52 | 4.03 | 0.00 |
-| sift100M_auto | 72.62 | 121.79 | 14.59 | 0.00 | 231.78 | 133.20 | 5.74 | 477.38 | 42.70 | 0.00 |
+| sift1M_auto | 0.64 | 0.23 | 0.09 | 0.00 | 0.40 | 0.23 | 0.02 | 2.05 | 0.00 | 0.94 |
+| sift1M_large | 0.14 | 0.60 | 0.26 | 0.00 | 0.80 | 0.22 | 0.02 | 3.60 | 0.63 | 0.00 |
+| sift10M_auto | 1.42 | 4.04 | 0.57 | 0.00 | 18.59 | 1.71 | 0.21 | 31.84 | 4.82 | 0.00 |
+| sift100M_auto | 72.03 | 128.15 | 14.31 | 0.00 | 220.92 | 132.18 | 5.12 | 335.10 | 27.81 | 0.00 |
 
 **(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
 
 | config | recall@1 | recall@10 | recall@32 | recall@64 |
 |---|---|---|---|---|
-| sift1M_auto | 0.9547 | 0.9436 | 0.9341 | 0.9268 |
-| sift1M_large | 0.9557 | 0.9448 | 0.9336 | 0.9261 |
-| sift10M_auto | 0.8827 | 0.8587 | 0.8394 | 0.8257 |
-| sift100M_auto | 0.6833 | 0.6560 | 0.6311 | 0.6155 |
+| sift1M_auto | 0.9603 | 0.9441 | 0.9345 | 0.9268 |
+| sift1M_large | 0.9532 | 0.9433 | 0.9324 | 0.9248 |
+| sift10M_auto | 0.8811 | 0.8589 | 0.8392 | 0.8255 |
+| sift100M_auto | 0.6885 | 0.6568 | 0.6325 | 0.6158 |
 
 **(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); sift1M/10M: cuVS CAGRA search, sift100M: DiskANN CPU search (itopk = L)**
 
@@ -68,10 +68,10 @@ After **#3 (A2 params: CENTROID_RATIO 0.004 / NPROBE 80 + Step 6 dots row tiling
 | TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
 | CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
 | CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
-| ours sift1M_auto | 0.9268 / 1947K | 0.9770 / 1034K | 0.9943 / 533K | 0.9988 / 189K | 0.9997 / 68K |
-| ours sift1M_large | 0.9136 / 2219K | 0.9703 / 1190K | 0.9924 / 561K | 0.9982 / 189K | 0.9996 / 68K |
-| ours sift10M_auto | 0.8335 / 1872K | 0.9247 / 1010K | 0.9713 / 501K | 0.9911 / 185K | 0.9977 / 68K |
-| ours sift100M_auto | 0.7331 / 61K | 0.8401 / 63K | 0.9157 / 38K | 0.9627 / 22K | 0.9856 / 13K |
+| ours sift1M_auto | 0.9267 / 1947K | 0.9765 / 1033K | 0.9942 / 532K | 0.9987 / 177K | 0.9997 / 68K |
+| ours sift1M_large | 0.9140 / 2221K | 0.9707 / 1188K | 0.9920 / 562K | 0.9980 / 182K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8337 / 1871K | 0.9247 / 1011K | 0.9718 / 481K | 0.9910 / 184K | 0.9978 / 68K |
+| ours sift100M_auto | 0.7353 / 68K | 0.8402 / 63K | 0.9166 / 39K | 0.9631 / 22K | 0.9859 / 13K |
 
 ## Baseline verification
 
@@ -148,6 +148,9 @@ SIFT100M Step 6 = 1687 s of 3215 s, and ~1000 s of it is the producer waiting on
 | B2 | GPU bucket cache budget vs dots slot buffers (resource params: `--gpu-cache-mb`, dots slot cap): fewer evictions | `largeIndex` `buffer_size` / `max_points` sizing, `reorder` slot choice | Step 6 wait_producer 660 + 735 | −100…−400 s |
 | B3 | Host side of the miss path: round bucket records held in RAM (bucket2 host budget so the Belady cache / blob holds 13.6 GB; RSS guard ≤ 1.2× 79.4 GB) — cf. cuVS-loop #75 | `graph_pool` kept in host RAM | Step 6 cache_get − upload ≈ 230 + 250 | −100…−300 s |
 | B4 | KMeans|| d(x, C): fused tensor-core GEMM + row-min with precomputed norms (cuVS-loop `iter73` patch, maybe + `iter72`) — at SIFT100M kmeans_parallel is 180 s / round | `nn_descent_opt_cal` + `cal_power` | Step 2 368 | −100…−170 s |
+| B7 | (user idea, relayed 2026-10-22) **Measure the change ratio first:** per round ≥ 2 log the fraction of points with cnt > 0 in the arrival and the fraction whose merged top-M actually changed (+ arrival bytes vs fixed width, printed since #4: SIFT100M round 2 44.1 / 52.0 GB, SIFT10M rounds 2–3 4.52 / 5.20 GB) — decides whether B8 is worth it | `order_merge_new` | merge stats | 0 (measurement) |
+| B8 | (user idea, relayed 2026-10-22) **Sparse running rewrite** — "只重写这一轮真的变了的那些行。每个 chunk 里先按 id 排序，再成段写回，而不是把整个 running 重写一遍": rewrite only rows whose top-M changed, sorted by id per chunk, written back as contiguous runs (pwrite) | `order_merge_new` (only the touched lists are rewritten) | merge iter ≥ 1 (matters when ITERATIONS ≥ 3) | depends on B7 |
+| B9 | (user idea, relayed 2026-10-22) **Generalize #4's deferral:** after each round ≥ 2 keep all not-yet-merged arrival files while their total ≤ one full first-round arrival (≈ running size); merge (running + all pending → running, or → vector_knn at the end) only when the bound would be exceeded or at the final round. Open points: next-round threshold = read-only pass over running + pending (like #4) vs keep the older looser kth (exact too, more arrival bytes) — measure; final merge reads pending files one at a time into the same buffer (per-thread memory unchanged, RSS guard) | `order_merge_new` (merge in one final pass) | merges for ITERATIONS ≥ 3 | SIFT10M merges / disk I/O |
 | B5 | Step 4.5: background writer so `pass3_write` (67 s) overlaps `resample` (92 s) | `cached_ofstream`, CPU merge thread overlapped with GPU | Step 4.5 195 | −50…−65 s |
 | B6 | `optimize_chunked -m E`: reverse edges collected on the GPU per chunk (unbounded, same rule), disk edge accumulator only when a chunk does not fit | `filter_cagra` reverse push + `filter_reverse_1hop` | optimize_chunked 280 (acc.finish 91, Phase 1 53) | −80…−140 s |
 
@@ -407,3 +410,66 @@ resident buckets), others ≤ best. optimize_chunked 287 → 355 s on SIFT100M (
 | ours sift1M_large | 0.9136 / 2219K | 0.9703 / 1190K | 0.9924 / 561K | 0.9982 / 189K | 0.9996 / 68K |
 | ours sift10M_auto | 0.8335 / 1872K | 0.9247 / 1010K | 0.9713 / 501K | 0.9911 / 185K | 0.9977 / 68K |
 | ours sift100M_auto | 0.7331 / 61K | 0.8401 / 63K | 0.9157 / 38K | 0.9627 / 22K | 0.9856 / 13K |
+
+### #4 — penultimate merge does not write running + variable-length arrival records (2026-10-22)
+
+**Idea:** after #3, SIFT100M round 2 Step 6 was 302 s wall but only 166 s inside the loop timers: the scatter worker
+(`ChunkedKnnAccumulator::add`, 954 chunk files, 255 KB `ofstream` writes) took 297 s and drained 136 s after the
+loop. Direct writes on this volume run at **258 MB/s** (`dd oflag=direct`), and round 2's 52 GB of arrival records
+competed with the writeback of the round-1 merge's 51 GB running files (`merge_iteration(iter=0)`: 103 GB moved,
+145 s, during round 2 Steps 2–4). (1) When the next merge is the final one (`planned_final_iter`), the merge only
+builds the merged lists in memory to export `kth` (the next round's top-M threshold), does **not** write running
+files and keeps its arrival file; the final merge rebuilds running from the older running files (if any) + the kept
+arrival, then merges the last round's arrival. For ITERATIONS = 2 (SIFT100M) the running files are never written.
+(2) Arrival records are variable length: `[int64 gid][uint32 cnt][cnt ids][cnt dists]`, cnt = last valid + 1; the
+merge pads back to M with −1/+inf → identical merge input (saves ~15 % in rounds ≥ 2: SIFT100M 44.1 vs 52.0 GB,
+SIFT10M 4.52 vs 5.20 GB). Final `vector_knn` unchanged.
+**TAGORE source:** `large_index.cu::order_merge_new` (local graphs stay in the buffer / on disk and are merged once in
+a final streaming pass) + `cached_ofstream` (big writes, fewer passes over the disk). **Class:** implementation.
+**Checks:** SIFT10M smoke (3 rounds: iter 1 deferred) pre-prune recall@10 0.8559 vs 0.8587 (#3 run), SIFT1M large
+`-t 2` vs a HEAD build 0.8815 vs 0.8811 (run-to-run noise); no leftover chunk files.
+**SIFT100M:** round 2 scatter 297 → 85 s (tail drain 136 → 0 s), merge iter 0 145 → 6 s, final merge 43 → 28 s;
+Step 6 477 → 335 s, bucket2 1108 → 943 s; total 1666.75 → **1434.63 s (+13.9 %, +55.4 % vs #0; 0.67× TAGORE)**;
+optimize_chunked 355 → 293 s (less disk contention). DiskANN recall@10 0.7353 / 0.8402 / 0.9166 / 0.9631 / 0.9859
+(best 0.7331 / … / 0.9856), RSS 79.1 GB, GPU 14588 MiB. SIFT10M +4.9 % (third round's penultimate merge), 1M ±1 %.
+
+**Build time (s, median; sum of all stages)**
+
+| config | path | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 5.13 | +0.6% | +18.1% | 0.56x | 0.44x | bucket2 5.13 | 5332 | 1.68 |
+| sift1M_large | large | 8.88 | +1.6% | +8.4% | 0.97x | 0.77x | bucket2 6.96, prune 0.72, optimize_chunked 0.72, translate 0.46 | 1286 | 2.00 |
+| sift10M_auto | large | 74.30 | +4.9% | +9.9% | 0.35x | 0.61x | bucket2 64.12, prune 3.85, optimize_chunked 2.90, translate 3.43 | 8996 | 11.72 |
+| sift100M_auto | large | 1434.63 | +13.9% | +55.4% | 0.67x | — | bucket2 943.15, prune 140.80, optimize_chunked 292.89, translate 57.79 | 14588 | 79.13 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.64 | 0.23 | 0.09 | 0.00 | 0.40 | 0.23 | 0.02 | 2.05 | 0.00 | 0.94 |
+| sift1M_large | 0.14 | 0.60 | 0.26 | 0.00 | 0.80 | 0.22 | 0.02 | 3.60 | 0.63 | 0.00 |
+| sift10M_auto | 1.42 | 4.04 | 0.57 | 0.00 | 18.59 | 1.71 | 0.21 | 31.84 | 4.82 | 0.00 |
+| sift100M_auto | 72.03 | 128.15 | 14.31 | 0.00 | 220.92 | 132.18 | 5.12 | 335.10 | 27.81 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+
+| config | recall@1 | recall@10 | recall@32 | recall@64 |
+|---|---|---|---|---|
+| sift1M_auto | 0.9603 | 0.9441 | 0.9345 | 0.9268 |
+| sift1M_large | 0.9532 | 0.9433 | 0.9324 | 0.9248 |
+| sift10M_auto | 0.8811 | 0.8589 | 0.8392 | 0.8255 |
+| sift100M_auto | 0.6885 | 0.6568 | 0.6325 | 0.6158 |
+
+**(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); sift1M/10M: cuVS CAGRA search, sift100M: DiskANN CPU search (itopk = L)**
+
+| graph | itopk 32 | itopk 64 | itopk 128 | itopk 256 | itopk 512 |
+|---|---|---|---|---|---|
+| TAGORE GNN-Descent k=96 + CAGRA prune, sift1M | 0.9220 / 1947K | 0.9752 / 1033K | 0.9936 / 497K | 0.9985 / 186K | 0.9996 / 68K |
+| TAGORE largeIndex Vamana, sift10M | 0.8448 / 1875K | 0.9238 / 1014K | 0.9662 / 482K | 0.9863 / 185K | 0.9950 / 68K |
+| TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
+| CAGRA native 64→32, sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| CAGRA native 64→32, sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| ours sift1M_auto | 0.9267 / 1947K | 0.9765 / 1033K | 0.9942 / 532K | 0.9987 / 177K | 0.9997 / 68K |
+| ours sift1M_large | 0.9140 / 2221K | 0.9707 / 1188K | 0.9920 / 562K | 0.9980 / 182K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8337 / 1871K | 0.9247 / 1011K | 0.9718 / 481K | 0.9910 / 184K | 0.9978 / 68K |
+| ours sift100M_auto | 0.7353 / 68K | 0.8402 / 63K | 0.9166 / 39K | 0.9631 / 22K | 0.9859 / 13K |
