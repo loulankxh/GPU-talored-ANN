@@ -148,3 +148,6 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   candidates under the running threshold). User ideas B7–B9 (change ratio, sparse rewrite, generalized deferral) are
   for ITERATIONS ≥ 3. Remaining SIFT100M: Step 6 335, optimize_chunked 293, Step 4 221, prune 141, Step 4.5 132,
   Step 2 128, Step 1 72, translate 58.
+- **#5 (rejected, possible gain +6.8%):** `EdgeChunkAccumulator::finish` copy removed (−100 s in optimize_chunked,
+  byte-identical) but single-run SIFT100M noise (Step 6 ±10 s) keeps it under the 7% gate. Bundle the patch with the
+  next optimize_chunked change (Phase 2 111 s, Phase 1 48 s, create 12 s) so the pair clears 7%.

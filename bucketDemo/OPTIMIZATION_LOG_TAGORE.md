@@ -167,7 +167,9 @@ SIFT100M Step 6 = 1687 s of 3215 s, and ~1000 s of it is the producer waiting on
 
 SIFT100M 3–7% faster with everything else passing (rechecked later with multi-run medians).
 
-(empty)
+| # | idea | TAGORE source | SIFT100M | other configs | patch |
+|---|---|---|---|---|---|
+| 5 | `optimize_chunked -m E` disk path: `EdgeChunkAccumulator::finish()` no longer copies the per-chunk reverse-edge files into one merged file (32 GB read + 32 GB write); `read_chunk` reads chunk c's own file (size checked) and deletes it. Byte-identical output (SIFT1M forced to 4 chunks, old vs new `cmp`) | `order_merge_new` (one file per local graph, streamed once) | 1434.63 → 1336.36 s (**+6.8 %**): `acc.finish` 107.3 → 6.9 s, optimize_chunked 292.9 → 191.9 s; Step 6 335 → 347 s (noise); DiskANN recall unchanged | 1M auto −0.8 %, 1M large +3.0 % then rerun +1.0 % (this change does not touch their in-memory edge path), 10M +0.1 % | `bucketDemo/patches/tagore5_edge_chunks_no_merge_copy.patch` |
 
 ## Tried & rejected
 
@@ -474,3 +476,11 @@ optimize_chunked 355 → 293 s (less disk contention). DiskANN recall@10 0.7353 
 | ours sift1M_large | 0.9140 / 2221K | 0.9707 / 1188K | 0.9920 / 562K | 0.9980 / 182K | 0.9996 / 68K |
 | ours sift10M_auto | 0.8337 / 1871K | 0.9247 / 1011K | 0.9718 / 481K | 0.9910 / 184K | 0.9978 / 68K |
 | ours sift100M_auto | 0.7353 / 68K | 0.8402 / 63K | 0.9166 / 39K | 0.9631 / 22K | 0.9859 / 13K |
+
+### #5 — REJECTED (possible gain): optimize_chunked disk path without the merge copy (2026-10-22)
+
+`acc.finish()` copied the per-chunk edge files into one merged file before Phase 2 (SIFT100M 107 s); now Phase 2 reads
+each chunk file directly. The stage gain is deterministic (optimize_chunked 293 → 192 s) but the SIFT100M total is
++6.85 % (1434.63 → 1336.36 s) — below the 7 % single-run gate — and the only ≥ 3 % config (1M large +3.04 %) did not
+hold on the rerun (+1.01 %; this change does not run there). Rejected per the rules, listed under **Possible gains**
+for the multi-run recheck; patch kept. Good candidate to bundle with the next optimize_chunked / merge change.
