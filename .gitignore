@@ -5,3 +5,19 @@
 /bucketDemo/buildBucket/output/
 /bucketDemo/buildCAGRA/build/
 
+
+# build artifacts / generated files (only source code + docs go to the remote)
+__pycache__/
+*.pyc
+/bucketDemo/buildBucket/CMakeCache.txt
+/bucketDemo/buildBucket/Makefile
+/bucketDemo/buildBucket/cmake_install.cmake
+/bucketDemo/buildBucket/search
+/bucketDemo/buildCAGRA/results*/
+/bucketDemo/debug/
+*.log
+# graph / index / dataset binaries
+*.u8bin
+*.fbin
+*.ibin
+*.npy
