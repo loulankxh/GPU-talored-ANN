@@ -169,7 +169,7 @@ SIFT100M 3–7% faster with everything else passing (rechecked later with multi-
 
 | # | idea | TAGORE source | SIFT100M | other configs | patch |
 |---|---|---|---|---|---|
-| — | (none open; #17 was accepted bundled in #18) | | | | |
+| 19 | Parallel sequential reads: (a) `translate_ids` reads the input graph once per 1 GB output window (SIFT100M 13 × 12.8 GB) through one `ifstream` → each thread `pread`s its own 2 MB batches and fills the window (byte-identical: SIFT10M at 64 MB and 1 GB buffers vs the existing final_graph); (b) `load::read_bigann_raw_range` → parallel 8 MB `pread` pieces; (c) Step 4 / BucketWrite reuse their batch buffers across batches (no per-batch zero-fill). TAGORE `order_merge_new` (parallel streaming of local results) | 810.90 → 761.61 s (**+6.1 %**): translate 55.1 → **22.7 s** (RSS 1.54 GB, guard 1.74), Step 4 176 → 149 s (read 12.3 / 13.3 → 5.9 / 6.0 s, BucketWrite read 13 → 1 s); bucket2 RSS 45.1 GB (guard 51.9); 1M auto −1.4 %, 1M large +3.1 % then rerun +1.5 % (borderline, did not hold), 10M +1.6 % | `bucketDemo/patches/tagore19_parallel_seq_reads.patch` |
 
 ## Tried & rejected
 
@@ -873,3 +873,8 @@ bucket2 RSS 36.2 → 43.2 GB (guard 45.7 GB; now the pipeline max); DiskANN reca
 | ours sift1M_large | 0.9126 / 2200K | 0.9702 / 1185K | 0.9919 / 562K | 0.9981 / 189K | 0.9996 / 68K |
 | ours sift10M_auto | 0.8338 / 1870K | 0.9249 / 1011K | 0.9717 / 525K | 0.9914 / 186K | 0.9978 / 68K |
 | ours sift100M_auto | 0.7340 / 69K | 0.8408 / 65K | 0.9159 / 39K | 0.9619 / 22K | 0.9855 / 13K |
+
+### #19 — REJECTED (possible gain +6.1 %): parallel sequential reads in translate / Step 4 / BucketWrite (2026-10-22)
+
+See **Possible gains** (#19): translate −32 s, Step 4 −27 s. The first judge said ACCEPT only through sift1M_large +3.09 %,
+which did not hold on the rerun (+1.49 %). To be bundled with the next change.
