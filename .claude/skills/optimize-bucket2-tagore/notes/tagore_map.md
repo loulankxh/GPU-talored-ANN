@@ -185,3 +185,6 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   SIFT100M: bucket2 578 (Step 6 238, Step 4 176, Step 2 76, Step 4.5 31, wait 26, Step 1 11, Step 3 9), prune 111,
   optimize_chunked 66, translate 55. bucket2 RSS 43.2 GB (guard now 51.9 GB). Next: Step 4 (search 61 / 42 s, reads 12 / 13,
   BucketWrite 28), Step 6 (loop ~116 / 114 s), translate 55 s.
+- **#20 (accepted, +8.7% → 740.5 s, 0.34× TAGORE):** parallel sequential I/O everywhere it was single-stream (translate,
+  Step 4 reads, optimize_chunked Phase 2, graph writer). Remaining SIFT100M: bucket2 548 (Step 6 240, Step 4 146 (CAGRA
+  search 61 / 42), Step 2 76, Step 4.5 29, wait 26, Step 1 11, Step 3 9), prune 110, optimize_chunked 60, translate 22.

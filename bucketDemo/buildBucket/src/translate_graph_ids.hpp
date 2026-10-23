@@ -84,8 +84,8 @@ inline void translate_graph_to_original_order(
 
     std::vector<uint32_t> inverse_perm = read_inverse_perm(inverse_perm_path, N);
 
-    std::ifstream in(graph_path, std::ios::binary);
-    if (!in.is_open())
+    const int in_fd = ::open(graph_path.c_str(), O_RDONLY);
+    if (in_fd < 0)
         throw std::runtime_error("translate_ids: cannot open " + graph_path);
     const std::streamoff header_bytes = sizeof(int64_t) + sizeof(int32_t);
 
@@ -93,7 +93,7 @@ inline void translate_graph_to_original_order(
     if (fd < 0)
         throw std::runtime_error("translate_ids: cannot open " + output_path + " for writing");
     auto fail = [&](const std::string& msg) {
-        ::close(fd);
+        ::close(fd); ::close(in_fd);
         throw std::runtime_error("translate_ids: " + msg);
     };
     auto pwrite_all = [&](const char* p, size_t n, off_t off) {
@@ -115,40 +115,53 @@ inline void translate_graph_to_original_order(
     const int64_t win_rows = std::max<int64_t>(1, std::min<int64_t>(
         N, static_cast<int64_t>(out_buffer_bytes / static_cast<size_t>(row_bytes))));
     std::vector<uint32_t> window(static_cast<size_t>(win_rows) * K_out);
-    std::vector<uint32_t> batch(static_cast<size_t>(batch_rows) * K_out);
     std::atomic<int64_t> bad_new_id{-1};
 
     for (int64_t win_lo = 0; win_lo < N; win_lo += win_rows) {
         const int64_t win_hi = std::min<int64_t>(N, win_lo + win_rows);
         int64_t filled = 0;
-        in.clear();
-        in.seekg(header_bytes);
-        for (int64_t lo = 0; lo < N; lo += batch_rows) {
-            int64_t rows = std::min<int64_t>(batch_rows, N - lo);
-            in.read(reinterpret_cast<char*>(batch.data()),
-                    static_cast<std::streamsize>(static_cast<size_t>(rows) * K_out * sizeof(uint32_t)));
-            if (!in.good()) fail("failed reading graph batch at row " + std::to_string(lo));
-
-            #pragma omp parallel for schedule(static) reduction(+:filled)
-            for (int64_t r = 0; r < rows; ++r) {
-                int64_t new_id = lo + r;
-                uint32_t old_id = inverse_perm[static_cast<size_t>(new_id)];
-                if (old_id < win_lo || old_id >= win_hi) continue;   // also rejects old_id >= N
-                const uint32_t* src = batch.data() + static_cast<size_t>(r) * K_out;
-                uint32_t* dst = window.data() + static_cast<size_t>(old_id - win_lo) * K_out;
-                for (int32_t k = 0; k < K_out; ++k) {
-                    uint32_t v = src[k];
-                    if (v >= static_cast<uint64_t>(N)) {   // bounds check: neighbor id out of range
-                        bad_new_id.store(new_id, std::memory_order_relaxed);
-                        v = 0;
-                    }
-                    dst[k] = inverse_perm[v];
+        // 每个窗都要把整份输入扫一遍 (SIFT100M: 13 窗 × 12.8 GB)；原来单线程 ifstream 按 2 MB 批读，
+        // 读是瓶颈 (translate 55 s)。现在各线程自己 pread 自己的批次、直接填窗 (窗内目标行互不相同，
+        // 无冲突)，结果逐字节相同。参考 TAGORE order_merge_new: 多段并行流式读回局部结果。
+        const int64_t n_batches = (N + batch_rows - 1) / batch_rows;
+        std::atomic<bool> read_fail{false};
+        #pragma omp parallel reduction(+:filled)
+        {
+            std::vector<uint32_t> tb(static_cast<size_t>(batch_rows) * K_out);
+            #pragma omp for schedule(dynamic, 4)
+            for (int64_t bi = 0; bi < n_batches; ++bi) {
+                const int64_t lo = bi * batch_rows;
+                const int64_t rows = std::min<int64_t>(batch_rows, N - lo);
+                char* p = reinterpret_cast<char*>(tb.data());
+                size_t want = static_cast<size_t>(rows) * K_out * sizeof(uint32_t);
+                off_t off = static_cast<off_t>(header_bytes) + static_cast<off_t>(lo) * row_bytes;
+                while (want > 0) {
+                    ssize_t r = ::pread(in_fd, p, want, off);
+                    if (r <= 0) break;
+                    p += r; want -= static_cast<size_t>(r); off += r;
                 }
-                ++filled;
+                if (want != 0) { read_fail.store(true, std::memory_order_relaxed); continue; }
+                for (int64_t r = 0; r < rows; ++r) {
+                    int64_t new_id = lo + r;
+                    uint32_t old_id = inverse_perm[static_cast<size_t>(new_id)];
+                    if (old_id < win_lo || old_id >= win_hi) continue;   // also rejects old_id >= N
+                    const uint32_t* src = tb.data() + static_cast<size_t>(r) * K_out;
+                    uint32_t* dst = window.data() + static_cast<size_t>(old_id - win_lo) * K_out;
+                    for (int32_t k = 0; k < K_out; ++k) {
+                        uint32_t v = src[k];
+                        if (v >= static_cast<uint64_t>(N)) {   // bounds check: neighbor id out of range
+                            bad_new_id.store(new_id, std::memory_order_relaxed);
+                            v = 0;
+                        }
+                        dst[k] = inverse_perm[v];
+                    }
+                    ++filled;
+                }
             }
-            if (bad_new_id.load() >= 0)
-                fail("neighbor id >= N in row (new id) " + std::to_string(bad_new_id.load()));
         }
+        if (read_fail.load()) fail("failed reading graph batch");
+        if (bad_new_id.load() >= 0)
+            fail("neighbor id >= N in row (new id) " + std::to_string(bad_new_id.load()));
         // inverse_perm is a permutation iff every destination row is hit once
         if (filled != win_hi - win_lo)
             fail("inverse_perm is not a permutation: window [" + std::to_string(win_lo) + ", " +
@@ -158,6 +171,7 @@ inline void translate_graph_to_original_order(
                    static_cast<off_t>(header_bytes) + static_cast<off_t>(win_lo) * row_bytes);
     }
 
+    ::close(in_fd);
     if (::close(fd) != 0)
         throw std::runtime_error("translate_ids: close failed for " + output_path);
 }

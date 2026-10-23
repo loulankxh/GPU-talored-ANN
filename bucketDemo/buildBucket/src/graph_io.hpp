@@ -32,6 +32,10 @@
 #pragma once
 
 #include <cstdint>
+#include <unistd.h>
+#include <fcntl.h>
+#include <cstring>
+#include <algorithm>
 #include <fstream>
 #include <stdexcept>
 #include <string>
@@ -100,26 +104,45 @@ public:
     StreamingGraphWriter(const std::string& path, int64_t N, int32_t K_out)
         : N_(N), K_out_(K_out)
     {
-        out_.open(path, std::ios::binary);
-        if (!out_.is_open())
+        fd_ = ::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (fd_ < 0)
             throw std::runtime_error("Cannot open for streaming write: " + path);
-        out_.write(reinterpret_cast<const char*>(&N), sizeof(int64_t));
-        out_.write(reinterpret_cast<const char*>(&K_out), sizeof(int32_t));
-        if (!out_.good())
+        char hdr[sizeof(int64_t) + sizeof(int32_t)];
+        std::memcpy(hdr, &N, sizeof(int64_t));
+        std::memcpy(hdr + sizeof(int64_t), &K_out, sizeof(int32_t));
+        if (!pwrite_all(hdr, sizeof(hdr), 0))
             throw std::runtime_error("Failed to write graph header: " + path);
     }
+    StreamingGraphWriter(const StreamingGraphWriter&) = delete;
+    StreamingGraphWriter& operator=(const StreamingGraphWriter&) = delete;
 
     // Rows must be supplied in strictly increasing, contiguous row_lo order
-    // (chunk c's call must start where chunk c-1's left off) -- this is a
-    // pure sequential append, no seeking.
+    // (chunk c's call must start where chunk c-1's left off). Each call's rows go
+    // to their known offset; large calls are split into 64 MB pieces written by
+    // parallel pwrite (SIFT100M optimize_chunked Phase 2 wrote 12.8 GB through one
+    // ofstream in 12 s). Same file contents as the old sequential append.
     void write_rows(const uint32_t* rows, int64_t row_lo, int64_t n_rows) {
         if (row_lo != rows_written_)
             throw std::runtime_error(
                 "StreamingGraphWriter: out-of-order write (expected row " +
                 std::to_string(rows_written_) + ", got " + std::to_string(row_lo) + ")");
-        out_.write(reinterpret_cast<const char*>(rows),
-                   static_cast<std::streamsize>(static_cast<size_t>(n_rows) * K_out_ * sizeof(uint32_t)));
-        if (!out_.good())
+        const int64_t bytes = n_rows * K_out_ * static_cast<int64_t>(sizeof(uint32_t));
+        const off_t base = static_cast<off_t>(kHeader) + static_cast<off_t>(row_lo) * K_out_ * static_cast<off_t>(sizeof(uint32_t));
+        const char* src = reinterpret_cast<const char*>(rows);
+        constexpr int64_t kPiece = int64_t(64) << 20;
+        bool ok = true;
+        if (bytes <= kPiece) {
+            ok = pwrite_all(src, static_cast<size_t>(bytes), base);
+        } else {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int64_t o = 0; o < bytes; o += kPiece) {
+                if (!pwrite_all(src + o, static_cast<size_t>(std::min<int64_t>(kPiece, bytes - o)), base + static_cast<off_t>(o))) {
+                    #pragma omp atomic write
+                    ok = false;
+                }
+            }
+        }
+        if (!ok)
             throw std::runtime_error("StreamingGraphWriter: write failed");
         rows_written_ += n_rows;
     }
@@ -127,12 +150,22 @@ public:
     ~StreamingGraphWriter() {
         // Best-effort: don't throw from a destructor. Callers should check
         // rows_written() == N themselves before letting this go out of scope.
+        if (fd_ >= 0) ::close(fd_);
     }
 
     int64_t rows_written() const { return rows_written_; }
 
 private:
-    std::ofstream out_;
+    static constexpr int64_t kHeader = sizeof(int64_t) + sizeof(int32_t);
+    bool pwrite_all(const char* p, size_t n, off_t off) const {
+        while (n > 0) {
+            ssize_t w = ::pwrite(fd_, p, n, off);
+            if (w <= 0) return false;
+            p += w; n -= static_cast<size_t>(w); off += w;
+        }
+        return true;
+    }
+    int fd_ = -1;
     int64_t N_;
     int32_t K_out_;
     int64_t rows_written_ = 0;

@@ -1476,6 +1476,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
 
     t_setup = std::chrono::duration<double>(Clock::now() - t_setup0).count();
 
+    std::vector<T> raw_batch;   // 跨 batch 复用 (每批重新分配会单线程清零一遍)
     for (int64_t batch_start = 0; batch_start < N_nc; batch_start += Nv) {
         int64_t batch_end = std::min(batch_start + Nv, N_nc);
         int64_t batch_size = batch_end - batch_start;
@@ -1487,7 +1488,6 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         auto tb0 = Clock::now();
         int64_t batch_lo = non_centroid_indices[batch_start];
         int64_t batch_hi = non_centroid_indices[batch_end - 1];
-        std::vector<T> raw_batch;
         const T* raw_ptr = nullptr;
         if (!is_pq && gpu_query_loader) {
             gpu_query_loader(non_centroid_indices.data() + batch_start, batch_size, d_queries);
@@ -1820,11 +1820,11 @@ void write_bucket_vectors_from_assignments(
 
     double t_read = 0, t_write = 0;
     std::vector<char> is_centroid;   // 内存模式下代替 centroid_set 的逐点哈希查找
+    std::vector<DataT> raw_chunk;    // 跨 chunk 复用 (每块重新分配会单线程清零一遍)
     for (int64_t lo = 0; lo < N; lo += chunk_points) {
         int64_t hi = std::min(lo + chunk_points, N) - 1;
 
         auto tr0 = Clock::now();
-        std::vector<DataT> raw_chunk;
         const DataT* chunk_ptr = nullptr;
         if (host_raw) {
             chunk_ptr = host_raw + static_cast<size_t>(lo) * D;

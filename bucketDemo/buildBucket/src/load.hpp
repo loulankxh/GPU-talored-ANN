@@ -360,15 +360,38 @@ inline void read_bigann_raw_range(const std::string& path,
             "read_bigann_raw_range: row range out of bounds");
 
     constexpr std::streamoff header_bytes = 2 * sizeof(int32_t);
-    std::streamoff offset = header_bytes +
-        static_cast<std::streamoff>(start_row) * static_cast<std::streamoff>(d) * sizeof(T);
-    in.seekg(offset);
+    const off_t offset = header_bytes +
+        static_cast<off_t>(start_row) * static_cast<off_t>(d) * static_cast<off_t>(sizeof(T));
+    in.close();
 
     const uint64_t cnt = static_cast<uint64_t>(num_rows) * static_cast<uint64_t>(d);
-    out.resize(cnt);
-    in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(cnt * sizeof(T)));
-    require(in.good(), "read_bigann_raw_range: failed to read rows ["
-                       + std::to_string(start_row) + ", " + std::to_string(start_row + num_rows) + ")");
+    if (out.size() != cnt) out.resize(cnt);   // 调用方复用同一个 vector 时不再每批清零
+    // 8 MB 一片并行 pread (原来单线程 ifstream ~1 GB/s；SIFT100M Step 4 / BucketWrite 每轮 12–13 s)
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    require(fd >= 0, "Cannot open file: " + path);
+    const uint64_t total = cnt * sizeof(T);
+    const uint64_t piece = uint64_t(8) << 20;
+    const int64_t n_pieces = static_cast<int64_t>((total + piece - 1) / piece);
+    bool ok = true;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int64_t i = 0; i < n_pieces; ++i) {
+        uint64_t o = static_cast<uint64_t>(i) * piece;
+        size_t want = static_cast<size_t>(std::min<uint64_t>(piece, total - o));
+        char* p = reinterpret_cast<char*>(out.data()) + o;
+        off_t off = offset + static_cast<off_t>(o);
+        while (want > 0) {
+            ssize_t r = ::pread(fd, p, want, off);
+            if (r <= 0) break;
+            p += r; want -= static_cast<size_t>(r); off += r;
+        }
+        if (want != 0) {
+            #pragma omp atomic write
+            ok = false;
+        }
+    }
+    ::close(fd);
+    require(ok, "read_bigann_raw_range: failed to read rows ["
+                + std::to_string(start_row) + ", " + std::to_string(start_row + num_rows) + ")");
 }
 
 // 推断 BIGANN 文件扩展名对应的元素类型大小（字节数）。

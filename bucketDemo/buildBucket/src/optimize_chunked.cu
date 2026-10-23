@@ -1858,10 +1858,10 @@ static void run_method_E(
 
             auto q0 = Clock::now();
             row_block.resize(static_cast<size_t>(chunk_sz) * K_out);
-            fwd_in2.read(reinterpret_cast<char*>(row_block.data()),
-                        static_cast<std::streamsize>(row_block.size() * sizeof(uint32_t)));
-            if (!fwd_in2.good())
-                throw std::runtime_error("Method E Phase 2: failed to read forward rows for chunk " + std::to_string(c));
+            // 并行 pread 这一块的前向行 (原来单线程 ifstream: SIFT100M read_fwd 11 s)
+            parallel_pread_file(fwd_path,
+                static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(j_lo) * K_out * static_cast<off_t>(sizeof(uint32_t)),
+                row_block.size() * sizeof(uint32_t), row_block.data());
 
             p2_fwd += p2s(q0); q0 = Clock::now();
             if (use_store) {
