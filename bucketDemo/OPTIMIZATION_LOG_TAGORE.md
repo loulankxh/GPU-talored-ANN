@@ -169,7 +169,7 @@ SIFT100M 3–7% faster with everything else passing (rechecked later with multi-
 
 | # | idea | TAGORE source | SIFT100M | other configs | patch |
 |---|---|---|---|---|---|
-| — | (none open; #14 was accepted bundled in #16) | | | | |
+| 17 | KMeans|| d(x, C): fused WMMA GEMM + row-min kernel (`kmeans_fused_min_kernel`, dots never leave registers / 1 KB warp scratch, per-row atomicMin; exact: u8 products exact in fp16, sums < 2^24 in fp32) + Step 3 centroid self-KNN fp16 tensor-core GEMM + select_k (cuVS-loop patch `iter73_kmeans_fused_min_plus72`, rejected there at 1M/10M scale; 3-way applied, conflict resolved keeping #74b's 1 GB dots tile cap). TAGORE `nn_descent_opt_cal` + `cal_power` (norms + tensor-core GEMM, reduce before writing) | 898.40 → 853.19 s (**+5.0 %**): Step 2 127 → 76 s (kmeans_parallel 56 / 64 → 34.5 / 34.5 s), Step 3 14.3 → 9.2 s; bucket2 RSS 36.2 → 43.4 GB (guard 45.7 GB); 1M auto +1.8 %, 1M large +0.9 %, 10M +0.8 %; recall unchanged | `bucketDemo/patches/tagore17_kmeans_fused_min_plus72.patch` |
 
 ## Tried & rejected
 
@@ -810,3 +810,8 @@ re-read; buffers in RAM). **Class:** implementation (+ resource parameter `--buc
 | ours sift1M_large | 0.9146 / 2224K | 0.9714 / 1190K | 0.9920 / 562K | 0.9982 / 189K | 0.9996 / 68K |
 | ours sift10M_auto | 0.8322 / 1867K | 0.9247 / 1011K | 0.9714 / 526K | 0.9907 / 186K | 0.9976 / 68K |
 | ours sift100M_auto | 0.7352 / 60K | 0.8419 / 55K | 0.9156 / 32K | 0.9620 / 19K | 0.9848 / 11K |
+
+### #17 — REJECTED (possible gain +5.0 %): KMeans|| fused GEMM + row-min (+ fp16 centroid KNN) (2026-10-22)
+
+See **Possible gains** (#17): Step 2 −51 s, Step 3 −5 s; to be bundled with the next change. Note: bucket2 RSS rose to
+43.4 GB in this run (guard 45.7 GB) — check what grew before bundling.
