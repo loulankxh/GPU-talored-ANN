@@ -192,3 +192,7 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   Remaining SIFT100M: bucket2 503 (Step 6 195, Step 4 148 (CAGRA search 61 / 42), Step 2 76, Step 4.5 28, wait 25, Step 1 11,
   Step 3 9), prune 102, optimize_chunked 62, translate 21. GPU cost per bucket in Step 6 is now ~0.2 ms (cuBLAS GEMM +
   top-M + gather), the next floor.
+- **#22 (rejected, +0.5%):** cache 10 GB cuts misses to 0.78M/round but Step 6 stays ~95 / 88 s → per-bucket GPU work is the
+  floor; parallel reorder_info (8 → 1.6 s, exact) kept as a bundling candidate. Loop stopped here by the user (2026-10-23).
+  Open directions: Step 6 GPU work per bucket (batch several buckets per GEMM / top-M launch), Step 4 CAGRA assignment
+  (61 / 42 s), prune reload (9.8 × N), B10 steps 1/2/4/5 (memory accounting for SIFT1B), A1 (approved, not started).
