@@ -321,6 +321,30 @@ void run(const int32_t* h_cand, const uint8_t* h_vec, int64_t N, int M, int D,
     cleanup();
 }
 
+// 相邻两块的窗口并集大量重叠: 上一块已经在显存里的桶直接 device→device 搬到新块的布局里，
+// 一个 block 一个 run (src 行, dst 行, 行数)，cand 行 M×int32、vec 行 D 字节。
+struct RowRun { int64_t src, dst, n; };
+__global__ void copy_row_runs_kernel(const RowRun* __restrict__ runs,
+                                     const int32_t* __restrict__ cand_src, const uint8_t* __restrict__ vec_src,
+                                     int32_t* __restrict__ cand_dst, uint8_t* __restrict__ vec_dst, int M, int D)
+{
+    const RowRun r = runs[blockIdx.x];
+    const int64_t nc = r.n * M;
+    const int32_t* cs = cand_src + r.src * M;
+    int32_t* cd = cand_dst + r.dst * M;
+    for (int64_t i = threadIdx.x; i < nc; i += blockDim.x) cd[i] = cs[i];
+    const int64_t nv = r.n * D;
+    const uint8_t* vs = vec_src + r.src * D;
+    uint8_t* vd = vec_dst + r.dst * D;
+    if ((D & 15) == 0) {
+        const uint4* vs4 = reinterpret_cast<const uint4*>(vs);
+        uint4* vd4 = reinterpret_cast<uint4*>(vd);
+        for (int64_t i = threadIdx.x; i < nv / 16; i += blockDim.x) vd4[i] = vs4[i];
+    } else {
+        for (int64_t i = threadIdx.x; i < nv; i += blockDim.x) vd[i] = vs[i];
+    }
+}
+
 // 窗口数据整份放不进 host 预算 / 显存时 (SIFT100M: 76.8 GB float 窗口 > 16 GB；GPU 整份
 // 需 51 GB) 的分块版本: 按处理位置切块 [p0, p1)，每块只把这些位置窗口的并集
 // (bucket 在新 id 空间连续 → 合并成连续行段) 读进来、压紧上传，kernel 用 cbase 把
@@ -339,17 +363,25 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
     // 一个位置的窗口最多 W 个桶，块至少要装得下一个窗口
     const int64_t cap_rows = std::max<int64_t>(static_cast<int64_t>(budget_bytes / row_bytes),
                                                static_cast<int64_t>(W) * max_bucket);
-    int32_t* d_cand = nullptr; uint8_t* d_vec = nullptr; uint32_t* d_off = nullptr;
+    // 两套行缓冲轮换 (上一块 / 这一块)，重叠的桶 device→device 搬，不再从磁盘重读、不再 H2D
+    // (参考 TAGORE largeIndex: graph_pool 缓冲里的子图被下一个 cluster 直接复用)
+    int32_t* d_candB[2] = {nullptr, nullptr}; uint8_t* d_vecB[2] = {nullptr, nullptr};
+    RowRun* d_runs = nullptr;
+    uint32_t* d_off = nullptr;
     int32_t* d_win = nullptr; int32_t* d_wl = nullptr; uint32_t* d_out = nullptr; int* d_err = nullptr;
     int64_t* d_cbase = nullptr;
     auto cleanup = [&] {
-        cudaFree(d_cand); cudaFree(d_vec); cudaFree(d_off); cudaFree(d_win);
+        for (int b = 0; b < 2; ++b) { cudaFree(d_candB[b]); cudaFree(d_vecB[b]); }
+        cudaFree(d_runs); cudaFree(d_off); cudaFree(d_win);
         cudaFree(d_wl); cudaFree(d_out); cudaFree(d_err); cudaFree(d_cbase);
     };
     try {
         Staging stg;
-        PWG_CHECK(cudaMalloc(&d_cand, static_cast<size_t>(cap_rows) * M * sizeof(int32_t)));
-        PWG_CHECK(cudaMalloc(&d_vec,  static_cast<size_t>(cap_rows) * D));
+        for (int b = 0; b < 2; ++b) {
+            PWG_CHECK(cudaMalloc(&d_candB[b], static_cast<size_t>(cap_rows) * M * sizeof(int32_t)));
+            PWG_CHECK(cudaMalloc(&d_vecB[b],  static_cast<size_t>(cap_rows) * D));
+        }
+        PWG_CHECK(cudaMalloc(&d_runs, static_cast<size_t>(n_buckets) * sizeof(RowRun)));
         PWG_CHECK(cudaMalloc(&d_out,  static_cast<size_t>(cap_rows) * out_deg * sizeof(uint32_t)));
         PWG_CHECK(cudaMalloc(&d_off,  (static_cast<size_t>(n_buckets) + 1) * sizeof(uint32_t)));
         PWG_CHECK(cudaMalloc(&d_win,  h_win.size() * sizeof(int32_t)));
@@ -364,12 +396,18 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
         std::vector<int32_t> h_cand(static_cast<size_t>(cap_rows) * M);
         std::vector<uint8_t> h_vec(static_cast<size_t>(cap_rows) * D);
         std::vector<int64_t> cbase(static_cast<size_t>(n_buckets), -1);
+        std::vector<int64_t> prev_cbase(static_cast<size_t>(n_buckets), -1);   // 上一块里桶的行 (在 d_*B[cur ^ 1])
         std::vector<int32_t> stamp(static_cast<size_t>(n_buckets), -1);
-        std::vector<int32_t> U;
+        std::vector<int32_t> U, prevU;
+        std::vector<RowRun> h_runs;
+        int cur = 0;
         int32_t chunk_id = 0;
         for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
             // ---- 并集 U(p0..p1): 加位置直到行数到上限 ----
-            for (int q : U) cbase[static_cast<size_t>(q)] = -1;
+            for (int q : prevU) prev_cbase[static_cast<size_t>(q)] = -1;
+            for (int q : U) prev_cbase[static_cast<size_t>(q)] = cbase[static_cast<size_t>(q)];   // 上一块的布局
+            prevU.swap(U);
+            for (int q : prevU) cbase[static_cast<size_t>(q)] = -1;
             U.clear();
             int64_t rows = 0;
             int p1 = p0;
@@ -388,12 +426,28 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                 rows += add;
                 ++p1;
             }
-            std::sort(U.begin(), U.end());
-            // ---- 压紧: 相邻位置的行在新 id 空间里首尾相接 → 合并成连续段并行读 ----
+            // ---- 布局: 上一块已在显存里的桶排前面 (按旧行号，旧布局里连续的仍连续 → run 少)，
+            //      其余桶按 id 排在后面 (相邻 id 合并成连续段并行读 + 一次 H2D)。kernel 只经 cbase 找行，
+            //      布局顺序不影响结果。
+            std::vector<int32_t> reuse, fresh;
+            for (int q : U) (prev_cbase[static_cast<size_t>(q)] >= 0 ? reuse : fresh).push_back(q);
+            std::sort(reuse.begin(), reuse.end(), [&](int a, int b) { return prev_cbase[static_cast<size_t>(a)] < prev_cbase[static_cast<size_t>(b)]; });
+            std::sort(fresh.begin(), fresh.end());
+            int64_t dst = 0;
+            h_runs.clear();
+            for (int q : reuse) {
+                const int64_t n = static_cast<int64_t>(h_offsets[q + 1]) - h_offsets[q];
+                const int64_t src = prev_cbase[static_cast<size_t>(q)];
+                cbase[static_cast<size_t>(q)] = dst;
+                if (!h_runs.empty() && h_runs.back().src + h_runs.back().n == src && h_runs.back().dst + h_runs.back().n == dst)
+                    h_runs.back().n += n;
+                else h_runs.push_back({src, dst, n});
+                dst += n;
+            }
+            const int64_t reuse_rows = dst;
             struct Run { int64_t lo, n, dst; };
             std::vector<Run> runs;
-            int64_t dst = 0;
-            for (int q : U) {
+            for (int q : fresh) {
                 const int64_t lo = h_offsets[q], n = static_cast<int64_t>(h_offsets[q + 1]) - lo;
                 cbase[static_cast<size_t>(q)] = dst;
                 if (!runs.empty() && runs.back().lo + runs.back().n == lo) runs.back().n += n;
@@ -401,14 +455,25 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                 dst += n;
             }
             if (dst > cap_rows) throw std::runtime_error("prune_windowed_gpu: chunk rows exceed capacity");
+            const int nb = cur ^ 1;   // 这一块写进另一套缓冲 (cur 里是上一块)
+            if (!h_runs.empty()) {
+                stg.h2d(d_runs, h_runs.data(), h_runs.size() * sizeof(RowRun));
+                copy_row_runs_kernel<<<static_cast<unsigned>(h_runs.size()), 256, 0, stg.st>>>(
+                    d_runs, d_candB[cur], d_vecB[cur], d_candB[nb], d_vecB[nb], M, D);
+                PWG_CHECK(cudaGetLastError());
+            }
             #pragma omp parallel for schedule(dynamic, 1)
             for (int64_t i = 0; i < static_cast<int64_t>(runs.size()); ++i) {
                 const Run& r = runs[static_cast<size_t>(i)];
-                load_rows(r.lo, r.n, h_cand.data() + static_cast<size_t>(r.dst) * M, h_vec.data() + static_cast<size_t>(r.dst) * D);
+                const int64_t hd = r.dst - reuse_rows;   // host 缓冲里只放新读的行
+                load_rows(r.lo, r.n, h_cand.data() + static_cast<size_t>(hd) * M, h_vec.data() + static_cast<size_t>(hd) * D);
             }
-            stg.h2d(d_cand, h_cand.data(), static_cast<size_t>(dst) * M * sizeof(int32_t));
-            stg.h2d(d_vec,  h_vec.data(),  static_cast<size_t>(dst) * D);
+            const int64_t fresh_rows = dst - reuse_rows;
+            stg.h2d(d_candB[nb] + static_cast<size_t>(reuse_rows) * M, h_cand.data(), static_cast<size_t>(fresh_rows) * M * sizeof(int32_t));
+            stg.h2d(d_vecB[nb] + static_cast<size_t>(reuse_rows) * D, h_vec.data(), static_cast<size_t>(fresh_rows) * D);
             stg.h2d(d_cbase, cbase.data(), cbase.size() * sizeof(int64_t));
+            int32_t* d_cand = d_candB[nb]; uint8_t* d_vec = d_vecB[nb];
+            cur = nb;
             const int64_t row0 = h_offsets[p0], n_rows = static_cast<int64_t>(h_offsets[p1]) - row0;
             const int64_t blocks = (n_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
             if (blocks > 0)
@@ -423,7 +488,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                                                     : "prune_windowed_gpu: fewer than output_degree valid candidates "
                                                       "(check --output-degree <= M_in and padding)");
             stg.d2h_rows(d_out, n_rows, out_deg, [&](const uint32_t* r, int64_t r0, int64_t n) { sink(r, row0 + r0, n); });
-            if (stats) { stats->chunks++; stats->loaded_rows += dst; }
+            if (stats) { stats->chunks++; stats->loaded_rows += fresh_rows; }
             p0 = p1;
         }
     } catch (...) {

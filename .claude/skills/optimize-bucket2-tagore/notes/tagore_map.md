@@ -178,3 +178,6 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   union), not the chunk cap; bigger chunks cost memory (guard is per stage). Ideas for prune: process positions in an
   order that reuses the loaded window (sliding window with incremental loads, like DiskJoin / TAGORE `reorder` buffer
   reuse) — i.e. load only the buckets that enter the window. #14 (+6%) still waiting for a bundle partner.
+- **#16 (accepted, +10.0% → 898.4 s, 0.42× TAGORE):** #14 + prune device row reuse across chunks. Remaining SIFT100M:
+  bucket2 676 (Step 6 241, Step 4 178, Step 2 127, Step 4.5 70, wait 25, Step 3 14, Step 1 11), prune 110 (reload still
+  9.8 × N → order chunks / windows for more reuse), optimize_chunked 64, translate 48. RSS 38 GB (guard 45.7 GB).
