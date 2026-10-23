@@ -3,7 +3,7 @@
  "sift1M":       {"dir": "/home/lanlu/microBenchmark/dataset/sift1M",       "base": "base.1M.u8bin",    "reps": 3, "iterations": null, "search": "cagra",   "ref": "tagore", "bench": ["auto", "large"]},
  "sift10M":      {"dir": "/home/lanlu/microBenchmark/dataset/sift10M",      "base": "base.10M.u8bin",   "reps": 3, "iterations": null, "search": "cagra",   "ref": "tagore", "bench": ["auto"]},
  "sift100M":     {"dir": "/home/lanlu/microBenchmark/dataset/sift100M",     "base": "base.100M.u8bin",  "reps": 3, "iterations": 2,    "search": "diskann", "ref": "own", "own_tol": 0.05, "bench": ["auto"]},
- "msTuring1M":   {"dir": "/home/lanlu/microBenchmark/dataset/msTuring1M",   "base": "base.1M.fbin",     "reps": 3, "iterations": null, "search": "diskann", "ref": "own", "own_tol": 0.01, "bench": []},
+ "msTuring1M":   {"dir": "/home/lanlu/microBenchmark/dataset/msTuring1M",   "base": "base.1M.fbin",     "reps": 3, "iterations": null, "search": "diskann", "ref": "own", "own_tol": 0.01, "bench": ["auto"]},
  "msTuring10M":  {"dir": "/home/lanlu/microBenchmark/dataset/msTuring10M",  "base": "base.10M.fbin",    "reps": 3, "iterations": null, "search": "diskann", "ref": "own", "own_tol": 0.01, "bench": ["auto"]},
  "msTuring100M": {"dir": "/home/lanlu/microBenchmark/dataset/msTuring100M", "base": "base.100M.fbin",   "reps": 3, "iterations": 2,    "search": "diskann", "ref": "own", "own_tol": 0.05, "bench": []}
 }

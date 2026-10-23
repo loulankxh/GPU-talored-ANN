@@ -40,12 +40,13 @@ files in `/home/lanlu/microBenchmark` (the cuVS loop's tree) except reading it.
 | `sift1M_auto` (resident) | 3 (median) | cuVS CAGRA (`cagra_eval`), itopk 32…512 | TAGORE − 0.01 |
 | `sift1M_large` (large path forced) | 3 | cuVS CAGRA | TAGORE − 0.05 |
 | `sift10M_auto` (→ large path) | 3 (median) | cuVS CAGRA | TAGORE − 0.05 |
+| `msTuring1M_auto` (float32, D=100, resident) | 3 (median) | DiskANN CPU, L 32…512; cuVS CAGRA after F3 | own best − 0.01 until F3; then CAGRA reference after step C |
 | `msTuring10M_auto` (float32, D=100) | 3 (median) | DiskANN CPU (`diskann_search.py`), L 32…512; cuVS CAGRA after F3 | own best − 0.01 until F3; then CAGRA reference (−0.01 resident / −0.05 large) after calibration step C |
 | `sift100M_auto` (2 rounds) | **3 (median)** | DiskANN CPU, L 32…512 | own best − 0.05 |
 
 **Rules (judge.py):**
 - **Every config: build_total ≥ 3% faster than best = gain, > 3% slower = regression** (2026-10-23:
-  every bench config is the median of 3 runs — SIFT1M, SIFT10M, msTuring10M and SIFT100M; the old 7% single-run gate and the "Possible gains"
+  every bench config is the median of 3 runs — SIFT1M, SIFT10M, msTuring1M, msTuring10M and SIFT100M; the old 7% single-run gate and the "Possible gains"
   bundling are retired — one coherent change per iteration again, don't bundle to pass the gate).
 - **ACCEPT** iff the full bench set was run, at least one config gains, none regresses, search
   quality passes everywhere, 0 graph defects, path selection unchanged, large-path memory ≤ 1.2× best.
@@ -183,8 +184,9 @@ R=$WT/bucketDemo/buildBucket/runs/tagore<N>
 bash $S/run_pipeline.sh -d sift1M      -m auto  -o $R/sift1M_auto       # resident path, 3 reps (datasets.json)
 bash $S/run_pipeline.sh -d sift1M      -m large -o $R/sift1M_large      # large path forced, 3 reps
 bash $S/run_pipeline.sh -d sift10M     -m auto  -o $R/sift10M_auto      # → large path, 3 reps (~4 min)
+bash $S/run_pipeline.sh -d msTuring1M  -m auto  -o $R/msTuring1M_auto   # float32 D=100, resident, 3 reps, DiskANN search
 bash $S/run_pipeline.sh -d msTuring10M -m auto  -o $R/msTuring10M_auto  # float32 D=100, 3 reps, DiskANN search
-python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/msTuring10M_auto --quick   # pre-check
+python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/msTuring1M_auto $R/msTuring10M_auto --quick   # pre-check
 bash $S/run_pipeline.sh -d sift100M    -m auto  -o $R/sift100M_auto     # 2 rounds, 3 reps (~35 min), DiskANN search
 ```
 - Reps come from `datasets.json` (`-r` overrides). Run in this order; if the `--quick` pre-check
@@ -207,7 +209,7 @@ bash $S/run_pipeline.sh -d sift100M    -m auto  -o $R/sift100M_auto     # 2 roun
 - `$SK/state/best.json` does not exist → **step P** (setup + baseline verification).
 - else `state/tagore_baseline.json` does not exist → **step B** (TAGORE baseline).
 - else `notes/tagore_map.md` does not exist → **step T0** (study).
-- else `best.json` lacks `msTuring10M_auto`, or `sift100M_auto` has `reps` < 3 → **step R** (re-baseline after the 2026-10-23 rule change).
+- else `best.json` lacks `msTuring1M_auto` or `msTuring10M_auto`, or `sift100M_auto` has `reps` < 3 → **step R** (re-baseline after the 2026-10-23 rule change).
 - else → **one iteration** (steps 0–6).
 
 ### P. Setup + verify the main baseline (first invocation, no optimization)
@@ -298,11 +300,11 @@ log and move on; never stop the loop for step B.
 
 ### R. Re-baseline after the 2026-10-23 rule change (once, no source change)
 1. Build HEAD, run the whole bench set (Test commands; SIFT100M with 3 reps) into `runs/tagoreR/`.
-2. `python3 $S/judge.py <all five dirs> --update --rebaseline --add-new --md`: replaces the
-   SIFT100M single-run best by the 3-run median and records `msTuring10M_auto` (first float32
-   entry), provided correctness / quality / memory pass (speed is not gated here).
+2. `python3 $S/judge.py <all six dirs> --update --rebaseline --add-new --md`: replaces the
+   SIFT100M single-run best by the 3-run median and records `msTuring1M_auto` / `msTuring10M_auto`
+   (first float32 entries), provided correctness / quality / memory pass (speed is not gated here).
 3. If msTuring10M fails (expected while F0 is open: float32 large path crash): log the exact failure,
-   record the other four configs (`judge.py <four dirs> --update --rebaseline`), temporarily set
+   record the other configs (`judge.py <their dirs> --update --rebaseline --add-new`; msTuring1M auto works on the resident path), temporarily set
    `msTuring10M` `bench: []` in `datasets.json` and make **F0** (below) the next iteration.
 4. Log `### #R — re-baseline (rule change: SIFT100M median of 3, ±3% gate, msTuring10M added)` with
    the `--md` tables and the printed adaptive parameters; commit `datasets.json`, `best.json`, the log.
@@ -320,7 +322,7 @@ log and move on; never stop the loop for step B.
   - **F1** prune GPU kernel for every element type (`prune_windowed_gpu` templated on uint8 / int8 / float; distances in fp32) — correctness first; measure msTuring10M prune before / after.
   - **F2** Step 6 out-of-core GPU bucket cache + batched misses (#1 / #2 / #21) for float32 data. Keeping fp32 GEMM is exact (implementation). Converting float data to fp16 for tensor cores changes results unless the top candidates are re-ranked exactly in fp32 → fp16 without exact re-rank needs the user's approval (log it as `A<k>`).
   - **F3 (right after F0)** `cagra_eval` float32 support (build the worktree's own `bucketDemo/evalCuvs`, not the shared binary) + CAGRA native reference on msTuring10M (and TAGORE if feasible) → `state/cagra_baseline.json["msTuring10M"]` (+ `tagore_baseline.json`), searched the same way as our graph; then switch msTuring10M's `search` to `cagra` if it fits and its `ref` to `cagra` (approved by the user 2026-10-23), followed by **step C**.
-  - **C — calibrate msTuring (user decision 2026-10-23)**: with the SIFT-tuned rules msTuring1M reaches only pre-prune recall@10 0.687 (SIFT1M 0.943) and DiskANN recall@10 0.66 @L32. Sweep `CENTROID_RATIO` (avg bucket 128–512) × `NPROBE` (and report ITERATIONS) on msTuring10M (exported env overrides, 1 run each, under the lock) until it passes the reference gate (resident −0.01 / large −0.05 vs CAGRA); until F3's reference exists, target pre-prune recall@10 ≈ 0.90. Record the chosen values as `datasets.json` `"params"` for msTuring1M/10M/100M (A2, approved), re-record msTuring10M best (`--update --rebaseline`), log the sweep table (time, pre-prune recall, search recall / QPS per setting). Only then optimize msTuring speed.
+  - **C — calibrate msTuring (user decision 2026-10-23)**: with the SIFT-tuned rules msTuring1M reaches only pre-prune recall@10 0.687 (SIFT1M 0.943) and DiskANN recall@10 0.66 @L32. Sweep `CENTROID_RATIO` (avg bucket 128–512) × `NPROBE` (and report ITERATIONS) on msTuring1M and msTuring10M (exported env overrides, 1 run each, under the lock) until it passes the reference gate (resident −0.01 / large −0.05 vs CAGRA); until F3's reference exists, target pre-prune recall@10 ≈ 0.90. Record the chosen values as `datasets.json` `"params"` for msTuring1M/10M/100M (A2, approved), re-record the msTuring1M / msTuring10M bests (`--update --rebaseline`), log the sweep table (time, pre-prune recall, search recall / QPS per setting). Only then optimize msTuring speed.
   - **F4** 1B readiness: B10's open steps (per-stage RSS, Phase 1 buffers from the host budget, SIFT1B audit of 64-bit N×K products) + `dataset_env.py` sanity for N = 1e9 (centroid cap, cache caps). A 1B base is not on the machine yet — ask the user before downloading / generating ~128 GB.
 - Candidates otherwise: implementation ideas from the backlog, plus `A<k>` entries the user APPROVED (A1: follow the split in `docs/A1_local_join.md` §2.8). Start from where SIFT100M time goes (largest stage first).
 - Name the TAGORE function(s) the idea comes from and, in one line, how cuVS 26.12 / our current code does the same step.
@@ -337,12 +339,12 @@ Run the bench set into `runs/tagore<N>/` (quick pre-check first, SIFT100M only i
 
 ### 4. Judge
 ```bash
-python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/msTuring10M_auto $R/sift100M_auto --md
+python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/msTuring1M_auto $R/msTuring10M_auto $R/sift100M_auto --md
 ```
 Rules: see Goal and judge.py's docstring (keys come from each run's metrics.json, so the order of the dirs does not matter).
 
 ### 5a. ACCEPT
-1. `python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/msTuring10M_auto $R/sift100M_auto --update --md`.
+1. `python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/msTuring1M_auto $R/msTuring10M_auto $R/sift100M_auto --update --md`.
 2. Append `### #<N> — <idea>` to `OPTIMIZATION_LOG_TAGORE.md` with: idea, **TAGORE source** (file + function), class (implementation / approved `A<k>`), the `--md` tables (incl. `vs TAGORE`), `a1_stats` for A1 runs; update **Current best**.
 3. Commit on `opt/bucket2-tagore`: sources, `$S/params.sh`, `$SK/state/best.json`, the log, notes / docs if changed. Message `bucket2 tagore #<N>: <idea>` + attribution line. Don't commit `runs/`.
 
