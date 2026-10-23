@@ -188,3 +188,7 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
 - **#20 (accepted, +8.7% → 740.5 s, 0.34× TAGORE):** parallel sequential I/O everywhere it was single-stream (translate,
   Step 4 reads, optimize_chunked Phase 2, graph writer). Remaining SIFT100M: bucket2 548 (Step 6 240, Step 4 146 (CAGRA
   search 61 / 42), Step 2 76, Step 4.5 29, wait 26, Step 1 11, Step 3 9), prune 110, optimize_chunked 60, translate 22.
+- **#21 (accepted, +7.1% → 687.9 s, 0.32× TAGORE):** 8 GB GPU bucket cache (misses ÷ 3.5) + prune pinned uploads.
+  Remaining SIFT100M: bucket2 503 (Step 6 195, Step 4 148 (CAGRA search 61 / 42), Step 2 76, Step 4.5 28, wait 25, Step 1 11,
+  Step 3 9), prune 102, optimize_chunked 62, translate 21. GPU cost per bucket in Step 6 is now ~0.2 ms (cuBLAS GEMM +
+  top-M + gather), the next floor.

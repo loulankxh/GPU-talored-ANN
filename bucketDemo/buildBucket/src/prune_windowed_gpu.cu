@@ -393,8 +393,17 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
         stg.h2d(d_wl,  h_win_len.data(), h_win_len.size() * sizeof(int32_t));
         PWG_CHECK(cudaMemsetAsync(d_err, 0, sizeof(int), stg.st));
 
-        std::vector<int32_t> h_cand(static_cast<size_t>(cap_rows) * M);
-        std::vector<uint8_t> h_vec(static_cast<size_t>(cap_rows) * D);
+        // 新读的行直接 pread 进 pinned 缓冲，一次 DMA 上传 (原来 pageable → 64 MB pinned 双缓冲中转，
+        // H2D 只有 ~5 GB/s: SIFT10M 强制分块时 h2d 占 prune 计算的一大半)；大小跟原来的 host 缓冲一样
+        struct PinnedBuf {
+            void* p = nullptr;
+            explicit PinnedBuf(size_t n) { PWG_CHECK(cudaMallocHost(&p, std::max<size_t>(n, 1))); }
+            ~PinnedBuf() { cudaFreeHost(p); }
+        };
+        PinnedBuf pin_cand(static_cast<size_t>(cap_rows) * M * sizeof(int32_t));
+        PinnedBuf pin_vec(static_cast<size_t>(cap_rows) * D);
+        int32_t* h_cand = static_cast<int32_t*>(pin_cand.p);
+        uint8_t* h_vec = static_cast<uint8_t*>(pin_vec.p);
         std::vector<int64_t> cbase(static_cast<size_t>(n_buckets), -1);
         std::vector<int64_t> prev_cbase(static_cast<size_t>(n_buckets), -1);   // 上一块里桶的行 (在 d_*B[cur ^ 1])
         std::vector<int32_t> stamp(static_cast<size_t>(n_buckets), -1);
@@ -466,11 +475,15 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             for (int64_t i = 0; i < static_cast<int64_t>(runs.size()); ++i) {
                 const Run& r = runs[static_cast<size_t>(i)];
                 const int64_t hd = r.dst - reuse_rows;   // host 缓冲里只放新读的行
-                load_rows(r.lo, r.n, h_cand.data() + static_cast<size_t>(hd) * M, h_vec.data() + static_cast<size_t>(hd) * D);
+                load_rows(r.lo, r.n, h_cand + static_cast<size_t>(hd) * M, h_vec + static_cast<size_t>(hd) * D);
             }
             const int64_t fresh_rows = dst - reuse_rows;
-            stg.h2d(d_candB[nb] + static_cast<size_t>(reuse_rows) * M, h_cand.data(), static_cast<size_t>(fresh_rows) * M * sizeof(int32_t));
-            stg.h2d(d_vecB[nb] + static_cast<size_t>(reuse_rows) * D, h_vec.data(), static_cast<size_t>(fresh_rows) * D);
+            // pinned → 直接 DMA (同一 stream: 排在上面的 device 内搬运之后、kernel 之前；
+            // 下一块重写 h_cand/h_vec 前，本块的 d2h_rows 已经同步过这个 stream)
+            PWG_CHECK(cudaMemcpyAsync(d_candB[nb] + static_cast<size_t>(reuse_rows) * M, h_cand,
+                                      static_cast<size_t>(fresh_rows) * M * sizeof(int32_t), cudaMemcpyHostToDevice, stg.st));
+            PWG_CHECK(cudaMemcpyAsync(d_vecB[nb] + static_cast<size_t>(reuse_rows) * D, h_vec,
+                                      static_cast<size_t>(fresh_rows) * D, cudaMemcpyHostToDevice, stg.st));
             stg.h2d(d_cbase, cbase.data(), cbase.size() * sizeof(int64_t));
             int32_t* d_cand = d_candB[nb]; uint8_t* d_vec = d_vecB[nb];
             cur = nb;
