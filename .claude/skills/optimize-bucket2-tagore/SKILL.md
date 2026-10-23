@@ -40,8 +40,8 @@ files in `/home/lanlu/microBenchmark` (the cuVS loop's tree) except reading it.
 | `sift1M_auto` (resident) | 3 (median) | cuVS CAGRA (`cagra_eval`), itopk 32…512 | TAGORE − 0.01 |
 | `sift1M_large` (large path forced) | 3 | cuVS CAGRA | TAGORE − 0.05 |
 | `sift10M_auto` (→ large path) | 3 (median) | cuVS CAGRA | TAGORE − 0.05 |
-| `msTuring1M_auto` (float32, D=100, resident) | 3 (median) | DiskANN CPU, L 32…512; cuVS CAGRA after F3 | own best − 0.01 until F3; then CAGRA reference after step C |
-| `msTuring10M_auto` (float32, D=100) | 3 (median) | DiskANN CPU (`diskann_search.py`), L 32…512; cuVS CAGRA after F3 | own best − 0.01 until F3; then CAGRA reference (−0.01 resident / −0.05 large) after calibration step C |
+| `msTuring1M_auto` (float32, D=100, resident) | 3 (median) | DiskANN CPU, L 32…512; cuVS CAGRA once P1 adds float32 to cagra_eval | own best − 0.01 until P1 / P4 give it a reference |
+| `msTuring10M_auto` (float32, D=100) | 3 (median) | DiskANN CPU (`diskann_search.py`), L 32…512; cuVS CAGRA once P1 adds float32 to cagra_eval | own best − 0.01 until P1 / P4 give it a reference (then −0.01 resident / −0.05 large) |
 | `sift100M_auto` (2 rounds) | **3 (median)** | DiskANN CPU, L 32…512 | own best − 0.05 |
 
 **Rules (judge.py):**
@@ -103,7 +103,7 @@ files in `/home/lanlu/microBenchmark` (the cuVS loop's tree) except reading it.
   | bucket2 read / bucketing / Step 6 GEMM | yes (fp16 tensor-core GEMM) | reads `.fbin`; Step 6 uses fp32 SGEMM (no tensor cores on V100) |
   | Step 6 out-of-core GPU bucket cache (#1/#2/#21) | yes | **no** (`use_dev_cache = kIsInt8Path && …`) |
   | prune (GPU chunked kernel, #76 / #16 / #21) | yes | **no**: `prune_windowed_gpu` is uint8-only → falls back to the slower path (verify) |
-| out-of-core Step 6 bucket reader | yes | **crashes** (F0: `ReorderedDatasetBucketReader: read failed`) |
+| out-of-core Step 6 bucket reader | yes | **crashes** (P2 item 1: `ReorderedDatasetBucketReader: read failed`) |
   | optimize / optimize_chunked / translate | yes | yes (graph only) |
   | search | cagra_eval (uint8) or DiskANN | DiskANN only (cagra_eval reads uint8) |
 
@@ -175,7 +175,7 @@ Also:
 - Never replace the pipeline with `cagra::build`, cuVS nn_descent, or TAGORE `GNN_descent` / `largeIndex` on the whole dataset.
 - Final graph: no out-of-range ids, self loops or duplicate edges. Add bounds checks with new indexing code.
 
-## Test commands (used by steps R and 3)
+## Test commands (used by phases P2 / P3 and step 3)
 ```bash
 WT=/home/lanlu/microBenchmark_tagore
 SK=$WT/.claude/skills/optimize-bucket2-tagore
@@ -209,8 +209,8 @@ bash $S/run_pipeline.sh -d sift100M    -m auto  -o $R/sift100M_auto     # 2 roun
 - `$SK/state/best.json` does not exist → **step P** (setup + baseline verification).
 - else `state/tagore_baseline.json` does not exist → **step B** (TAGORE baseline).
 - else `notes/tagore_map.md` does not exist → **step T0** (study).
-- else `best.json` lacks `msTuring1M_auto` or `msTuring10M_auto`, or `sift100M_auto` has `reps` < 3 → **step R** (re-baseline after the 2026-10-23 rule change).
-- else → **one iteration** (steps 0–6).
+- else the first phase of the **Restart plan** not listed as done in `$SK/state/phase.json` (`{"done": ["P1", …]}`; missing file = nothing done) → work on that phase (P1–P4); one coherent step per invocation, phases P2 / P5 use the iteration steps 0–6.
+- else (P1–P4 done) → **one iteration** (steps 0–6) = phase P5.
 
 ### P. Setup + verify the main baseline (first invocation, no optimization)
 (Done 2026-10-22; kept for reference. Its ±7% SIFT100M tolerance was the rule of that time.)
@@ -298,16 +298,84 @@ log and move on; never stop the loop for step B.
 3. Use the step-B profile (`state/tagore_baseline.json`: GNN-Descent vs pruning time, largeIndex prep vs build vs merge) to say which TAGORE stage is fast for which reason, and where TAGORE's SIFT100M build beats or loses to ours stage by stage.
 4. Commit notes + log (`bucket2 tagore: T0 study notes`), return with a 3-line summary of the top ideas and the list of `A<k>` waiting for the user.
 
-### R. Re-baseline after the 2026-10-23 rule change (once, no source change)
-1. Build HEAD, run the whole bench set (Test commands; SIFT100M with 3 reps) into `runs/tagoreR/`.
-2. `python3 $S/judge.py <all six dirs> --update --rebaseline --add-new --md`: replaces the
-   SIFT100M single-run best by the 3-run median and records `msTuring1M_auto` / `msTuring10M_auto`
-   (first float32 entries), provided correctness / quality / memory pass (speed is not gated here).
-3. If msTuring10M fails (expected while F0 is open: float32 large path crash): log the exact failure,
-   record the other configs (`judge.py <their dirs> --update --rebaseline --add-new`; msTuring1M auto works on the resident path), temporarily set
-   `msTuring10M` `bench: []` in `datasets.json` and make **F0** (below) the next iteration.
-4. Log `### #R — re-baseline (rule change: SIFT100M median of 3, ±3% gate, msTuring10M added)` with
-   the `--md` tables and the printed adaptive parameters; commit `datasets.json`, `best.json`, the log.
+## Restart plan (user decision 2026-10-23, 2nd) — phases P1 → P5
+
+Executed in this order after the loop restarts (step selection uses `state/phase.json`). Mark a phase
+done by adding it to `phase.json`, a `### Phase P<k> done — <summary>` log entry and a commit.
+
+### P1. CAGRA + TAGORE build and search baselines for every registered dataset
+For sift1M, sift10M, sift100M, msTuring1M, msTuring10M, msTuring100M (no source change to our pipeline):
+- **CAGRA** (cuVS 26.10 native): add float32 (and int8) support to `cagra_eval` in the **worktree's own**
+  `bucketDemo/evalCuvs` (build it there; never rebuild the shared `/home/lanlu/microBenchmark/...` binary),
+  build NN-Descent + optimize. Datasets that do not fit the 16 GB V100 in-memory build (100M): try cuVS's
+  host-memory / batched build paths available in 26.10 public API; if impossible, record
+  `status: infeasible` + reason. Search: `cagra_eval search` when index + data fit the GPU, else DiskANN
+  (`diskann_search.py`, medoid entry) on the CAGRA graph.
+- **TAGORE**: as in step B (patched copy only). For float32 / D=100 build a separate TAGORE copy with
+  `DIM_SIZE` = 100 (`include/common.cuh`; patched-src copy, never the clone), fvecs input converted from
+  `.fbin` into the scratchpad; 1M in-memory `GNN_descent` + CAGRA prune, 10M / 100M `largeIndex`
+  (Vamana; prep timed separately).
+- **Quality target (user): recall@10 ≈ 0.95 or above.** Interpretation (tell the user if it is wrong):
+  the reference must reach recall@10 ≥ 0.95 within the standard sweep at itopk / L = 64 (the mid
+  operating point); if it does not, rebuild with larger degrees (graph 32 → 64, intermediate 64 → 128,
+  for TAGORE k / final_degree likewise) and record both. Keep the **degree-32 configuration as the gate
+  reference** (same final degree as ours — apples to apples): `state/<ref>_baseline.json[dataset]` top-level
+  = gate config; higher-degree configs go into `[dataset]["configs"]` for reporting only.
+- Every timed run under the bench lock (GPU 0), detached; record build time (+ prep), search recall@10 / QPS
+  per itopk or L, defects, GPU / host peak, config (degrees, iterations, search tool).
+- Set each dataset's `ref` in `datasets.json`: SIFT stays `tagore`; msTuring → `cagra` (user-approved
+  2026-10-23) once its CAGRA gate config exists. Summarize all references in one log table. Done when every
+  dataset has a CAGRA and a TAGORE entry (or a recorded infeasibility).
+
+### P2. Port every uint8-only optimization to float32 (judged iterations)
+Start by grepping for uint8-only paths (`kIsInt8Path`, `uint8_t` kernels, `.u8bin` assumptions,
+`use_dev_cache`) and list them in the log; then one item per iteration (steps 0–6), uint8 configs must not
+regress, float configs gain or at least become runnable:
+1. **float32 large-path crash** (first): `SMOKE=1 … -d msTuring1M -m large` → bucket2 Step 6
+   `FATAL: ReorderedDatasetBucketReader: read failed for bucket 537` (resident path works: msTuring1M auto
+   6.96 s, 0 defects). Fix + bounds check; verify msTuring1M large and msTuring10M end to end; record the
+   msTuring configs with `judge.py … --update --add-new`.
+2. **prune GPU kernel for every element type** (`prune_windowed_gpu` templated on uint8 / int8 / float,
+   fp32 distances).
+3. **Step 6 out-of-core GPU bucket cache + batched misses + deferred frees + block reuse** (#1 / #2 / #21)
+   for float32. fp32 GEMM keeps results exact (implementation); fp16 GEMM for float data changes results
+   unless the top candidates are re-ranked exactly in fp32 → fp16 without exact re-rank = `A<k>` for the user.
+4. every other uint8-gated path found by the grep (Step 4 / KMeans‖ GEMM precision, host-blob loaders,
+   resident Step 6, …).
+Done when the grep list is empty or each remaining item has a recorded reason.
+
+### P3. End-to-end check + full summary
+- Run every registered dataset with HEAD (bench set ×3 + msTuring100M ×3 + `-m large` on msTuring1M) and
+  confirm uint8 and float32 both run cleanly (0 defects, expected paths).
+- Re-record our bests as 3-run medians: `judge.py <dirs> --update --rebaseline --add-new --md` (replaces the
+  single-run SIFT100M entry; adds the msTuring configs).
+- Write `docs/summary_<date>.md` and a log entry: for every dataset × {ours (auto / large), CAGRA, TAGORE
+  (gate + higher-degree configs)} the build time (with stages / prep), recall@10 + QPS per itopk / L,
+  defects, GPU / host peak memory, search tool used.
+
+### P4. Document the dataset-specific tunables + calibrate msTuring
+- Write **`docs/dataset_tuning_params.md`**: every parameter that was tuned for SIFT100M / this machine or
+  should be re-tuned for a new dataset or size, one row each: name, where (file:line or flag / script),
+  current value per dataset, what it controls, how it is derived now (`dataset_env.py` rule vs hard-coded),
+  symptoms when it is wrong, how to tune it (sweep range, which config to watch), class (resource =
+  implementation vs algorithm = A2 / user approval). Grep the sources for hard-coded sizes. Seed list (at
+  least): `CENTROID_RATIO` / avg bucket, `NPROBE` / pool rows, `KNN_K`, `ITERATIONS`, `SEED`,
+  `--kmeans-train-fraction`, `--cache-mb`, `--bucket-mem-mb`, `--gpu-bucket-cache-mb`, `PRUNE_CACHE_MB` and
+  the prune chunk budget (4 GB), `CHUNKED_GPU_BUDGET_MB`, `CHUNKED_EDGE_BUFFER_MB`, `--host-budget-mb`,
+  Step 6 slot count (6) and the dots row tile (256), `order_window` (128), the CSR row-block size (8192 rows),
+  fp16 vs fp32 GEMM choice per dtype, the resident / out-of-core fit check, DiskANN / CAGRA search sweep
+  (itopk / L list), `NEIGHBORS_M` / `OUTPUT_DEGREE` (fixed by the user; listed for completeness).
+- Then apply it to msTuring (former step C): sweep `CENTROID_RATIO` (avg bucket 128–512) × `NPROBE` (report
+  ITERATIONS) on msTuring1M / 10M until they pass the CAGRA gate reference (−0.01 resident / −0.05 large);
+  with SIFT parameters msTuring1M reaches only pre-prune recall@10 0.687 (SIFT1M 0.943). Store the chosen
+  values as `datasets.json` `"params"` (A2, approved), re-record the msTuring bests (`--rebaseline`), log the
+  sweep table, and add the result to the doc as the worked example.
+
+### P5. Continue the normal loop
+Steps 0–6 with the backlog: B10's open steps (incl. 1B readiness: per-stage RSS, Phase 1 buffers from the
+host budget, 64-bit N×K audit, `dataset_env.py` sanity at N = 1e9 — ask the user before
+downloading / generating a ~128 GB 1B base), A1, B7–B9a, and new ideas for the largest SIFT100M / msTuring
+stages.
 
 ## One iteration
 
@@ -317,13 +385,7 @@ log and move on; never stop the loop for step B.
 - Check the bench lock owner (`cat /home/lanlu/.bench_locks/bucket2_bench.lock.owner`): if the cuVS loop is timing, do steps 1–2 gently (niced build, SMOKE tests) and let the timed runs queue.
 
 ### 1. Pick ONE idea
-- **Top work items after step R (user decision 2026-10-23: the loop ports float32 support):**
-  - **F0 (first) float32 large path crashes**: smoke run 2026-10-23 `SMOKE=1 … -d msTuring1M -m large -r 1` → bucket2 Step 6 `FATAL: ReorderedDatasetBucketReader: read failed for bucket 537` (the resident path works: msTuring1M auto 6.96 s, 0 defects). Likely element-size / offset arithmetic assuming 1 byte per element, or the async `data_reordered.fbin` write. Fix it (correctness, implementation), add a bounds check, verify msTuring1M large + msTuring10M end to end, then put msTuring10M back into the bench set and record it with `judge.py … --update --add-new`.
-  - **F1** prune GPU kernel for every element type (`prune_windowed_gpu` templated on uint8 / int8 / float; distances in fp32) — correctness first; measure msTuring10M prune before / after.
-  - **F2** Step 6 out-of-core GPU bucket cache + batched misses (#1 / #2 / #21) for float32 data. Keeping fp32 GEMM is exact (implementation). Converting float data to fp16 for tensor cores changes results unless the top candidates are re-ranked exactly in fp32 → fp16 without exact re-rank needs the user's approval (log it as `A<k>`).
-  - **F3 (right after F0)** `cagra_eval` float32 support (build the worktree's own `bucketDemo/evalCuvs`, not the shared binary) + CAGRA native reference on msTuring10M (and TAGORE if feasible) → `state/cagra_baseline.json["msTuring10M"]` (+ `tagore_baseline.json`), searched the same way as our graph; then switch msTuring10M's `search` to `cagra` if it fits and its `ref` to `cagra` (approved by the user 2026-10-23), followed by **step C**.
-  - **C — calibrate msTuring (user decision 2026-10-23)**: with the SIFT-tuned rules msTuring1M reaches only pre-prune recall@10 0.687 (SIFT1M 0.943) and DiskANN recall@10 0.66 @L32. Sweep `CENTROID_RATIO` (avg bucket 128–512) × `NPROBE` (and report ITERATIONS) on msTuring1M and msTuring10M (exported env overrides, 1 run each, under the lock) until it passes the reference gate (resident −0.01 / large −0.05 vs CAGRA); until F3's reference exists, target pre-prune recall@10 ≈ 0.90. Record the chosen values as `datasets.json` `"params"` for msTuring1M/10M/100M (A2, approved), re-record the msTuring1M / msTuring10M bests (`--update --rebaseline`), log the sweep table (time, pre-prune recall, search recall / QPS per setting). Only then optimize msTuring speed.
-  - **F4** 1B readiness: B10's open steps (per-stage RSS, Phase 1 buffers from the host budget, SIFT1B audit of 64-bit N×K products) + `dataset_env.py` sanity for N = 1e9 (centroid cap, cache caps). A 1B base is not on the machine yet — ask the user before downloading / generating ~128 GB.
+- During phase P2 the candidate is the next open float-port item of P2 (see **Restart plan**); in phase P5 pick normally:
 - Candidates otherwise: implementation ideas from the backlog, plus `A<k>` entries the user APPROVED (A1: follow the split in `docs/A1_local_join.md` §2.8). Start from where SIFT100M time goes (largest stage first).
 - Name the TAGORE function(s) the idea comes from and, in one line, how cuVS 26.12 / our current code does the same step.
 - If the idea you want turns out to be an algorithm change and isn't approved: add it to **Awaiting approval**, pick the next implementation idea.

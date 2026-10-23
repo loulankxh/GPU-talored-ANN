@@ -1008,3 +1008,11 @@ See **Tried & rejected** (#22). Step 6 at 8 GB of cache is past the point where 
 - **Bench set:** SIFT1M auto / large ×3, SIFT10M ×3, **msTuring1M auto ×3 + msTuring10M ×3** (float32), SIFT100M ×3 (user corrections 2026-10-23: every bench config ×3, msTuring1M added); msTuring100M only at milestones.
 - **Smoke runs (SMOKE=1, GPU 2):** sift1M auto 4.90 s, recall@10 0.9270 @32 (unchanged); **msTuring1M auto** resident, 6.96 s, 0 defects, pre-prune recall@10 0.687 (SIFT1M 0.943), DiskANN recall@10 0.6615 / 0.7775 / 0.8657 / 0.9274 / 0.9660 @ L 32…512; **msTuring1M large: bucket2 Step 6 `FATAL: ReorderedDatasetBucketReader: read failed for bucket 537`** → work item F0.
 - **Work order after resume:** step R (re-baseline) → F0 (float32 large-path crash) → F3 (cagra_eval float32 + CAGRA reference on msTuring10M; `ref` → cagra approved) → step C (calibrate msTuring `CENTROID_RATIO` / `NPROBE` within A2 bounds to the reference gate; interim target pre-prune recall@10 ≈ 0.90) → F1 / F2 (float prune GPU kernel, Step 6 float GPU cache; fp16 GEMM without exact re-rank needs approval) → F4 (1B readiness; no 1B base on the machine yet).
+
+### User decisions 2026-10-23 (2nd): restart order P1 → P5
+
+1. **P1** CAGRA + TAGORE build + search baselines for every registered dataset (sift1M/10M/100M, msTuring1M/10M/100M); recall@10 ≈ 0.95 or above — the build degree may be raised (32/64 → 64/128) for that; the degree-32 configuration stays the gate reference, higher-degree ones are reported. `cagra_eval` gets float32 support (worktree copy).
+2. **P2** port every uint8-only optimization to float32 (first: the float32 large-path crash; then the prune GPU kernel, the Step 6 GPU bucket cache family #1/#2/#21, and every other uint8-gated path found by grep).
+3. **P3** verify uint8 + float32 end to end on HEAD, re-record our bests as 3-run medians, and write `docs/summary_<date>.md` with every dataset × {ours, CAGRA, TAGORE} build + search.
+4. **P4** `docs/dataset_tuning_params.md`: every SIFT100M- / machine-specific tunable, how to re-tune it for a new dataset; then calibrate msTuring to the CAGRA gate as the worked example.
+5. **P5** continue the normal loop (B10 / 1B readiness, A1, B7–B9a, new ideas).
