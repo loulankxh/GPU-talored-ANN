@@ -47,6 +47,7 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/random/rng.cuh>
 #include <raft/matrix/select_k.cuh>
+#include <mma.h>
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/neighbors/cagra.hpp>
 #include <rmm/device_scalar.hpp>
@@ -1972,6 +1973,126 @@ __global__ void kmeans_row_min_kernel(const float* __restrict__ dots, const floa
     if (lane == 0) out[r] = fmaxf(xnorm[r] + m, 0.0f);
 }
 
+// GEMM + 逐行 min 融合 (Tensor Core WMMA)：原来 cuBLAS fp16 GEMM 把 tile × n 的
+// dots (SIFT10M 子集 1M × 50K 新候选 = 200 GB fp32) 写回显存再由
+// kmeans_row_min_kernel 读一遍，带宽占了大头；这里 dots 只活在寄存器 / 每
+// warp 1 KB 的 shared scratch 里，直接归约成每行 min (cuVS 26.12
+// detail/fused_l2_knn.cuh / fused distance+argmin 的思路, k=1)。
+// block: 128 行 X × 每次 64 个候选，8 warp = 4 行组 (32 行) × 2 列组 (32 列)。
+// 结果对每行 atomicMin (非负 float 的位序 = 数值序)，out 须先置 +inf。
+constexpr int kFmBM = 128, kFmBN = 64, kFmLD = 136;   // LD: 128 + 8 half, 避 bank 冲突
+constexpr size_t kFmSmem = (static_cast<size_t>(kFmBM + kFmBN) * kFmLD) * sizeof(__half)
+                         + 8 * 256 * sizeof(float);
+__global__ void __launch_bounds__(256) kmeans_fused_min_kernel(
+    const __half* __restrict__ X, const float* __restrict__ xn, int64_t N,
+    const __half* __restrict__ C, const float* __restrict__ cn, int n, int D,
+    unsigned* __restrict__ out)
+{
+    using namespace nvcuda;
+    extern __shared__ __align__(16) unsigned char fm_smem[];
+    __half* sA = reinterpret_cast<__half*>(fm_smem);
+    __half* sB = sA + kFmBM * kFmLD;
+    float* scratch = reinterpret_cast<float*>(sB + kFmBN * kFmLD);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int wr = warp >> 1, wc = warp & 1;
+    float* sc = scratch + warp * 256;
+    const int64_t row0 = static_cast<int64_t>(blockIdx.x) * kFmBM;
+    const int v8 = D >> 3;                 // 每行 uint4 数
+    const int ksteps = D >> 4;
+
+    for (int idx = tid; idx < kFmBM * v8; idx += 256) {
+        const int r = idx / v8, c = idx - r * v8;
+        const int64_t gr = row0 + r;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (gr < N) v = reinterpret_cast<const uint4*>(X + gr * D)[c];
+        reinterpret_cast<uint4*>(sA + r * kFmLD)[c] = v;
+    }
+    // 下一块候选先读进寄存器 (sm70 没有 cp.async)，算当前块时预取
+    uint4 pre[4];
+    auto load_b = [&](int j0) {
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int idx = tid + q * 256;
+            pre[q] = make_uint4(0, 0, 0, 0);
+            if (idx < kFmBN * v8) {
+                const int r = idx / v8, c = idx - r * v8;
+                const int64_t gc = static_cast<int64_t>(j0) + r;
+                if (gc < n) pre[q] = reinterpret_cast<const uint4*>(C + gc * D)[c];
+            }
+        }
+    };
+    auto store_b = [&]() {
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int idx = tid + q * 256;
+            if (idx < kFmBN * v8) {
+                const int r = idx / v8, c = idx - r * v8;
+                reinterpret_cast<uint4*>(sB + r * kFmLD)[c] = pre[q];
+            }
+        }
+    };
+
+    float rmin[2] = {INFINITY, INFINITY};
+    const int jstep = gridDim.y * kFmBN;
+    int j0 = blockIdx.y * kFmBN;
+    if (j0 < n) load_b(j0);
+    for (; j0 < n; j0 += jstep) {
+        __syncthreads();                   // 上一块的 sB 用完
+        store_b();
+        __syncthreads();
+        if (j0 + jstep < n) load_b(j0 + jstep);
+
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i)
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0f);
+        for (int k = 0; k < ksteps; ++k) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa[2];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb[2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                wmma::load_matrix_sync(fa[i], sA + (wr * 32 + i * 16) * kFmLD + k * 16, kFmLD);
+            #pragma unroll
+            for (int j = 0; j < 2; ++j)
+                wmma::load_matrix_sync(fb[j], sB + (wc * 32 + j * 16) * kFmLD + k * 16, kFmLD);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int j = 0; j < 2; ++j) wmma::mma_sync(acc[i][j], fa[i], fb[j], acc[i][j]);
+        }
+        const int r = lane & 15, h = lane >> 4;
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                wmma::store_matrix_sync(sc, acc[i][j], 16, wmma::mem_row_major);
+                __syncwarp();
+                const int cb = j0 + wc * 32 + j * 16 + h * 8;
+                #pragma unroll
+                for (int c = 0; c < 8; ++c) {
+                    const int col = cb + c;
+                    if (col < n) rmin[i] = fminf(rmin[i], cn[col] - 2.0f * sc[r * 16 + h * 8 + c]);
+                }
+                __syncwarp();
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        float m = fminf(rmin[i], __shfl_xor_sync(0xFFFFFFFFu, rmin[i], 16));
+        const int64_t row = row0 + wr * 32 + i * 16 + lane;
+        if (lane < 16 && row < N && m < INFINITY)
+            atomicMin(out + row, __float_as_uint(fmaxf(xn[row] + m, 0.0f)));
+    }
+}
+
+__global__ void fill_u32_kernel(unsigned* p, int64_t n, unsigned v)
+{
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = v;
+}
+
 struct KmeansMinDistF16 {
     static constexpr int64_t kTile = 4096;
     cublasHandle_t h = nullptr;
@@ -1980,6 +2101,7 @@ struct KmeansMinDistF16 {
     __half* d_xh = nullptr; float* d_xn = nullptr;
     __half* d_ch = nullptr; float* d_cn = nullptr; int64_t c_cap = 0;
     float* d_dots = nullptr; int64_t dots_cap = 0;   // 元素数
+    bool fused = false;                               // kmeans_fused_min_kernel (D % 16 == 0, D ≤ 128)
 
     KmeansMinDistF16(const float* d_x, int64_t N_, int D_, cudaStream_t st) : stream(st), N(N_), D(D_) {
         if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("KmeansMinDistF16: cublasCreate failed");
@@ -1991,6 +2113,10 @@ struct KmeansMinDistF16 {
         step4_f32_to_f16_kernel<<<static_cast<unsigned>((nd + 255) / 256), 256, 0, stream>>>(d_x, d_xh, nd);
         step4_row_norms_kernel<<<static_cast<unsigned>((N + 255) / 256), 256, 0, stream>>>(d_x, d_xn, N, D);
         CUDA_CHECK(cudaGetLastError());
+        fused = (D % 16 == 0) && D <= 128 && !std::getenv("BUCKET2_KMEANS_NO_FUSED");
+        if (fused)
+            CUDA_CHECK(cudaFuncSetAttribute(kmeans_fused_min_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kFmSmem)));
     }
     ~KmeansMinDistF16() {
         cudaFree(d_xh); cudaFree(d_xn); cudaFree(d_ch); cudaFree(d_cn); cudaFree(d_dots);
@@ -2012,7 +2138,7 @@ struct KmeansMinDistF16 {
         // 4096 × n × 4 B 会到 8 GB，跟数据集本身一起把显存撑爆；SIFT1M/10M 不变
         const int64_t tile = std::min<int64_t>(std::min<int64_t>(kTile, N),
                                                std::max<int64_t>(256, (int64_t(1) << 30) / (n * 4)));
-        if (tile * n > dots_cap) {
+        if (!fused && tile * n > dots_cap) {
             cudaFree(d_dots);
             CUDA_CHECK(cudaMalloc(&d_dots, tile * n * sizeof(float)));
             dots_cap = tile * n;
@@ -2020,6 +2146,18 @@ struct KmeansMinDistF16 {
         step4_f32_to_f16_kernel<<<static_cast<unsigned>((n * D + 255) / 256), 256, 0, stream>>>(d_c, d_ch, n * D);
         step4_row_norms_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(d_c, d_cn, n, D);
         CUDA_CHECK(cudaGetLastError());
+        if (fused) {
+            unsigned* o = reinterpret_cast<unsigned*>(d_min);
+            fill_u32_kernel<<<static_cast<unsigned>((N + 255) / 256), 256, 0, stream>>>(o, N, 0x7f800000u);
+            const unsigned gx = static_cast<unsigned>((N + kFmBM - 1) / kFmBM);
+            // 行块不够铺满 SM 时把候选再切几份 (各自 atomicMin)
+            const unsigned gy = static_cast<unsigned>(std::max<int64_t>(1, std::min<int64_t>(
+                (n + kFmBN - 1) / kFmBN, (4 * 80 + gx - 1) / gx)));
+            kmeans_fused_min_kernel<<<dim3(gx, gy), 256, kFmSmem, stream>>>(
+                d_xh, d_xn, N, d_ch, d_cn, static_cast<int>(n), D, o);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         const float alpha = 1.0f, beta = 0.0f;
         for (int64_t t0 = 0; t0 < N; t0 += tile) {
             const int64_t tn = std::min(tile, N - t0);
@@ -2434,11 +2572,87 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
  * KNN 图 (bucket 顺序 / 重排 / 窗口)，前 nprobe 列直接当 Step 6 的近邻表。
  * 返回 host (n_centroids, k_out) row-major, 按距离升序; 越界 id 直接报错。
  */
+// dist[r][j] = ‖c_j‖² − 2·dot[r][j] (行常数 ‖c_r‖² 不影响排序)；自己 (j == row0 + r) 置 +inf
+__global__ void centroid_self_dist_kernel(float* __restrict__ dots, const float* __restrict__ cn,
+                                          int64_t rows, int64_t n, int64_t row0)
+{
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= rows * n) return;
+    const int64_t r = i / n, j = i - r * n;
+    dots[i] = (j == row0 + r) ? INFINITY : cn[j] - 2.0f * dots[i];
+}
+
 std::vector<uint32_t> centroid_self_knn_bf(const float* d_centroids_f32, int64_t n_centroids,
-                                           int64_t D, uint32_t k_out)
+                                           int64_t D, uint32_t k_out, bool exact8 = false)
 {
     if (static_cast<int64_t>(k_out) >= n_centroids)
         throw std::runtime_error("centroid_self_knn_bf: k_out must be < n_centroids");
+    // 8-bit 数据: centroid 就是数据点 (整数值)，fp16 表示精确、fp32 累加
+    // (D·255² < 2^24) 也精确 → Tensor Core fp16 GEMM 得到跟 fp32 一样的距离
+    // (同 step4_top2_kernel / KmeansMinDistF16)。分块 GEMM + 原地转距离 (自己
+    // 置 +inf) + select_k，即 cuVS detail/knn_brute_force.cuh 的结构，只是 GEMM
+    // 换成 fp16 Tensor Core (V100 fp32 brute force 走 CUDA core)。
+    if (exact8 && D <= 128) {
+        const int64_t n = n_centroids;
+        cudaStream_t st = nullptr;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+        cublasHandle_t h = nullptr;
+        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("centroid_self_knn_bf: cublasCreate failed");
+        cublasSetStream(h, st);
+        cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH);
+        const int64_t tile = std::max<int64_t>(1, std::min<int64_t>(n, (512ll << 20) / (n * 4)));
+        __half* d_ch = nullptr; float* d_cn = nullptr; float* d_dots = nullptr;
+        float* d_sd = nullptr; int32_t* d_si = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_ch, n * D * sizeof(__half)));
+        CUDA_CHECK(cudaMalloc(&d_cn, n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_dots, tile * n * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_sd, tile * k_out * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_si, n * k_out * sizeof(int32_t)));
+        step4_f32_to_f16_kernel<<<static_cast<unsigned>((n * D + 255) / 256), 256, 0, st>>>(d_centroids_f32, d_ch, n * D);
+        step4_row_norms_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(d_centroids_f32, d_cn, n, static_cast<int>(D));
+        CUDA_CHECK(cudaGetLastError());
+        raft::resources res;
+        raft::resource::set_cuda_stream(res, st);
+        const float alpha = 1.0f, beta = 0.0f;
+        for (int64_t t0 = 0; t0 < n; t0 += tile) {
+            const int64_t tn = std::min(tile, n - t0);
+            cublasStatus_t cs = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N,
+                static_cast<int>(n), static_cast<int>(tn), static_cast<int>(D), &alpha,
+                d_ch, CUDA_R_16F, static_cast<int>(D), d_ch + t0 * D, CUDA_R_16F, static_cast<int>(D), &beta,
+                d_dots, CUDA_R_32F, static_cast<int>(n),
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (cs != CUBLAS_STATUS_SUCCESS)
+                throw std::runtime_error("centroid_self_knn_bf: fp16 GEMM failed, status=" + std::to_string(cs));
+            const int64_t tot = tn * n;
+            centroid_self_dist_kernel<<<static_cast<unsigned>((tot + 255) / 256), 256, 0, st>>>(d_dots, d_cn, tn, n, t0);
+            CUDA_CHECK(cudaGetLastError());
+            raft::matrix::select_k<float, int32_t>(res,
+                raft::make_device_matrix_view<const float, int64_t, raft::row_major>(d_dots, tn, n),
+                std::nullopt,
+                raft::make_device_matrix_view<float, int64_t, raft::row_major>(d_sd, tn, k_out),
+                raft::make_device_matrix_view<int32_t, int64_t, raft::row_major>(d_si + t0 * k_out, tn, k_out),
+                /*select_min=*/true, /*sorted=*/true);
+        }
+        std::vector<int32_t> h_si(static_cast<size_t>(n) * k_out);
+        CUDA_CHECK(cudaMemcpyAsync(h_si.data(), d_si, h_si.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        cudaFree(d_ch); cudaFree(d_cn); cudaFree(d_dots); cudaFree(d_sd); cudaFree(d_si);
+        cublasDestroy(h);
+        cudaStreamDestroy(st);
+        std::vector<uint32_t> out(h_si.size());
+        int64_t n_bad = 0;
+        #pragma omp parallel for schedule(static) reduction(+:n_bad)
+        for (int64_t c = 0; c < n; ++c) {
+            for (uint32_t j = 0; j < k_out; ++j) {
+                const int32_t v = h_si[static_cast<size_t>(c) * k_out + j];
+                if (v < 0 || v >= n || v == c) { ++n_bad; out[static_cast<size_t>(c) * k_out + j] = 0; continue; }
+                out[static_cast<size_t>(c) * k_out + j] = static_cast<uint32_t>(v);
+            }
+        }
+        if (n_bad > 0)
+            throw std::runtime_error("centroid_self_knn_bf: " + std::to_string(n_bad) + " bad ids (fp16 path)");
+        return out;
+    }
     const int64_t ks = static_cast<int64_t>(k_out) + 1;   // 多取 1 个，剥掉自己
     raft::resources res;
     auto cview = raft::make_device_matrix_view<const float, int64_t>(d_centroids_f32, n_centroids, D);
@@ -6854,7 +7068,8 @@ int run_pipeline_impl(
         uint32_t exact_knn_k = 0;
         if (!mem_est.need_pq) {
             exact_knn_k = std::max<uint32_t>(K, (nprobe > 0) ? nprobe : K);
-            centroid_exact_knn = centroid_self_knn_bf(d_centroids_f32, n_centroids, D, exact_knn_k);
+            centroid_exact_knn = centroid_self_knn_bf(d_centroids_f32, n_centroids, D, exact_knn_k,
+                std::is_same<DataT, uint8_t>::value || std::is_same<DataT, int8_t>::value);
             std::vector<uint32_t> g(static_cast<size_t>(n_centroids) * K);
             for (int64_t c = 0; c < n_centroids; ++c)
                 std::memcpy(g.data() + static_cast<size_t>(c) * K,
@@ -7163,31 +7378,87 @@ int run_pipeline_impl(
                     write_reordered_async(data_reordered_path, holder->data(), holder->size(), holder);
                 }
             } else {
-                auto writer = reordered_io::ReorderedDatasetWriter<DataT>::create(
-                    data_reordered_path, D, n_centroids,
-                    reorder_offsets_new, reorder_pos_of, config.bucket_vec_buffer_bytes);
-
-                std::ifstream scan_in(working_input_path, std::ios::binary);
-                if (!scan_in.is_open())
-                    throw std::runtime_error("Inline reorder: cannot open " + working_input_path);
-                scan_in.seekg(2 * sizeof(int32_t));  // 跳过 header (int32 N, int32 D)
-
-                constexpr int64_t kScanBatchRows = 1 << 16;
-                std::vector<DataT> scan_batch;
-                for (int64_t lo = 0; lo < N; lo += kScanBatchRows) {
-                    int64_t rows = std::min<int64_t>(kScanBatchRows, N - lo);
-                    scan_batch.resize(static_cast<size_t>(rows) * D);
-                    scan_in.read(reinterpret_cast<char*>(scan_batch.data()),
-                                static_cast<std::streamsize>(scan_batch.size() * sizeof(DataT)));
-                    if (!scan_in.good())
-                        throw std::runtime_error(
-                            "Inline reorder: failed reading dataset batch at row " + std::to_string(lo));
-                    for (int64_t r = 0; r < rows; ++r) {
-                        writer.add(assignments[static_cast<size_t>(lo + r)],
-                                  scan_batch.data() + static_cast<size_t>(r) * D);
-                    }
+                // 输出就是输入行的一个置换 (新行 i = 旧行 inverse_perm[i])。原来单线程逐行扫输入、
+                // 塞进 n_centroids 个每桶 ~10 KB 的小缓冲再零散 pwrite (SIFT100M pass3_write 55 s)。
+                // 现在按输出行分窗 (≤ 4 GB 一窗)：每窗并行 pread 整份输入 (8 MB 块)，只把落在窗里的
+                // 行按 perm 放进窗缓冲，再一次顺序写出。结果逐字节相同。
+                // 参考 TAGORE prep: 直接按目标位置成块写，不走逐条小缓冲。
+                if (static_cast<int64_t>(reorder_info.inverse_perm.size()) != N)
+                    throw std::runtime_error("Inline reorder: inverse_perm size != N");
+                const int64_t row_bytes = static_cast<int64_t>(D) * static_cast<int64_t>(sizeof(DataT));
+                std::vector<uint32_t> perm(static_cast<size_t>(N));   // 旧 id → 新 id
+                #pragma omp parallel for schedule(static)
+                for (int64_t i = 0; i < N; ++i) {
+                    const uint32_t o = reorder_info.inverse_perm[static_cast<size_t>(i)];
+                    if (static_cast<int64_t>(o) >= N) throw std::runtime_error("Inline reorder: inverse_perm out of range");   // bounds check
+                    perm[o] = static_cast<uint32_t>(i);
                 }
-                writer.finish();
+                const int in_fd = ::open(working_input_path.c_str(), O_RDONLY);
+                if (in_fd < 0) throw std::runtime_error("Inline reorder: cannot open " + working_input_path);
+                const int out_fd = ::open(data_reordered_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+                if (out_fd < 0) { ::close(in_fd); throw std::runtime_error("Inline reorder: cannot create " + data_reordered_path); }
+                auto pio = [](bool wr, int fd, char* p, size_t n, off_t off) {
+                    while (n > 0) {
+                        ssize_t r = wr ? ::pwrite(fd, p, n, off) : ::pread(fd, p, n, off);
+                        if (r <= 0) return false;
+                        p += r; n -= static_cast<size_t>(r); off += r;
+                    }
+                    return true;
+                };
+                {
+                    int32_t hdr[2] = {static_cast<int32_t>(N), static_cast<int32_t>(D)};
+                    if (!pio(true, out_fd, reinterpret_cast<char*>(hdr), sizeof(hdr), 0))
+                        throw std::runtime_error("Inline reorder: header write failed");
+                }
+                const off_t hdr_bytes = 2 * sizeof(int32_t);
+                const int64_t win_rows = std::max<int64_t>(1, std::min<int64_t>(N, (int64_t(4) << 30) / row_bytes));
+                const int64_t chunk_rows = std::max<int64_t>(1, (int64_t(8) << 20) / row_bytes);
+                const int64_t n_chunks = (N + chunk_rows - 1) / chunk_rows;
+                std::unique_ptr<char[]> win(new char[static_cast<size_t>(win_rows * row_bytes)]);
+                bool io_ok = true;
+                for (int64_t w0 = 0; w0 < N; w0 += win_rows) {
+                    const int64_t w1 = std::min<int64_t>(N, w0 + win_rows);
+                    #pragma omp parallel
+                    {
+                        std::vector<char> cbuf(static_cast<size_t>(chunk_rows * row_bytes));
+                        #pragma omp for schedule(dynamic, 1)
+                        for (int64_t ch = 0; ch < n_chunks; ++ch) {
+                            const int64_t r0 = ch * chunk_rows, r1 = std::min<int64_t>(N, r0 + chunk_rows);
+                            // 这一块里有没有落进窗的行 (没有就不读)
+                            bool any = false;
+                            for (int64_t r = r0; r < r1 && !any; ++r) any = (perm[r] >= w0 && perm[r] < w1);
+                            if (!any) continue;
+                            if (!pio(false, in_fd, cbuf.data(), static_cast<size_t>((r1 - r0) * row_bytes),
+                                     hdr_bytes + static_cast<off_t>(r0 * row_bytes))) {
+                                #pragma omp atomic write
+                                io_ok = false;
+                                continue;
+                            }
+                            for (int64_t r = r0; r < r1; ++r) {
+                                const int64_t p = perm[r];
+                                if (p >= w0 && p < w1)
+                                    std::memcpy(win.get() + (p - w0) * row_bytes, cbuf.data() + (r - r0) * row_bytes,
+                                                static_cast<size_t>(row_bytes));
+                            }
+                        }
+                    }
+                    if (!io_ok) break;
+                    // 窗内容顺序写出 (按 64 MB 片并行)
+                    const int64_t wn = (w1 - w0) * row_bytes;
+                    const int64_t piece = int64_t(64) << 20;
+                    #pragma omp parallel for schedule(dynamic, 1)
+                    for (int64_t o = 0; o < wn; o += piece) {
+                        if (!pio(true, out_fd, win.get() + o, static_cast<size_t>(std::min<int64_t>(piece, wn - o)),
+                                 hdr_bytes + static_cast<off_t>(w0 * row_bytes + o))) {
+                            #pragma omp atomic write
+                            io_ok = false;
+                        }
+                    }
+                    if (!io_ok) break;
+                }
+                ::close(in_fd);
+                if (::close(out_fd) != 0) io_ok = false;
+                if (!io_ok) throw std::runtime_error("Inline reorder: I/O failed writing " + data_reordered_path);
             }
             std::cout << "  Wrote " << data_reordered_path << "\n";
             {

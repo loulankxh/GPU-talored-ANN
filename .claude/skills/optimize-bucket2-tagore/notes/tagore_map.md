@@ -181,3 +181,7 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
 - **#16 (accepted, +10.0% → 898.4 s, 0.42× TAGORE):** #14 + prune device row reuse across chunks. Remaining SIFT100M:
   bucket2 676 (Step 6 241, Step 4 178, Step 2 127, Step 4.5 70, wait 25, Step 3 14, Step 1 11), prune 110 (reload still
   9.8 × N → order chunks / windows for more reuse), optimize_chunked 64, translate 48. RSS 38 GB (guard 45.7 GB).
+- **#18 (accepted, +9.7% → 810.9 s, 0.38× TAGORE):** k-means fused kernel (#17) + Step 4.5 windowed permute. Remaining
+  SIFT100M: bucket2 578 (Step 6 238, Step 4 176, Step 2 76, Step 4.5 31, wait 26, Step 1 11, Step 3 9), prune 111,
+  optimize_chunked 66, translate 55. bucket2 RSS 43.2 GB (guard now 51.9 GB). Next: Step 4 (search 61 / 42 s, reads 12 / 13,
+  BucketWrite 28), Step 6 (loop ~116 / 114 s), translate 55 s.
