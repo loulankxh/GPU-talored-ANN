@@ -174,3 +174,7 @@ Implementation → log **Ideas backlog**; algorithm → **Awaiting approval**. U
   source is gone; then Step 4 (219 s), Step 6 (235 s), prune (140 s), Step 4.5 (132 s).
 - **#13 (accepted, +8.8% → 998.6 s, 0.46× TAGORE):** #11 re-applied. SIFT100M now: Step 6 245, Step 4 220, prune 138,
   Step 2 127, optimize_chunked 78, Step 4.5 72, translate 47, wait 30, Step 3 14, Step 1 12. RSS 40 GB.
+- **#15 (rejected):** prune reload (10–12 × N rows) is dominated by window overlap between chunks (~19.5M rows per chunk
+  union), not the chunk cap; bigger chunks cost memory (guard is per stage). Ideas for prune: process positions in an
+  order that reuses the loaded window (sliding window with incremental loads, like DiskJoin / TAGORE `reorder` buffer
+  reuse) — i.e. load only the buckets that enter the window. #14 (+6%) still waiting for a bundle partner.

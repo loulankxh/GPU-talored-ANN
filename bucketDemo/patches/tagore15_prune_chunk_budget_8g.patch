@@ -1,0 +1,18 @@
+diff --git a/bucketDemo/buildBucket/src/prune_windowed.cpp b/bucketDemo/buildBucket/src/prune_windowed.cpp
+index 3c8f332..7ed4c83 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed.cpp
++++ b/bucketDemo/buildBucket/src/prune_windowed.cpp
+@@ -500,8 +500,11 @@ int main(int argc, char** argv)
+                 pread_all(fd_d, reinterpret_cast<char*>(vec), static_cast<size_t>(n) * D_all,
+                           static_cast<off_t>(2 * sizeof(int32_t)) + static_cast<off_t>(lo) * D_all);
+             };
+-            // 块大小: cand + vec 行 ≤ host 预算的一半，且 ≤ 4 GB (显存另有 out / 窗口表)
+-            const size_t budget = std::min<size_t>((cache_mb << 20) / 2, size_t(4) << 30);
++            // 块大小: cand + vec 行 ≤ host 预算的一半，且 ≤ 8 GB (显存另有 out: 每行再 out_deg×4 B → 8 GB 预算
++            // ≈ 10.7 GB 显存 + 窗口表，prune 进程单独占 GPU)。每块除了自己的中心桶还要装整段窗口的边缘桶，
++            // 块越小重复装得越多: SIFT100M 4 GB 时 113 块、装了 12.56×N 行 (~480 GB pread + H2D)。
++            // 参考 TAGORE largeIndex: 每个 cluster 整块上 GPU，缓冲区按显存一次给足。
++            const size_t budget = std::min<size_t>((cache_mb << 20) / 2, size_t(8) << 30);
+             double t_sink = 0;
+             prune_windowed_gpu::ChunkStats cst;
+             prune_windowed_gpu::run_chunked(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
