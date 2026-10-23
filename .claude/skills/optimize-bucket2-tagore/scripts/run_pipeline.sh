@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # One full build of the bucket pipeline + quality eval, on GPU 0 (SMOKE=1: see the lock block).
 #
-#   run_pipeline.sh -d sift1M|sift10M|sift100M [-m auto|large] [-r REPS] [-o OUTDIR] [-q] [-k]
+#   run_pipeline.sh -d DATASET [-m auto|large] [-r REPS] [-o OUTDIR] [-q] [-k]
+#     -d DATASET : a name from datasets.json (sift1M, sift10M, sift100M, msTuring10M, ...);
+#                  vector type from the base file extension (.u8bin / .i8bin / .fbin),
+#                  size-adaptive parameters from dataset_env.py (env values override them)
 #     -m auto  : bucket2 picks GPU-resident vs out-of-core itself; optimize (cuVS
 #                resident prune+reverse) runs if it fits, else falls back to
 #                prune_windowed + optimize_chunked -m E.            (default)
 #     -m large : force the large-dataset path end to end
 #                (bucket2 --out-of-core, prune_windowed, optimize_chunked -m E).
-#     -r REPS  : full build repetitions (median is reported). default 3 (sift10M: 1)
+#     -r REPS  : full build repetitions (median is reported). default: datasets.json "reps"
 #     -q       : skip quality eval (timing only)
 #     -k       : keep the big intermediate files (default: delete after eval)
 #
@@ -18,7 +21,6 @@ set -uo pipefail
 
 SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$SKILL/../../.." && pwd)"   # this worktree (/home/lanlu/microBenchmark_tagore)
-DATA=/home/lanlu/microBenchmark/dataset   # shared, untracked
 BB=$ROOT/bucketDemo/buildBucket
 BIN=$BB/build
 EVAL=/home/lanlu/microBenchmark/bucketDemo/evalCuvs/build/cagra_eval   # shared eval tool (not optimized)
@@ -32,16 +34,16 @@ while getopts "d:m:r:o:qk" o; do
     q) QUALITY=0 ;; k) KEEP=1 ;; *) sed -n 2,17p "$0"; exit 1 ;;
   esac
 done
-case $DS in
-  sift1M)  BASE=$DATA/sift1M/base.1M.u8bin;   : "${REPS:=3}" ;;
-  sift10M) BASE=$DATA/sift10M/base.10M.u8bin; : "${REPS:=1}" ;;
-  sift100M) BASE=$DATA/sift100M/base.100M.u8bin; : "${REPS:=1}" ;;
-  *) echo "-d sift1M|sift10M|sift100M required"; exit 1 ;;
-esac
-DSDIR=$(dirname "$BASE")
-# SIFT100M (user decision 2026-10-22): 2 build rounds instead of 3, and search with DiskANN's
-# CPU in-memory searcher (cuVS CAGRA search does not fit 100M on the 16 GB GPU)
-[[ $DS == sift100M ]] && ITERATIONS=2
+# 数据集查表 + 按规模自适应的参数 (dataset_env.py；环境变量里显式给的值优先，用于参数扫描)
+ENV_OUT=$("$PY" -I "$SKILL/scripts/dataset_env.py" "$DS") || { echo "$ENV_OUT"; exit 1; }
+eval "$ENV_OUT"
+DSDIR=$DS_DIR
+: "${REPS:=$DEF_REPS}"
+# cagra_eval 目前只读 uint8；其它类型先用 DiskANN CPU 搜索
+[[ $SEARCH == cagra && $DTYPE != uint8 ]] && SEARCH=diskann
+BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
+CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
+echo "[$DS] $DTYPE N=$N D=$DIM reps=$REPS iters=$ITERATIONS ratio=$CENTROID_RATIO nprobe=$NPROBE search=$SEARCH ($ADAPT_NOTE)"
 : "${OUT:=$BB/runs/$(date +%Y%m%d_%H%M%S)_${DS}_${MODE}}"
 mkdir -p "$OUT"
 # 正式计时排队（user 2026-10-22）：optimize-bucket2 和 optimize-bucket2-tagore 两个 loop 的计时运行
@@ -96,7 +98,7 @@ for ((R = 0; R < REPS; R++)); do
     FUSED=1   # resident path finished inside bucket2 (optimize + translate_ids folded in)
   elif [[ $MODE == auto ]]; then
     # shellcheck disable=SC2086
-    timed optimize "$BIN/optimize" -i "$O/data_reordered.u8bin" -g "$O/vector_knn.bin" \
+    timed optimize "$BIN/optimize" -i "$O/data_reordered$EXT" -g "$O/vector_knn.bin" \
       -o "$O/graph_new_ids.bin" --output-degree "$OUTPUT_DEGREE" $OPTIMIZE_EXTRA
     rc=$?
     if [[ $rc -eq 2 ]]; then PATH_USED=large; rm -f "$RD/optimize.time"
@@ -106,7 +108,7 @@ for ((R = 0; R < REPS; R++)); do
   fi
   if [[ $PATH_USED == large ]]; then
     # shellcheck disable=SC2086
-    timed prune "$BIN/prune_windowed" -k "$O/vector_knn.bin" -i "$O/data_reordered.u8bin" \
+    timed prune "$BIN/prune_windowed" -k "$O/vector_knn.bin" -i "$O/data_reordered$EXT" \
       --bucket-offsets "$O/bucket_offsets.bin" --bucket-process-order "$O/bucket_process_order.bin" \
       -c "$O/centroid_knn.bin" -o "$O/forward_graph_reordered.bin" \
       --output-degree "$OUTPUT_DEGREE" --cache-mb "$PRUNE_CACHE_MB" $PRUNE_EXTRA \
@@ -129,15 +131,15 @@ for ((R = 0; R < REPS; R++)); do
   if [[ $QUALITY -eq 1 && $R -eq $((REPS - 1)) ]]; then
     "$PY" -I "$SKILL/scripts/knn_similarity.py" "$O/vector_knn.bin" "$O/inverse_perm.bin" \
       "$DSDIR/base_knn_sample10K_k64.ibin" > "$RD/knn_similarity.json" || echo "knn_similarity FAILED"
-    # final-graph structural check + recall/QPS through the cuVS CAGRA searcher
-    # (SIFT100M: DiskANN CPU in-memory search, same JSON format; points[].itopk = DiskANN L)
-    if [[ $DS == sift100M ]]; then
+    # final-graph structural check + recall/QPS: cuVS CAGRA searcher (SEARCH=cagra, uint8) or
+    # DiskANN CPU in-memory search (SEARCH=diskann; same JSON format, points[].itopk = DiskANN L)
+    if [[ $SEARCH == diskann ]]; then
       "$PY" -I "$SKILL/scripts/diskann_search.py" "$BASE" "$O/final_graph.bin" \
-        "$DSDIR/query.public.10K.u8bin" "$DSDIR/groundtruth.ibin" "$W/diskann" \
+        "$DSDIR/query.public.10K$EXT" "$DSDIR/groundtruth.ibin" "$W/diskann" \
         2> "$RD/search.err" | grep '^{' > "$RD/search.json" || echo "search FAILED (see search.err)"
     else
     "$EVAL" search --data "$BASE" --graph "$O/final_graph.bin" \
-      --query "$DSDIR/query.public.10K.u8bin" --gt "$DSDIR/groundtruth.ibin" \
+      --query "$DSDIR/query.public.10K$EXT" --gt "$DSDIR/groundtruth.ibin" \
       2> "$RD/search.err" | grep '^{' > "$RD/search.json" || echo "search FAILED (see search.err)"
     fi
   fi

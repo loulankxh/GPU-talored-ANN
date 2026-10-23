@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Re-run only the tail of a large-path run_pipeline.sh rep whose work dir was kept after a
 # failure in optimize_chunked / translate / search (bucket2 + prune .time files are reused).
-#   resume_large_tail.sh -d sift100M -o OUTDIR      (rep0 only)
+#   resume_large_tail.sh -d DATASET -o OUTDIR      (rep0 only; DATASET from datasets.json)
 set -uo pipefail
 SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$SKILL/../../.." && pwd)"; BB=$ROOT/bucketDemo/buildBucket; BIN=$BB/build
 PY=/home/lanlu/miniconda3/envs/cuvs-bench/bin/python
 source "$SKILL/scripts/params.sh"
 while getopts "d:o:" o; do case $o in d) DS=$OPTARG ;; o) OUT=$OPTARG ;; esac; done
-[[ $DS == sift100M ]] && ITERATIONS=2
-BASE=$(ls /home/lanlu/microBenchmark/dataset/$DS/base.*.u8bin); DSDIR=$(dirname "$BASE")
+ENV_OUT=$("$PY" -I "$SKILL/scripts/dataset_env.py" "$DS") || { echo "$ENV_OUT"; exit 1; }
+eval "$ENV_OUT"; DSDIR=$DS_DIR   # BASE / EXT / ITERATIONS / NPROBE / ... as in run_pipeline.sh
+CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
 RD=$OUT/rep0; W=$RD/work; O=$W/k${KNN_K}p${NPROBE}m${NEIGHBORS_M}t${ITERATIONS}
 # same bench lock as run_pipeline.sh (timed run)
 BENCH_LOCK=/home/lanlu/.bench_locks/bucket2_bench.lock; mkdir -p "$(dirname "$BENCH_LOCK")"
@@ -31,7 +32,7 @@ echo large > "$RD/path.txt"
 "$PY" -I "$SKILL/scripts/knn_similarity.py" "$O/vector_knn.bin" "$O/inverse_perm.bin" \
   "$DSDIR/base_knn_sample10K_k64.ibin" > "$RD/knn_similarity.json" || echo "knn_similarity FAILED"
 "$PY" -I "$SKILL/scripts/diskann_search.py" "$BASE" "$O/final_graph.bin" \
-  "$DSDIR/query.public.10K.u8bin" "$DSDIR/groundtruth.ibin" "$W/diskann" \
+  "$DSDIR/query.public.10K$EXT" "$DSDIR/groundtruth.ibin" "$W/diskann" \
   2> "$RD/search.err" | grep '^{' > "$RD/search.json" || echo "search FAILED (see search.err)"
 rm -rf "$W"
 "$PY" -I "$SKILL/scripts/summarize.py" "$OUT" "$DS" auto > "$OUT/metrics.json"

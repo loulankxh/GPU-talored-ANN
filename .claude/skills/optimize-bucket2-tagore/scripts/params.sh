@@ -5,18 +5,18 @@
 NEIGHBORS_M=64
 OUTPUT_DEGREE=32
 
-: "${CENTROID_RATIO:=0.004}"   # A2 (user-approved, params only): avg bucket ~250 points
+# CENTROID_RATIO / NPROBE / kmeans train fraction / host + GPU cache sizes / ITERATIONS per dataset come from
+# dataset_env.py (size-adaptive, reproduces the hand-tuned SIFT100M values; export a value to override it).
 SEED=42
 : "${KNN_K:=32}"
-: "${NPROBE:=80}"   # A2: pool (NPROBE+1) x bucket kept ~20K rows
-ITERATIONS=3
+ITERATIONS=3   # default; datasets.json "iterations" overrides (SIFT100M / msTuring100M: 2)
 
 PRUNE_CACHE_MB=16000
 CHUNKED_GPU_BUDGET_MB=16000
 CHUNKED_EDGE_BUFFER_MB=16000
 
 # extra flags appended verbatim (keep empty unless an optimization needs them)
-BUCKET2_EXTRA="--skip-npy --skip-dists --kmeans-train-fraction 0.10 --cache-mb 15000 --bucket-mem-mb 16000 --gpu-bucket-cache-mb 8192"   # #21: Step 6 GPU bucket cache 2 → 8 GB (Step 6 itself uses ~4 GB of the 16 GB V100; the 14.6 GB peak is in an earlier step); #9: Step 6 host Belady cache holds a whole SIFT100M round (13.6 GB of records; default cpu_limit/2 = 8.6 GB); #14: round 2..t records stay in RAM (no BucketWrite to disk), Step 6 copies misses from them
+BUCKET2_EXTRA="--skip-npy --skip-dists"   # + --kmeans-train-fraction / --cache-mb / --bucket-mem-mb / --gpu-bucket-cache-mb from dataset_env.py (#9 host cache holds a whole round, #14 round 2..t records in RAM, #21 GPU bucket cache = half the GPU)
 OPTIMIZE_EXTRA="--skip-sort"
 PRUNE_EXTRA=""
 CHUNKED_EXTRA=""

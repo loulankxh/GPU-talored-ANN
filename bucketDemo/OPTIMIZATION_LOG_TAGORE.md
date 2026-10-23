@@ -999,3 +999,12 @@ peak 14588 MiB (unchanged); bucket2 RSS 46.2 GB (guard 51.9 GB); DiskANN recall 
 
 See **Tried & rejected** (#22). Step 6 at 8 GB of cache is past the point where misses matter (0.2 ms of per-bucket GPU work
 — cuBLAS GEMM + top-M + gather — is the floor now). Loop stopped after this iteration at the user's request (2026-10-23).
+
+### User decisions 2026-10-23 (skill change applied from the user's other session while the loop was held after #22)
+
+- **Measurement rule:** SIFT100M is now the **median of 3 runs** with the **±3% gate** like every other config; the 7% single-run gate and the "Possible gains" bundling are retired (one coherent change per iteration). The SIFT100M best (#21, 1 run) is re-recorded as a 3-run median in step R.
+- **Dataset-generic skill:** `datasets.json` registry, `dataset_env.py` size-adaptive parameters (reproduce the hand-tuned SIFT100M values 0.004 / 80 / 0.10 / 15000 / 16000 / 8192; SIFT1M/10M get exactly the same flags as before), `prep_dataset.py` + `gen_gt.py` (dtype-generic, one pass for groundtruth + self-sample KNN), `run_pipeline.sh` / `resume_large_tail.sh` / `diskann_search.py` for uint8 / int8 / float32, generic `judge.py` (keys `<dataset>_<mode>`, `--quick`, `--rebaseline`). No uint32 vectors (user).
+- **New data:** msTuring1M / 10M / 100M (float32, D=100) in `/home/lanlu/microBenchmark/dataset/` from `/home/lanlu/SCALER/dataset/msTuring100M` (100M base + queries hard-linked, 1M / 10M = first N vectors); our 100M groundtruth matches the shipped one (top-100 overlap 1.0000).
+- **Bench set:** SIFT1M auto / large ×3, SIFT10M ×1, **msTuring10M ×1** (float32), SIFT100M ×3; msTuring100M only at milestones.
+- **Smoke runs (SMOKE=1, GPU 2):** sift1M auto 4.90 s, recall@10 0.9270 @32 (unchanged); **msTuring1M auto** resident, 6.96 s, 0 defects, pre-prune recall@10 0.687 (SIFT1M 0.943), DiskANN recall@10 0.6615 / 0.7775 / 0.8657 / 0.9274 / 0.9660 @ L 32…512; **msTuring1M large: bucket2 Step 6 `FATAL: ReorderedDatasetBucketReader: read failed for bucket 537`** → work item F0.
+- **Work order after resume:** step R (re-baseline) → F0 (float32 large-path crash) → F3 (cagra_eval float32 + CAGRA reference on msTuring10M; `ref` → cagra approved) → step C (calibrate msTuring `CENTROID_RATIO` / `NPROBE` within A2 bounds to the reference gate; interim target pre-prune recall@10 ≈ 0.90) → F1 / F2 (float prune GPU kernel, Step 6 float GPU cache; fp16 GEMM without exact re-rank needs approval) → F4 (1B readiness; no 1B base on the machine yet).

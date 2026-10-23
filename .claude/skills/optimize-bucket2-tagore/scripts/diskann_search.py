@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""SIFT100M search for our final graph with DiskANN's CPU in-memory searcher
-(cuVS CAGRA search does not fit 100M on a 16 GB GPU).
+"""Search our final graph with DiskANN's CPU in-memory searcher (100M+ datasets: cuVS CAGRA search does
+not fit on a 16 GB GPU; non-uint8 datasets: cagra_eval reads uint8 only).
 
-usage: diskann_search.py BASE.u8bin final_graph.bin QUERY.u8bin GT.ibin WORKDIR [--L 32,64,128,256,512] [--K 10]
+usage: diskann_search.py BASE final_graph.bin QUERY GT.ibin WORKDIR [--L 32,64,128,256,512] [--K 10]
+  BASE / QUERY: .u8bin (uint8), .i8bin (int8) or .fbin (float32) -- DiskANN --data_type from the extension
 
 1. reads our graph (int64 N, int32 K, uint32 graph[N*K]; graph_io.hpp write_graph) and checks it:
    out-of-range ids, self loops, duplicate edges per row (same counters as cagra_eval);
@@ -10,7 +11,7 @@ usage: diskann_search.py BASE.u8bin final_graph.bin QUERY.u8bin GT.ibin WORKDIR 
 3. writes DiskANN's in-memory graph format (in_mem_graph_store.cpp load_impl:
    u64 file_size, u32 max_degree, u32 start, u64 frozen_pts=0, then per node u32 k + k ids)
    to WORKDIR/diskann_index, symlinks WORKDIR/diskann_index.data -> BASE;
-4. runs search_memory_index (uint8, l2, all threads) for every L, recall@K vs GT;
+4. runs search_memory_index (data type of BASE, l2, all threads) for every L, recall@K vs GT;
 prints one JSON line in cagra_eval's search format:
    {"degree", "bad_ids", "self_loops", "dup_edges", "points": [{"itopk": L, "recall", "qps"}]}
 (points[].itopk holds DiskANN's L so judge.py / summarize.py can read it unchanged).
@@ -19,6 +20,7 @@ import argparse, json, os, re, subprocess, sys, time
 import numpy as np
 
 SEARCH = "/home/lanlu/DiskANN/build/apps/search_memory_index"
+DTYPES = {".u8bin": (np.uint8, "uint8"), ".i8bin": (np.int8, "int8"), ".fbin": (np.float32, "float")}
 ap = argparse.ArgumentParser()
 ap.add_argument("base"); ap.add_argument("graph"); ap.add_argument("query"); ap.add_argument("gt"); ap.add_argument("work")
 ap.add_argument("--L", default="32,64,128,256,512"); ap.add_argument("--K", type=int, default=10)
@@ -33,7 +35,12 @@ assert os.path.getsize(a.graph) == 12 + 4 * N * K, "graph file size mismatch"
 G = np.memmap(a.graph, dtype=np.uint32, mode="r", offset=12, shape=(N, K))
 bn, bd = (int(x) for x in np.fromfile(a.base, dtype=np.int32, count=2))
 assert bn == N, f"graph N {N} != base N {bn}"
-B = np.memmap(a.base, dtype=np.uint8, mode="r", offset=8, shape=(bn, bd))
+ext = os.path.splitext(a.base)[1]
+if ext not in DTYPES or os.path.splitext(a.query)[1] != ext:
+    sys.exit(f"base / query must both be one of {list(DTYPES)} ({a.base}, {a.query})")
+np_t, dk_t = DTYPES[ext]
+assert os.path.getsize(a.base) == 8 + bn * bd * np.dtype(np_t).itemsize, "base file size mismatch"
+B = np.memmap(a.base, dtype=np_t, mode="r", offset=8, shape=(bn, bd))
 
 # ---- checks + DiskANN graph file (one pass over the graph)
 t0 = time.time()
@@ -87,7 +94,7 @@ os.symlink(os.path.abspath(a.base), data_link)
 
 # ---- search
 Ls = [int(x) for x in a.L.split(",")]
-cmd = [SEARCH, "--data_type", "uint8", "--dist_fn", "l2", "--index_path_prefix", idx_path,
+cmd = [SEARCH, "--data_type", dk_t, "--dist_fn", "l2", "--index_path_prefix", idx_path,
        "--result_path", os.path.join(a.work, "diskann_res"), "--query_file", a.query, "--gt_file", a.gt,
        "-K", str(a.K), "-L", *map(str, Ls)]
 log("[diskann_search] " + " ".join(cmd))
