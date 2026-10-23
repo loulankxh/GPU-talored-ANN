@@ -33,23 +33,22 @@ files in `/home/lanlu/microBenchmark` (the cuVS loop's tree) except reading it.
 **Make the large-scale build faster on any dataset**, with SIFT100M as the main target. Since
 2026-10-23 the skill is dataset-generic (see **Datasets, data types and adaptive parameters**).
 
-**Bench set** (every iteration; `datasets.json` field `bench`):
+**Bench set** (every iteration; `datasets.json` fields `bench` and `reps`; user decision 2026-10-23: every bench config ×3, msTuring100M ×3 only at milestones):
 
 | config | reps | search | quality reference (judge.py) |
 |---|---|---|---|
 | `sift1M_auto` (resident) | 3 (median) | cuVS CAGRA (`cagra_eval`), itopk 32…512 | TAGORE − 0.01 |
 | `sift1M_large` (large path forced) | 3 | cuVS CAGRA | TAGORE − 0.05 |
-| `sift10M_auto` (→ large path) | 1 | cuVS CAGRA | TAGORE − 0.05 |
-| `msTuring10M_auto` (float32, D=100) | 1 | DiskANN CPU (`diskann_search.py`), L 32…512; cuVS CAGRA after F3 | own best − 0.01 until F3; then CAGRA reference (−0.01 resident / −0.05 large) after calibration step C |
+| `sift10M_auto` (→ large path) | 3 (median) | cuVS CAGRA | TAGORE − 0.05 |
+| `msTuring10M_auto` (float32, D=100) | 3 (median) | DiskANN CPU (`diskann_search.py`), L 32…512; cuVS CAGRA after F3 | own best − 0.01 until F3; then CAGRA reference (−0.01 resident / −0.05 large) after calibration step C |
 | `sift100M_auto` (2 rounds) | **3 (median)** | DiskANN CPU, L 32…512 | own best − 0.05 |
 
 **Rules (judge.py):**
 - **Every config: build_total ≥ 3% faster than best = gain, > 3% slower = regression** (2026-10-23:
-  SIFT100M is now the median of 3 runs too; the old 7% single-run gate and the "Possible gains"
+  every bench config is the median of 3 runs — SIFT1M, SIFT10M, msTuring10M and SIFT100M; the old 7% single-run gate and the "Possible gains"
   bundling are retired — one coherent change per iteration again, don't bundle to pass the gate).
 - **ACCEPT** iff the full bench set was run, at least one config gains, none regresses, search
   quality passes everywhere, 0 graph defects, path selection unchanged, large-path memory ≤ 1.2× best.
-- SIFT1M / SIFT10M borderline gain (3–5%): rerun that config into `<dir>_b`, accept only if both pass.
 - Pick ideas by SIFT100M stage times first (`state/best.json` → `sift100M_auto.stages_s`,
   `bucket2_steps_s`), then by msTuring10M (float path); ideas must scale with N (the large path
   stays out-of-core).
@@ -183,8 +182,8 @@ S=$SK/scripts
 R=$WT/bucketDemo/buildBucket/runs/tagore<N>
 bash $S/run_pipeline.sh -d sift1M      -m auto  -o $R/sift1M_auto       # resident path, 3 reps (datasets.json)
 bash $S/run_pipeline.sh -d sift1M      -m large -o $R/sift1M_large      # large path forced, 3 reps
-bash $S/run_pipeline.sh -d sift10M     -m auto  -o $R/sift10M_auto      # → large path, 1 rep (~1.5 min)
-bash $S/run_pipeline.sh -d msTuring10M -m auto  -o $R/msTuring10M_auto  # float32 D=100, 1 rep, DiskANN search
+bash $S/run_pipeline.sh -d sift10M     -m auto  -o $R/sift10M_auto      # → large path, 3 reps (~4 min)
+bash $S/run_pipeline.sh -d msTuring10M -m auto  -o $R/msTuring10M_auto  # float32 D=100, 3 reps, DiskANN search
 python3 $S/judge.py $R/sift1M_auto $R/sift1M_large $R/sift10M_auto $R/msTuring10M_auto --quick   # pre-check
 bash $S/run_pipeline.sh -d sift100M    -m auto  -o $R/sift100M_auto     # 2 rounds, 3 reps (~35 min), DiskANN search
 ```
