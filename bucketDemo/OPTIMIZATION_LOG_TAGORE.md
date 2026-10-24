@@ -1057,3 +1057,64 @@ Findings:
 - **CAGRA ACE is a strong 100M reference**: 738 s on SIFT100M (ours 688 s, TAGORE 2151 s) with better recall at every L (L64 0.870 vs ours 0.841); it reorders + builds 13 partitions × ~15M rows (core + nearest-other-partition augmented copies) with ~5.5 GB of GPU data each — structurally the same idea as our bucketing / TAGORE's 2-cluster membership, but each partition is a full CAGRA build.
 - TAGORE is behind CAGRA on msTuring at equal degree (deg 32 L64: 0.739 vs 0.792 on 1M) and has duplicate edges / self loops / short rows; msTuring (normalized float, D=100) is much harder than SIFT for every builder.
 - Gate references now in place: SIFT → TAGORE (unchanged), msTuring 1M / 10M / 100M → CAGRA degree 32. Our msTuring runs with SIFT-derived parameters (pre-prune recall@10 0.687 on 1M) will likely fail the CAGRA gate until P4 calibrates them.
+
+### #23 — P2.1: float32 large-path crash fixed (ReorderedDatasetBucketReader reads the host copy) (2026-10-24)
+**P2 inventory (grep `kIsInt8Path`, `uint8_t` kernels, `.u8bin` assumptions, `use_dev_cache`):**
+1. ~~float32 large path crashes in Step 6~~ → fixed here.
+2. `prune_windowed.cpp:305/465` GPU chunked prune and the batched GPU prune only for `.u8bin` / `.i8bin` (`prune_windowed_gpu` reads raw u8 bytes) → float32 falls back to the CPU prune (msTuring10M prune 21.5 s vs SIFT10M 3.9 s). P2.2.
+3. `bucket.cu:5090` `use_dev_cache = kIsInt8Path && …`: no GPU bucket cache / blob upload / batched misses / deferred frees for float32 (Step 6 uses fp32 SGEMM via the host Belady cache). P2.3. msTuring10M bucket2 234.9 s (SIFT10M 62.8 s).
+4. **int8 is read as uint8**: `load::read_u8bin_to_f32` / `read_u8bin_chunk_to_f32` / `read_u8bin_sampled_to_f32` (Step 1, Step 4, optimize) and `prune_windowed.cpp:305` convert `.i8bin` bytes as `uint8_t` (negative values become 128…255) → wrong distances for any int8 dataset (none registered yet). P2.4.
+5. `bucket.cu:1427` Step 4 exact fp16 GEMM + top-2 only for 8-bit data (float32 → cuVS brute force / CAGRA); `bucket.cu:6769` parallel raw loader only for uint8 (float reads via `read_fbin_f32`). P2.4.
+6. `bucket.cu:5022` the float Step 6 path is labelled "FP32 TF32": check whether the GEMM really runs in TF32 (not bit-exact fp32) and what that means for exactness. P2.3/P2.4.
+
+**Idea / cause:** msTuring1M `-m large` died with `FATAL: ReorderedDatasetBucketReader: read failed for bucket 537`. Round 1 sets the reader to the in-memory reordered copy (`set_host_data`) and skips `join_reorder_write()` (blob mode), but float32 has no GPU bucket cache, so Step 6 loads buckets through the host Belady cache → `read_bucket()` → reads `data_reordered.fbin` while the async writer is still filling it → short read. Fix (`reordered_dataset_io.hpp`): `read_bucket()` copies from the host copy when one is set (bounds-checked against the host rows), file read otherwise. Implementation (same bytes). uint8 path unchanged: with `h_blob` / `d_blob` set the loader takes `blob_locate`, never `read_bucket` (sift1M_large uploads one blob per round, SIFT100M round 1 copies from the host blob).
+
+Verification: msTuring1M large 21.67 s (bucket2 18.68, prune 1.88), 0 defects, itopk 64 recall 0.692; msTuring1M auto 7.30 s; msTuring10M auto 262.71 s; all six configs rc=0.
+
+**Build time (s, median of reps; sum of all stages)**
+
+| config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 3 | 5.08 | -1.2% | +18.8% | 0.55x | 0.44x | bucket2 5.08 | 4596 | 1.61 |
+| sift1M_large | large | 3 | 8.71 | -3.8% | +10.1% | 0.95x | 0.75x | bucket2 6.94, prune 0.71, optimize_chunked 0.71, translate 0.35 | 1286 | 1.92 |
+| sift10M_auto | large | 3 | 72.20 | -0.6% | +12.4% | 0.34x | 0.59x | bucket2 62.77, prune 3.85, optimize_chunked 2.92, translate 2.62 | 8996 | 11.73 |
+| msTuring1M_auto | resident | 3 | 7.30 | — | — | 0.78x | 0.64x | bucket2 7.30 | 7782 | 1.64 |
+| msTuring10M_auto | large | 3 | 262.71 | — | — | 1.14x | 2.21x | bucket2 234.91, prune 21.46, optimize_chunked 3.01, translate 2.69 | 8996 | 28.02 |
+| sift100M_auto | large | 3 | 709.74 | -3.2% | +77.9% | 0.33x | 0.96x | bucket2 518.76, prune 102.46, optimize_chunked 63.27, translate 23.08 | 14588 | 46.47 |
+
+**bucket2 step breakdown (s)**
+
+| config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | 0.69 | 0.17 | 0.07 | 0.00 | 0.44 | 0.21 | 0.02 | 2.07 | 0.00 | 1.00 |
+| sift1M_large | 0.15 | 0.44 | 0.16 | 0.00 | 1.13 | 0.18 | 0.02 | 3.71 | 0.53 | 0.00 |
+| sift10M_auto | 1.17 | 3.06 | 0.57 | 0.00 | 18.55 | 1.71 | 0.20 | 31.47 | 5.02 | 0.00 |
+| msTuring1M_auto | 0.91 | 0.28 | 0.03 | 0.00 | 0.78 | 0.51 | 0.02 | 3.22 | 0.00 | 1.01 |
+| msTuring10M_auto | 4.83 | 7.65 | 0.40 | 0.00 | 71.47 | 4.75 | 0.28 | 138.45 | 4.50 | 0.00 |
+| sift100M_auto | 11.58 | 75.57 | 9.22 | 0.00 | 146.77 | 30.06 | 4.16 | 208.62 | 26.95 | 0.00 |
+
+**(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
+**(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
+
+| graph | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| TAGORE GNN-Descent k=96 + CAGRA prune, sift1M | 0.9220 / 1947K | 0.9752 / 1033K | 0.9936 / 497K | 0.9985 / 186K | 0.9996 / 68K |
+| CAGRA , sift1M | 0.9305 / 1942K | 0.9782 / 1036K | 0.9948 / 533K | 0.9988 / 189K | 0.9998 / 68K |
+| TAGORE largeIndex Vamana, sift10M | 0.8448 / 1875K | 0.9238 / 1014K | 0.9662 / 482K | 0.9863 / 185K | 0.9950 / 68K |
+| CAGRA , sift10M | 0.8672 / 1868K | 0.9463 / 1013K | 0.9839 / 525K | 0.9959 / 187K | 0.9992 / 68K |
+| TAGORE GNN-Descent k=96 + CAGRA prune (degree 32), msTuring1M | 0.6046 / 1495K | 0.7390 / 798K | 0.8454 / 371K | 0.9150 / 147K | 0.9572 / 47K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring1M | 0.6628 / 1451K | 0.7924 / 735K | 0.8860 / 366K | 0.9449 / 147K | 0.9770 / 47K |
+| TAGORE largeIndex Vamana (degree 32), msTuring10M | 0.5838 / 1445K | 0.7300 / 769K | 0.8446 / 380K | 0.9135 / 152K | 0.9515 / 48K |
+| CAGRA CAGRA NN-Descent 64->32, msTuring10M | 0.6621 / 1418K | 0.7995 / 740K | 0.8922 / 370K | 0.9451 / 150K | 0.9741 / 47K |
+| TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
+| CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
+| ours sift1M_auto | 0.9278 / 1947K | 0.9772 / 1035K | 0.9942 / 488K | 0.9988 / 185K | 0.9997 / 68K |
+| ours sift1M_large | 0.9143 / 2223K | 0.9708 / 1190K | 0.9920 / 562K | 0.9980 / 177K | 0.9995 / 68K |
+| ours sift10M_auto | 0.8319 / 1872K | 0.9258 / 857K | 0.9723 / 497K | 0.9914 / 185K | 0.9981 / 68K |
+| ours msTuring1M_auto | 0.6196 / 1451K | 0.7569 / 765K | 0.8619 / 370K | 0.9270 / 147K | 0.9657 / 47K |
+| ours msTuring10M_auto | 0.5360 / 1407K | 0.6815 / 725K | 0.7928 / 365K | 0.8722 / 150K | 0.9224 / 47K |
+| ours sift100M_auto | 0.7331 / 64K | 0.8402 / 61K | 0.9151 / 37K | 0.9620 / 21K | 0.9853 / 12K |
+
+**Judge: REJECT** — (a) msTuring1M / 10M below the CAGRA degree-32 floor at every itopk (expected: SIFT-derived CENTROID_RATIO / NPROBE, calibration is P4), (b) sift1M_large +3.8 % (Step 2 k-means 0.30 → 0.44 s, untouched code; the best's own reps span 8.21–8.71 s), sift100M_auto +3.2 % (now a median of 3: 726.9 / 700.3 / 709.7 vs the single-run best 687.9; rep 0 has a 26 s stall outside the round-1 loop breakdown), no gain.
+**Kept anyway (P2 correctness fix, not a speed claim):** the changed function is not executed on any uint8 bench config (see above), so (b) cannot come from it, and P2.1 requires the fix. best.json unchanged (`--add-new` skips configs with failures, so the msTuring entries are recorded only once they pass the CAGRA gate: P3/P4). Flagged to the user.
+Observations: msTuring10M is the slowest config relative to references (262.7 s = 1.14× TAGORE, 2.21× CAGRA) → P2.2 / P2.3 are worth it; ours msTuring1M resident beats TAGORE at every itopk but is 0.03–0.04 under CAGRA.

@@ -239,6 +239,17 @@ public:
         std::iota(ids_out.begin(), ids_out.end(), lo);
 
         vecs_out.resize(static_cast<size_t>(n) * static_cast<size_t>(D_));
+        // set_host_data 之后数据在 host 内存里，data_reordered 文件可能还在后台写
+        // (join_reorder_write 只在非 blob 模式下等): 直接从内存拷，不读文件。
+        // 没走 GPU blob/cache 的路径 (如 float32 Step 6) 也会调到这里。
+        if (host_) {
+            if (lo < 0 || hi > host_rows_ || hi < lo)
+                throw std::runtime_error("ReorderedDatasetBucketReader: bucket " + std::to_string(bucket_id) +
+                                         " region out of range of the host data");
+            std::memcpy(vecs_out.data(), host_ + static_cast<size_t>(lo) * static_cast<size_t>(D_),
+                        vecs_out.size() * sizeof(DataT));
+            return;
+        }
         in_.seekg(header_bytes_ + static_cast<std::streamoff>(lo) * D_ * sizeof(DataT));
         in_.read(reinterpret_cast<char*>(vecs_out.data()),
                  static_cast<std::streamsize>(vecs_out.size() * sizeof(DataT)));
