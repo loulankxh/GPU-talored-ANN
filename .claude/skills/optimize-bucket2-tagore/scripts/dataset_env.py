@@ -75,4 +75,5 @@ for k, v in adaptive.items():
     out[k] = os.environ.get(k) or v     # explicit environment value wins
 for k, v in out.items():
     print(f"{k}={v}")
-print(f"ADAPT_NOTE='avg bucket {B}, centroids {int(n / B)}, round records {records_mib / 1024:.1f} GiB'")
+Bf = 1.0 / float(out["CENTROID_RATIO"])
+print(f"ADAPT_NOTE='avg bucket {Bf:.0f}, centroids {int(n / Bf)}, round records {records_mib / 1024:.1f} GiB{" (datasets.json params)" if d.get("params") else ""}'")
