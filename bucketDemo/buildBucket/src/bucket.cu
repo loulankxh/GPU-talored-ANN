@@ -3653,11 +3653,13 @@ static inline void launch_block_topM_resident(
     cudaStream_t stream, const float* d_dots, const float* d_norms_pool, const int32_t* d_ids_pool,
     int32_t* d_out_neighbors, float* d_out_dists,
     int bucket_size, int pool_size, int ldd, int actual_M, int out_ld,
-    const float* d_seed = nullptr)
+    const float* d_seed = nullptr, int row0 = 0)
 {
     constexpr int G = 8;
+    // bucket_size = 本次 dots 分块的行数 (bucket 的 [row0, row0 + bucket_size) 行)
 #define LAUNCH_BLOCK_KOUT(KV) block_topK_from_dots_kernel<(KV), G><<<bucket_size, G * 32, 0, stream>>>( \
-        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld, d_seed)
+        d_dots, d_norms_pool, d_ids_pool, d_out_neighbors, d_out_dists, pool_size, ldd, actual_M, out_ld, d_seed, \
+        nullptr, 0, row0)
     if      (actual_M <= 32)  LAUNCH_BLOCK_KOUT(32);
     else if (actual_M <= 64)  LAUNCH_BLOCK_KOUT(64);
     else if (actual_M <= 128) LAUNCH_BLOCK_KOUT(128);
@@ -4028,11 +4030,19 @@ struct GpuResidentKnn {
         CUDA_CHECK(cudaMemcpy(d_seg_bucket, seg_bucket.data(), n_centroids * S * sizeof(int32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_seg_ofs, seg_ofs.data(), n_centroids * S * sizeof(int32_t), cudaMemcpyHostToDevice));
 
+        // dots 按 query 行分块 (同 out-of-core Step 6 的 kDotsRowTile)：每个 slot 的 dots 不超过
+        // kDotsSlotBytes。不分块时是 max_bucket × max_pool × 4 B / slot，大 bucket + 大 pool 时
+        // 显存爆掉 (msTuring1M B 512 / NPROBE 256: 4643 × 133K × 4 B = 2.5 GB × 4 slot → OOM)。
+        // 默认参数下一块就装下整个 bucket，跟原来完全一样。
+        constexpr size_t kDotsSlotBytes = size_t(512) << 20;
+        const int64_t max_ldd = (max_pool + 3) / 4 * 4;
+        const int64_t row_tile = std::max<int64_t>(1, std::min<int64_t>(max_bucket,
+            static_cast<int64_t>(kDotsSlotBytes / (sizeof(float) * std::max<int64_t>(1, max_ldd)))));
         for (auto& s : slots) {
             ensure_device(s.pool, s.pool_cap, static_cast<size_t>(max_pool) * D);
             ensure_device(s.pool_norms, s.norms_cap, static_cast<size_t>(max_pool));
             ensure_device(s.pool_ids, s.ids_cap, static_cast<size_t>(max_pool));
-            ensure_device(s.dots, s.dots_cap, static_cast<size_t>(max_bucket) * ((max_pool + 3) / 4 * 4));
+            ensure_device(s.dots, s.dots_cap, static_cast<size_t>(row_tile) * max_ldd);
         }
 
         size_t nm = static_cast<size_t>(N) * M;
@@ -4059,29 +4069,32 @@ struct GpuResidentKnn {
                 s.pool, s.pool_norms, s.pool_ids, D);
             CUDA_CHECK(cudaGetLastError());
 
-            // dots (bucket_size, ps) row-major = pool[0:bucket_size] · pool^T
-            float alpha = 1.0f, beta = 0.0f;
-            cublasStatus_t stat;
-            if constexpr (kHalf) {
-                stat = cublasGemmEx(s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                                    ps, bucket_size, D, &alpha,
-                                    s.pool, CUDA_R_16F, D,
-                                    s.pool, CUDA_R_16F, D, &beta,
-                                    s.dots, CUDA_R_32F, ldd,
-                                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            } else {
-                stat = cublasSgemm(s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                                   ps, bucket_size, D, &alpha,
-                                   s.pool, D, s.pool, D, &beta, s.dots, ldd);
-            }
-            if (stat != CUBLAS_STATUS_SUCCESS)
-                throw std::runtime_error("GpuResidentKnn: GEMM failed, status=" + std::to_string(stat));
+            for (int r0 = 0; r0 < bucket_size; r0 += static_cast<int>(row_tile)) {
+                const int rows = std::min(static_cast<int>(row_tile), bucket_size - r0);
+                // dots (rows, ps) row-major = pool[r0:r0+rows] · pool^T
+                float alpha = 1.0f, beta = 0.0f;
+                cublasStatus_t stat;
+                if constexpr (kHalf) {
+                    stat = cublasGemmEx(s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                        ps, rows, D, &alpha,
+                                        s.pool, CUDA_R_16F, D,
+                                        s.pool + static_cast<size_t>(r0) * D, CUDA_R_16F, D, &beta,
+                                        s.dots, CUDA_R_32F, ldd,
+                                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                } else {
+                    stat = cublasSgemm(s.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                                       ps, rows, D, &alpha,
+                                       s.pool, D, s.pool + static_cast<size_t>(r0) * D, D, &beta, s.dots, ldd);
+                }
+                if (stat != CUBLAS_STATUS_SUCCESS)
+                    throw std::runtime_error("GpuResidentKnn: GEMM failed, status=" + std::to_string(stat));
 
-            // pool 前 bucket_size 行就是 query 自己: ids / ‖q‖² 都直接取 pool 的前缀
-            launch_block_topM_resident(s.stream, s.dots, s.pool_norms, s.pool_ids,
-                                       d_cur_n, d_cur_d, bucket_size, ps, ldd, actual_M, /*out_ld=*/M,
-                                       has_run ? d_run_d : nullptr);
-            CUDA_CHECK(cudaGetLastError());
+                // pool 前 bucket_size 行就是 query 自己: ids / ‖q‖² 都直接取 pool 的前缀 (第 r0 + 块内行)
+                launch_block_topM_resident(s.stream, s.dots, s.pool_norms, s.pool_ids,
+                                           d_cur_n, d_cur_d, rows, ps, ldd, actual_M, /*out_ld=*/M,
+                                           has_run ? d_run_d : nullptr, r0);
+                CUDA_CHECK(cudaGetLastError());
+            }
         }
         double t_launch = std::chrono::duration<double>(Clock::now() - t1).count();
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -4102,7 +4115,7 @@ struct GpuResidentKnn {
         double t_merge = std::chrono::duration<double>(Clock::now() - t2).count();
 
         std::cout << "  [GpuResidentKNN] buckets=" << launched << " max_pool=" << max_pool
-                  << " max_bucket=" << max_bucket << " gemm=" << (kHalf ? "FP16-TC" : "FP32")
+                  << " max_bucket=" << max_bucket << " row_tile=" << row_tile << " gemm=" << (kHalf ? "FP16-TC" : "FP32")
                   << " | setup=" << std::fixed << std::setprecision(3) << t_setup
                   << "s loop=" << t_loop << "s (host launch " << t_launch
                   << "s) merge=" << t_merge << "s\n";
