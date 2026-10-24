@@ -4933,10 +4933,12 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
             // D=128 一个 warp 一趟读完一行 (原来逐字节读、逐 half 写要 4 趟)。
             // 对齐: 桶向量区 16B 对齐 (见 DevBucket)、行宽 D 字节是 4 的倍数；
             // B 的行宽 2D 字节是 8 的倍数。
-            const uchar4* src4 = reinterpret_cast<const uchar4*>(src);
+            // int8 按有符号读 (char4)，uint8 按无符号 (uchar4)；原来一律 uchar4，int8 负值读成 128…255
+            using V4 = typename std::conditional<std::is_same<DataT, int8_t>::value, char4, uchar4>::type;
+            const V4* src4 = reinterpret_cast<const V4*>(src);
             __half2* dst2 = reinterpret_cast<__half2*>(dst);
             for (int q = lane; q < (D >> 2); q += 32) {
-                uchar4 u = src4[q];
+                V4 u = src4[q];
                 // 8-bit 值在 fp16 里精确
                 __half2 h01 = __floats2half2_rn(static_cast<float>(u.x), static_cast<float>(u.y));
                 __half2 h23 = __floats2half2_rn(static_cast<float>(u.z), static_cast<float>(u.w));

@@ -65,7 +65,16 @@ inline void read_fbin_f32(const std::string& path,
     require(in.good(), "Failed to read float payload from: " + path);
 }
 
-// .u8bin / .i8bin: header int32 N,D then N*D uint8, convert to float32
+// .i8bin 的字节是有符号 int8：8-bit 读取器按扩展名决定怎么转 float (原来一律按 uint8 转，
+// 负值会变成 128…255；P2.4 2026-10-24)
+inline bool is_i8bin_path(const std::string& path) {
+    return path.size() >= 6 && path.compare(path.size() - 6, 6, ".i8bin") == 0;
+}
+inline float byte_to_f32(uint8_t b, bool is_i8) {
+    return is_i8 ? static_cast<float>(static_cast<int8_t>(b)) : static_cast<float>(b);
+}
+
+// .u8bin / .i8bin: header int32 N,D then N*D uint8 / int8, convert to float32
 inline void read_u8bin_to_f32(const std::string& path,
                               std::vector<float>& out,
                               int32_t& N, int32_t& D) {
@@ -82,7 +91,8 @@ inline void read_u8bin_to_f32(const std::string& path,
     require(in.good(), "Failed to read uint8 payload from: " + path);
 
     out.resize(cnt);
-    for (uint64_t i = 0; i < cnt; ++i) out[i] = static_cast<float>(tmp[i]);
+    const bool i8 = is_i8bin_path(path);
+    for (uint64_t i = 0; i < cnt; ++i) out[i] = byte_to_f32(tmp[i], i8);
 }
 
 // .ibin: header int32 N,D then N*D int32
@@ -165,6 +175,7 @@ inline void read_u8bin_sampled_to_f32(const std::string& path,
     const int64_t chunk_rows = std::max<int64_t>(1, (8 << 20) / row_bytes);
     const int64_t n_chunks = (static_cast<int64_t>(N) + chunk_rows - 1) / chunk_rows;
     const off_t header_bytes = 2 * sizeof(int32_t);
+    const bool i8 = is_i8bin_path(path);
     bool ok = true;
     #pragma omp parallel
     {
@@ -194,7 +205,7 @@ inline void read_u8bin_sampled_to_f32(const std::string& path,
             for (int64_t i = i0; i < i1; ++i) {
                 const uint8_t* src = buf.data() + static_cast<size_t>((sorted_indices[static_cast<size_t>(i)] - r0) * row_bytes);
                 float* dst = out.data() + static_cast<size_t>(i) * D;
-                for (int32_t k = 0; k < D; ++k) dst[k] = static_cast<float>(src[k]);
+                for (int32_t k = 0; k < D; ++k) dst[k] = byte_to_f32(src[k], i8);
             }
         }
     }
@@ -255,7 +266,8 @@ inline void read_u8bin_chunk_to_f32(const std::string& path,
     require(in.good(), "Failed to read chunk from: " + path);
 
     out.resize(cnt);
-    for (uint64_t i = 0; i < cnt; ++i) out[i] = static_cast<float>(tmp[i]);
+    const bool i8 = is_i8bin_path(path);
+    for (uint64_t i = 0; i < cnt; ++i) out[i] = byte_to_f32(tmp[i], i8);
 }
 
 // .ibin 版本：读原始 int32 数据块，转换为 float32
