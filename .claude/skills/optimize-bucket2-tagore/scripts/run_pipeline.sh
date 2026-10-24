@@ -23,7 +23,7 @@ SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT="$(cd "$SKILL/../../.." && pwd)"   # this worktree (/home/lanlu/microBenchmark_tagore)
 BB=$ROOT/bucketDemo/buildBucket
 BIN=$BB/build
-EVAL=/home/lanlu/microBenchmark/bucketDemo/evalCuvs/build/cagra_eval   # shared eval tool (not optimized)
+EVAL=$ROOT/bucketDemo/evalCuvs/build/cagra_eval   # eval tool (not optimized); worktree build: uint8 / int8 / float32 (P1)
 PY=/home/lanlu/miniconda3/envs/cuvs-bench/bin/python
 source "$SKILL/scripts/params.sh"
 
@@ -39,8 +39,6 @@ ENV_OUT=$("$PY" -I "$SKILL/scripts/dataset_env.py" "$DS") || { echo "$ENV_OUT"; 
 eval "$ENV_OUT"
 DSDIR=$DS_DIR
 : "${REPS:=$DEF_REPS}"
-# cagra_eval 目前只读 uint8；其它类型先用 DiskANN CPU 搜索
-[[ $SEARCH == cagra && $DTYPE != uint8 ]] && SEARCH=diskann
 BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
 CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
 echo "[$DS] $DTYPE N=$N D=$DIM reps=$REPS iters=$ITERATIONS ratio=$CENTROID_RATIO nprobe=$NPROBE search=$SEARCH ($ADAPT_NOTE)"

@@ -1016,3 +1016,44 @@ See **Tried & rejected** (#22). Step 6 at 8 GB of cache is past the point where 
 3. **P3** verify uint8 + float32 end to end on HEAD, re-record our bests as 3-run medians, and write `docs/summary_<date>.md` with every dataset × {ours, CAGRA, TAGORE} build + search.
 4. **P4** `docs/dataset_tuning_params.md`: every SIFT100M- / machine-specific tunable, how to re-tune it for a new dataset; then calibrate msTuring to the CAGRA gate as the worked example.
 5. **P5** continue the normal loop (B10 / 1B readiness, A1, B7–B9a, new ideas).
+
+### Phase P1 done — CAGRA + TAGORE build and search references for all six datasets (2026-10-24)
+No change to our pipeline. All runs on GPU 0 under the bench lock (runs/tagoreP1, scripts kept there).
+State: `state/cagra_baseline.json`, `state/tagore_baseline.json` — top level = **degree-32 gate config**, `[ds].configs.deg64` = higher-degree config (reporting only).
+
+**Tooling added:** `bucketDemo/evalCuvs` (worktree copy) `cagra_eval` reads `.u8bin` / `.i8bin` / `.fbin` (templated on the element type) and builds with `--algo ace` (cuVS 26.10 ACE partitioned build, first released in cuVS 25.12, PR #1404 2025-11-13). ACE switched to disk mode by itself on both 100M sets (SIFT100M: 2 → 13 partitions, GPU estimate 75.6 GiB > 15.8); `scripts/cagra_ace_to_graph.py` converts its artifacts (`cagra_graph.npy` in reordered ids + `dataset_mapping.npy`, reordered → original: `out[map[r]] = map[graph[r]]`; verified on SIFT1M forced disk mode = identical recall to in-memory ACE, 0 defects). `run_pipeline.sh` now uses the worktree `cagra_eval` (float32 search on the GPU); `datasets.json`: msTuring1M / 10M `search: cagra`, all msTuring `ref: cagra`. TAGORE on msTuring: D=100 zero-padded to 128 in `tagore_u8bin_to_fvecs.py` / `tagore_prep_clusters.py --pad-dim 128` instead of a DIM_SIZE=100 copy (TAGORE's `cal_power` reduces one 32-lane warp per 32 dims and its GEMM tiles D in SS=128 chunks anyway: padding is exact and nearly free; a D=100 build would hit a partial-warp `__shfl_down_sync`).
+
+| dataset | ref | config | build s | recall@10 itopk/L 32 / 64 / 128 / 256 / 512 | defects / notes |
+|---|---|---|---|---|---|
+| sift1M | CAGRA | NND 64→32 (gate) | 11.54 | 0.930 / 0.978 / 0.995 / 0.999 / 1.000 | 0 |
+| sift1M | CAGRA | NND 128→64 | 12.69 | 0.978 / 0.995 / 0.999 / 1.000 / 1.000 | 0 |
+| sift1M | TAGORE | k96, deg 32 (gate) | 9.18 | 0.922 / 0.975 / 0.994 / 0.999 / 1.000 | 440K dup edges |
+| sift1M | ours (best) | auto | 5.02 | 0.928 / 0.977 / 0.994 / 0.999 / 1.000 | 0 |
+| sift10M | CAGRA | NND 64→32 (gate) | 122.6 | 0.867 / 0.946 / 0.984 / 0.996 / 0.999 | 0 |
+| sift10M | CAGRA | NND 128→64 | 135.5 | 0.948 / 0.984 / 0.997 / 0.999 / 1.000 | 0 |
+| sift10M | TAGORE | largeIndex deg 32 (gate) | 214.5 | 0.845 / 0.924 / 0.966 / 0.986 / 0.995 | short rows padded |
+| sift10M | TAGORE | largeIndex k96 deg 64 | 254.8 (prep 43.3) | 0.913 / 0.970 / 0.991 / 0.998 / 0.999 | 636 self loops, 22.1M pad slots |
+| sift10M | ours (best) | auto (large) | 71.75 | 0.833 / 0.925 / 0.972 / 0.991 / 0.998 | 0 |
+| sift100M (DiskANN L) | CAGRA | ACE 64→32 (gate), 13 partitions, disk | 738.0 (+155 convert) | 0.767 / 0.870 / 0.937 / 0.976 / 0.992 | 0; peak RSS 20.7 GB, GPU 6.2 GB |
+| sift100M | CAGRA | ACE 128→64 | 900.4 (+266 convert) | 0.868 / 0.938 / 0.976 / 0.992 / 0.998 | 0 |
+| sift100M | TAGORE | largeIndex deg 32 (step B) | 2151.3 | 0.769 / 0.862 / 0.924 / 0.962 / 0.982 | 18.8K self loops |
+| sift100M | TAGORE | largeIndex k96 deg 64 | 2570.3 (prep 395.6) | 0.847 / 0.924 / 0.967 / 0.988 / 0.996 | 14.5K self loops, 213M pad slots |
+| sift100M | ours (best) | auto, 2 rounds | 687.9 | 0.733 / 0.841 / 0.916 / 0.962 / 0.985 | 0 |
+| msTuring1M | CAGRA | NND 64→32 (gate) | 11.48 | 0.663 / 0.792 / 0.886 / 0.945 / 0.977 | 0 |
+| msTuring1M | CAGRA | NND 128→64 | 13.75 | 0.787 / 0.891 / 0.952 / 0.982 / 0.995 | 0 |
+| msTuring1M | TAGORE | k96 deg 32 | 9.35 | 0.605 / 0.739 / 0.845 / 0.915 / 0.957 | 473K dup edges |
+| msTuring1M | TAGORE | k96 deg 64 | 9.10 | 0.740 / 0.850 / 0.920 / 0.961 / 0.984 | 1.7M dup edges |
+| msTuring10M | CAGRA | NND 64→32 (gate) | 119.1 | 0.662 / 0.799 / 0.892 / 0.945 / 0.974 | 0 |
+| msTuring10M | CAGRA | NND 128→64 | 140.4 | 0.791 / 0.891 / 0.949 / 0.977 / 0.990 | 0 |
+| msTuring10M | TAGORE | largeIndex deg 32 | 230.9 (prep 36.4) | 0.584 / 0.730 / 0.845 / 0.913 / 0.951 | 9 self loops, 835K pad |
+| msTuring10M | TAGORE | largeIndex k96 deg 64 | 282.8 (prep 37.9) | 0.726 / 0.845 / 0.917 / 0.958 / 0.979 | 2.6M pad |
+| msTuring100M (DiskANN L) | CAGRA | ACE 64→32 (gate), disk | 1205.1 (+162 convert) | 0.630 / 0.751 / 0.846 / 0.910 / 0.951 | 0; segfault at process teardown after ACE completed + committed artifacts |
+| msTuring100M | CAGRA | ACE 128→64 | 1411.5 (+293 convert) | 0.755 / 0.847 / 0.911 / 0.952 / 0.975 | 0 |
+| msTuring100M | TAGORE | largeIndex deg 32 | 2168.6 (prep 341.3) | 0.592 / 0.720 / 0.817 / 0.886 / 0.933 | 607 self loops, 10.7M pad |
+| msTuring100M | TAGORE | largeIndex k96 deg 64 | 2854.5 (prep shared) | 0.754 / 0.846 / 0.908 / 0.946 / 0.971 | 828 self loops, 88.6M pad |
+
+Findings:
+- **Quality target (≈ 0.95 at itopk / L 64)**: met by SIFT1M (all), SIFT10M (CAGRA 0.946 deg 32, ≥ 0.97 deg 64), SIFT100M only near it at degree 64 (CAGRA 0.938, TAGORE 0.924). **msTuring cannot reach it at L 64 with any reference, even at degree 64** (0.85–0.89; 0.95 needs itopk 128 for CAGRA deg 64 on 1M/10M, 256 on 100M). Recorded as is; the gate stays the degree-32 config (user's rule). Flagged to the user.
+- **CAGRA ACE is a strong 100M reference**: 738 s on SIFT100M (ours 688 s, TAGORE 2151 s) with better recall at every L (L64 0.870 vs ours 0.841); it reorders + builds 13 partitions × ~15M rows (core + nearest-other-partition augmented copies) with ~5.5 GB of GPU data each — structurally the same idea as our bucketing / TAGORE's 2-cluster membership, but each partition is a full CAGRA build.
+- TAGORE is behind CAGRA on msTuring at equal degree (deg 32 L64: 0.739 vs 0.792 on 1M) and has duplicate edges / self loops / short rows; msTuring (normalized float, D=100) is much harder than SIFT for every builder.
+- Gate references now in place: SIFT → TAGORE (unchanged), msTuring 1M / 10M / 100M → CAGRA degree 32. Our msTuring runs with SIFT-derived parameters (pre-prune recall@10 0.687 on 1M) will likely fail the CAGRA gate until P4 calibrates them.

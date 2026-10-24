@@ -1,5 +1,5 @@
 {
- "note": "TAGORE (/home/lanlu/Tagore 110d480) built for sm_70 from a patched copy (build-v100/patched-src, scripts/tagore_v100_fix.patch: shared-array bounds check in nn_descent_opt_reverse_sample, wmma accumulator re-layout to the sm_80 element order nn_descent_opt_cal assumes, dis_func pointer fix in gpu_construct); V100 GPU 0 under the bench lock, page cache dropped; 2026-10-22. sift1M/sift10M search = same cagra_eval sweep as ours; sift100M search = diskann_search.py (DiskANN L, medoid entry).",
+ "note": "TAGORE (/home/lanlu/Tagore 110d480) built for sm_70 from a patched copy (build-v100/patched-src, scripts/tagore_v100_fix.patch: shared-array bounds check in nn_descent_opt_reverse_sample, wmma accumulator re-layout to the sm_80 element order nn_descent_opt_cal assumes, dis_func pointer fix in gpu_construct); V100 GPU 0 under the bench lock, page cache dropped; 2026-10-22. sift1M/sift10M search = same cagra_eval sweep as ours; sift100M search = diskann_search.py (DiskANN L, medoid entry). | P1 2026-10-23: msTuring entries (float32 D=100 zero-padded to 128 for TAGORE: its cal_power reduces per 32-lane warp and the GEMM tiles D in SS=128 chunks, so the padding is exact and costs it little), deg64 configs ([ds].configs, k=96 compiled K_SIZE, max_points 1.5M for the k=96 device footprint).",
  "sift1M": {
   "label": "GNN-Descent k=96 + CAGRA prune",
   "index_type": "CAGRA",
@@ -173,6 +173,75 @@
   },
   "inmemory_attempt": {
    "status": "failed: GNN_descent k=64 on 10M needs >16 GB (unchecked cudaMalloc -> illegal memory access, GPU peak 15778 MiB)"
+  },
+  "configs": {
+   "deg64": {
+    "label": "largeIndex Vamana (degree 64)",
+    "index_type": "Vamana (alpha 1.2, variable degree <= 64)",
+    "status": "ok",
+    "config": "largeIndex(devicelist=[0], k=96, m=64, final_degree=64, max_degree=64, alpha=1.2, max_points=1500000, buffer=6, clusters 10 k-means -> 20 after split; pad_dim 128)",
+    "build_s": [
+     254.83
+    ],
+    "build_median_s": 254.83,
+    "prep_s": 43.32,
+    "largeindex_s": 211.51,
+    "prep_detail": {
+     "n": 10000000,
+     "dim": 128,
+     "pad_dim": 128,
+     "clusters_kmeans": 10,
+     "clusters": 20,
+     "max_points": 1500000,
+     "size_min": 787605,
+     "size_max": 1170391,
+     "size_mean": 1000000.0,
+     "norm_factor": 0.1,
+     "kmeans_s": 3.48,
+     "assign_s": 3.93,
+     "split_s": 4.1,
+     "write_s": 30.21,
+     "total_s": 41.72
+    },
+    "gpu_peak_mib": 4886,
+    "peak_rss_gb": 6.42,
+    "search": {
+     "32": 0.91295,
+     "64": 0.96959,
+     "128": 0.99089,
+     "256": 0.99759,
+     "512": 0.99936
+    },
+    "qps": {
+     "32": 1320672.9,
+     "64": 750547.9,
+     "128": 356157.7,
+     "256": 131284.7,
+     "512": 53526.9
+    },
+    "search_tool": "cagra_eval, short rows repeat-padded",
+    "defects": {
+     "bad_ids": 0,
+     "self_loops": 636,
+     "dup_edges": 22059585
+    },
+    "diskann_medoid": {
+     "search": {
+      "32": 0.9207,
+      "64": 0.9708,
+      "128": 0.9911,
+      "256": 0.9977,
+      "512": 0.9995
+     },
+     "qps": {
+      "32": 13717.9,
+      "64": 14776.9,
+      "128": 15182.7,
+      "256": 11517.1,
+      "512": 8390.8
+     }
+    }
+   }
   }
  },
  "sift100M": {
@@ -240,6 +309,372 @@
     "128": 33600.89,
     "256": 19464.43,
     "512": 11059.02
+   }
+  },
+  "configs": {
+   "deg64": {
+    "label": "largeIndex Vamana (degree 64)",
+    "index_type": "Vamana (alpha 1.2, variable degree <= 64)",
+    "status": "ok",
+    "config": "largeIndex(devicelist=[0], k=96, m=64, final_degree=64, max_degree=64, alpha=1.2, max_points=1500000, buffer=30, clusters 100 k-means -> 196 after split; pad_dim 128)",
+    "build_s": [
+     2570.32
+    ],
+    "build_median_s": 2570.32,
+    "prep_s": 395.59,
+    "largeindex_s": 2174.73,
+    "prep_detail": {
+     "n": 100000000,
+     "dim": 128,
+     "pad_dim": 128,
+     "clusters_kmeans": 100,
+     "clusters": 196,
+     "max_points": 1500000,
+     "size_min": 764008,
+     "size_max": 1497941,
+     "size_mean": 1020408.1632653062,
+     "norm_factor": 0.1,
+     "kmeans_s": 65.04,
+     "assign_s": 49.4,
+     "split_s": 56.16,
+     "write_s": 221.96,
+     "total_s": 392.56
+    },
+    "gpu_peak_mib": 14768,
+    "peak_rss_gb": 38.41,
+    "search": {
+     "32": 0.847,
+     "64": 0.9242,
+     "128": 0.9672,
+     "256": 0.9882,
+     "512": 0.9961
+    },
+    "qps": {
+     "32": 63344.7,
+     "64": 43594.8,
+     "128": 24748.9,
+     "256": 12853.3,
+     "512": 5951.2
+    },
+    "search_tool": "DiskANN in-memory (L, medoid entry)",
+    "defects": {
+     "bad_ids": 213193680,
+     "self_loops": 14518,
+     "dup_edges": 197122103
+    }
+   }
+  }
+ },
+ "msTuring1M": {
+  "label": "GNN-Descent k=96 + CAGRA prune (degree 32)",
+  "index_type": "CAGRA",
+  "status": "ok",
+  "config": "GNN_descent(k=96, iters=10) + Pruning(final_degree=32, m=64, 'CAGRA'); in-memory; float32 D=100 zero-padded to 128 (fvecs, prep not in build_s)",
+  "build_s": [
+   9.13,
+   9.35,
+   9.63
+  ],
+  "build_median_s": 9.35,
+  "gnn_descent_s": 3.09,
+  "pruning_s": 1.01,
+  "search": {
+   "32": 0.60461,
+   "64": 0.73904,
+   "128": 0.84539,
+   "256": 0.91502,
+   "512": 0.95716
+  },
+  "qps": {
+   "32": 1494701.5,
+   "64": 797958.4,
+   "128": 370598.1,
+   "256": 147281.5,
+   "512": 46599.2
+  },
+  "search_tool": "cagra_eval (worktree build)",
+  "defects": {
+   "bad_ids": 0,
+   "self_loops": 0,
+   "dup_edges": 473004
+  },
+  "gpu_peak_mib": 2878,
+  "peak_rss_gb": 1.21,
+  "configs": {
+   "deg64": {
+    "label": "GNN-Descent k=96 + CAGRA prune (degree 64)",
+    "index_type": "CAGRA",
+    "status": "ok",
+    "config": "GNN_descent(k=96, iters=10) + Pruning(final_degree=64, m=64, 'CAGRA'); in-memory; float32 D=100 zero-padded to 128 (fvecs, prep not in build_s)",
+    "build_s": [
+     9.1
+    ],
+    "build_median_s": 9.1,
+    "gnn_descent_s": 3.101,
+    "pruning_s": 0.851,
+    "search": {
+     "32": 0.74028,
+     "64": 0.84951,
+     "128": 0.92048,
+     "256": 0.96134,
+     "512": 0.98377
+    },
+    "qps": {
+     "32": 849544.8,
+     "64": 452188.7,
+     "128": 221074.2,
+     "256": 95839.9,
+     "512": 33512.5
+    },
+    "search_tool": "cagra_eval (worktree build)",
+    "defects": {
+     "bad_ids": 0,
+     "self_loops": 0,
+     "dup_edges": 1714711
+    },
+    "gpu_peak_mib": 2878,
+    "peak_rss_gb": 1.21
+   }
+  }
+ },
+ "msTuring10M": {
+  "label": "largeIndex Vamana (degree 32)",
+  "index_type": "Vamana (alpha 1.2, variable degree <= 32)",
+  "status": "ok",
+  "config": "largeIndex(devicelist=[0], k=64, m=64, final_degree=32, max_degree=32, alpha=1.2, max_points=2500000, buffer=6, clusters 10 k-means -> 11 after split; pad_dim 128)",
+  "build_s": [
+   230.88
+  ],
+  "build_median_s": 230.88,
+  "prep_s": 36.4,
+  "largeindex_s": 194.48,
+  "prep_detail": {
+   "n": 10000000,
+   "dim": 100,
+   "pad_dim": 128,
+   "clusters_kmeans": 10,
+   "clusters": 11,
+   "max_points": 2500000,
+   "size_min": 864457,
+   "size_max": 2438701,
+   "size_mean": 1818181.8181818181,
+   "norm_factor": 10.0,
+   "kmeans_s": 2.16,
+   "assign_s": 1.92,
+   "split_s": 2.53,
+   "write_s": 28.06,
+   "total_s": 34.66
+  },
+  "gpu_peak_mib": 7242,
+  "peak_rss_gb": 8.03,
+  "search": {
+   "32": 0.58383,
+   "64": 0.73002,
+   "128": 0.84458,
+   "256": 0.91346,
+   "512": 0.95146
+  },
+  "qps": {
+   "32": 1444722.6,
+   "64": 768853.1,
+   "128": 379875.3,
+   "256": 151685.2,
+   "512": 47868.4
+  },
+  "search_tool": "cagra_eval, short rows repeat-padded",
+  "defects": {
+   "bad_ids": 0,
+   "self_loops": 9,
+   "dup_edges": 835192
+  },
+  "diskann_medoid": {
+   "search": {
+    "32": 0.6609,
+    "64": 0.7738,
+    "128": 0.8595,
+    "256": 0.9178,
+    "512": 0.9522
+   },
+   "qps": {
+    "32": 12804.2,
+    "64": 11979.9,
+    "128": 10372.6,
+    "256": 7977.3,
+    "512": 5789.3
+   }
+  },
+  "configs": {
+   "deg64": {
+    "label": "largeIndex Vamana (degree 64)",
+    "index_type": "Vamana (alpha 1.2, variable degree <= 64)",
+    "status": "ok",
+    "config": "largeIndex(devicelist=[0], k=96, m=64, final_degree=64, max_degree=64, alpha=1.2, max_points=1500000, buffer=6, clusters 10 k-means -> 18 after split; pad_dim 128)",
+    "build_s": [
+     282.8
+    ],
+    "build_median_s": 282.8,
+    "prep_s": 37.9,
+    "largeindex_s": 244.9,
+    "prep_detail": {
+     "n": 10000000,
+     "dim": 100,
+     "pad_dim": 128,
+     "clusters_kmeans": 10,
+     "clusters": 18,
+     "max_points": 1500000,
+     "size_min": 777599,
+     "size_max": 1468625,
+     "size_mean": 1111111.111111111,
+     "norm_factor": 10.0,
+     "kmeans_s": 1.94,
+     "assign_s": 2.01,
+     "split_s": 3.89,
+     "write_s": 28.97,
+     "total_s": 36.81
+    },
+    "gpu_peak_mib": 4886,
+    "peak_rss_gb": 8.03,
+    "search": {
+     "32": 0.72598,
+     "64": 0.84489,
+     "128": 0.91743,
+     "256": 0.95808,
+     "512": 0.97932
+    },
+    "qps": {
+     "32": 788676.0,
+     "64": 427988.1,
+     "128": 213245.7,
+     "256": 93248.7,
+     "512": 33095.3
+    },
+    "search_tool": "cagra_eval, short rows repeat-padded",
+    "defects": {
+     "bad_ids": 0,
+     "self_loops": 4,
+     "dup_edges": 2564620
+    },
+    "diskann_medoid": {
+     "search": {
+      "32": 0.7794,
+      "64": 0.8648,
+      "128": 0.9226,
+      "256": 0.9588,
+      "512": 0.9794
+     },
+     "qps": {
+      "32": 12794.2,
+      "64": 10146.0,
+      "128": 7099.0,
+      "256": 4543.5,
+      "512": 2805.9
+     }
+    }
+   }
+  }
+ },
+ "msTuring100M": {
+  "label": "largeIndex Vamana (degree 32)",
+  "index_type": "Vamana (alpha 1.2, variable degree <= 32)",
+  "status": "ok",
+  "config": "largeIndex(devicelist=[0], k=64, m=64, final_degree=32, max_degree=32, alpha=1.2, max_points=1500000, buffer=30, clusters 100 k-means -> 180 after split; pad_dim 128)",
+  "build_s": [
+   2168.62
+  ],
+  "build_median_s": 2168.62,
+  "prep_s": 341.27,
+  "largeindex_s": 1827.35,
+  "prep_detail": {
+   "n": 100000000,
+   "dim": 100,
+   "pad_dim": 128,
+   "clusters_kmeans": 100,
+   "clusters": 180,
+   "max_points": 1500000,
+   "size_min": 756856,
+   "size_max": 1497201,
+   "size_mean": 1111111.111111111,
+   "norm_factor": 10.0,
+   "kmeans_s": 3.87,
+   "assign_s": 30.91,
+   "split_s": 55.46,
+   "write_s": 248.77,
+   "total_s": 339.01
+  },
+  "gpu_peak_mib": 13682,
+  "peak_rss_gb": 45.88,
+  "search": {
+   "32": 0.5919,
+   "64": 0.7199,
+   "128": 0.8166,
+   "256": 0.8862,
+   "512": 0.9327
+  },
+  "qps": {
+   "32": 30851.9,
+   "64": 19913.2,
+   "128": 11979.2,
+   "256": 6919.8,
+   "512": 3733.1
+  },
+  "search_tool": "DiskANN in-memory (L, medoid entry)",
+  "defects": {
+   "bad_ids": 10697570,
+   "self_loops": 607,
+   "dup_edges": 9143986
+  },
+  "configs": {
+   "deg64": {
+    "label": "largeIndex Vamana (degree 64)",
+    "index_type": "Vamana (alpha 1.2, variable degree <= 64)",
+    "status": "ok",
+    "config": "largeIndex(devicelist=[0], k=96, m=64, final_degree=64, max_degree=64, alpha=1.2, max_points=1500000, buffer=30, clusters 100 k-means -> 180 after split; pad_dim 128)",
+    "build_s": [
+     2854.53
+    ],
+    "build_median_s": 2854.53,
+    "prep_s": 341.27,
+    "largeindex_s": 2513.26,
+    "prep_detail": {
+     "n": 100000000,
+     "dim": 100,
+     "pad_dim": 128,
+     "clusters_kmeans": 100,
+     "clusters": 180,
+     "max_points": 1500000,
+     "size_min": 756856,
+     "size_max": 1497201,
+     "size_mean": 1111111.111111111,
+     "norm_factor": 10.0,
+     "kmeans_s": 3.87,
+     "assign_s": 30.91,
+     "split_s": 55.46,
+     "write_s": 248.77,
+     "total_s": 339.01
+    },
+    "gpu_peak_mib": 13682,
+    "peak_rss_gb": 45.88,
+    "search": {
+     "32": 0.7537,
+     "64": 0.8458,
+     "128": 0.9079,
+     "256": 0.9458,
+     "512": 0.9705
+    },
+    "qps": {
+     "32": 6776.5,
+     "64": 18291.7,
+     "128": 10788.0,
+     "256": 5682.6,
+     "512": 2941.8
+    },
+    "search_tool": "DiskANN in-memory (L, medoid entry)",
+    "defects": {
+     "bad_ids": 88639112,
+     "self_loops": 828,
+     "dup_edges": 81841338
+    },
+    "note": "prep shared with the degree-32 build (same cluster files); prep_s counted in both"
    }
   }
  }

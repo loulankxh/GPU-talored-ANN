@@ -1,5 +1,5 @@
 {
- "note": "cuVS 26.10 CAGRA native build, NN-Descent intermediate_graph_degree=64 -> graph_degree=32, nnd 20 iters, V100 GPU0 (evalCuvs/build/cagra_eval build); search = same cagra_eval search sweep as ours; sift10M search measured 2026-10-21 on evalCuvs/baseline/cagra_sift10M_64_32.bin",
+ "note": "cuVS 26.10 CAGRA native build, NN-Descent intermediate_graph_degree=64 -> graph_degree=32, nnd 20 iters, V100 GPU0 (evalCuvs/build/cagra_eval build); search = same cagra_eval search sweep as ours; sift10M search measured 2026-10-21 on evalCuvs/baseline/cagra_sift10M_64_32.bin | P1 2026-10-23: msTuring + 100M entries, deg64 configs ([ds].configs, reporting only; top level = degree-32 gate config).",
  "sift1M": {
   "build_s": [
    11.5363,
@@ -20,6 +20,39 @@
    "128": 532692.8,
    "256": 189005.7,
    "512": 68163.0
+  },
+  "configs": {
+   "deg64": {
+    "label": "CAGRA NN-Descent 128->64",
+    "config": "cuVS 26.10 cagra::build NN-Descent (20 iters), intermediate 128 -> graph 64, cagra_eval build (1 warmup + reps)",
+    "status": "ok",
+    "build_s": [
+     12.9811,
+     12.6889,
+     12.6941
+    ],
+    "build_median_s": 12.694,
+    "search": {
+     "32": 0.9779,
+     "64": 0.99547,
+     "128": 0.99922,
+     "256": 0.99973,
+     "512": 0.9999
+    },
+    "qps": {
+     "32": 1364444.6,
+     "64": 702328.9,
+     "128": 336622.3,
+     "256": 139074.0,
+     "512": 53557.2
+    },
+    "search_tool": "cagra_eval (worktree build, float32/int8/uint8)",
+    "defects": {
+     "bad_ids": 0,
+     "self_loops": 0,
+     "dup_edges": 0
+    }
+   }
   }
  },
  "sift10M": {
@@ -40,6 +73,298 @@
    "128": 525111.8,
    "256": 186762.8,
    "512": 67934.6
+  },
+  "configs": {
+   "deg64": {
+    "label": "CAGRA NN-Descent 128->64",
+    "config": "cuVS 26.10 cagra::build NN-Descent (20 iters), intermediate 128 -> graph 64, cagra_eval build (1 warmup + reps)",
+    "status": "ok",
+    "build_s": [
+     135.4732
+    ],
+    "build_median_s": 135.473,
+    "search": {
+     "32": 0.94794,
+     "64": 0.98416,
+     "128": 0.99672,
+     "256": 0.99936,
+     "512": 0.99984
+    },
+    "qps": {
+     "32": 1318293.8,
+     "64": 651595.5,
+     "128": 339353.6,
+     "256": 134312.7,
+     "512": 53234.8
+    },
+    "search_tool": "cagra_eval (worktree build, float32/int8/uint8)",
+    "defects": {
+     "bad_ids": 0,
+     "self_loops": 0,
+     "dup_edges": 0
+    }
+   }
+  }
+ },
+ "msTuring1M": {
+  "label": "CAGRA NN-Descent 64->32",
+  "config": "cuVS 26.10 cagra::build NN-Descent (20 iters), intermediate 64 -> graph 32, cagra_eval build (1 warmup + reps)",
+  "status": "ok",
+  "build_s": [
+   11.4748,
+   11.5047,
+   11.3122
+  ],
+  "build_median_s": 11.475,
+  "search": {
+   "32": 0.66277,
+   "64": 0.79237,
+   "128": 0.88602,
+   "256": 0.94492,
+   "512": 0.97703
+  },
+  "qps": {
+   "32": 1451016.5,
+   "64": 734958.4,
+   "128": 365904.7,
+   "256": 147460.0,
+   "512": 46672.6
+  },
+  "search_tool": "cagra_eval (worktree build, float32/int8/uint8)",
+  "defects": {
+   "bad_ids": 0,
+   "self_loops": 0,
+   "dup_edges": 0
+  },
+  "configs": {
+   "deg64": {
+    "label": "CAGRA NN-Descent 128->64",
+    "config": "cuVS 26.10 cagra::build NN-Descent (20 iters), intermediate 128 -> graph 64, cagra_eval build (1 warmup + reps)",
+    "status": "ok",
+    "build_s": [
+     13.9777,
+     13.7483,
+     13.3207
+    ],
+    "build_median_s": 13.748,
+    "search": {
+     "32": 0.78701,
+     "64": 0.89132,
+     "128": 0.95221,
+     "256": 0.98201,
+     "512": 0.9945
+    },
+    "qps": {
+     "32": 811071.1,
+     "64": 432370.2,
+     "128": 210701.2,
+     "256": 91766.0,
+     "512": 32446.0
+    },
+    "search_tool": "cagra_eval (worktree build, float32/int8/uint8)",
+    "defects": {
+     "bad_ids": 0,
+     "self_loops": 0,
+     "dup_edges": 0
+    }
+   }
+  }
+ },
+ "msTuring10M": {
+  "label": "CAGRA NN-Descent 64->32",
+  "config": "cuVS 26.10 cagra::build NN-Descent (20 iters), intermediate 64 -> graph 32, cagra_eval build (1 warmup + reps)",
+  "status": "ok",
+  "build_s": [
+   119.098
+  ],
+  "build_median_s": 119.098,
+  "search": {
+   "32": 0.66214,
+   "64": 0.79949,
+   "128": 0.89222,
+   "256": 0.9451,
+   "512": 0.97415
+  },
+  "qps": {
+   "32": 1418313.6,
+   "64": 740128.7,
+   "128": 370224.0,
+   "256": 150017.6,
+   "512": 47425.1
+  },
+  "search_tool": "cagra_eval (worktree build, float32/int8/uint8)",
+  "defects": {
+   "bad_ids": 0,
+   "self_loops": 0,
+   "dup_edges": 0
+  },
+  "configs": {
+   "deg64": {
+    "label": "CAGRA NN-Descent 128->64",
+    "config": "cuVS 26.10 cagra::build NN-Descent (20 iters), intermediate 128 -> graph 64, cagra_eval build (1 warmup + reps)",
+    "status": "ok",
+    "build_s": [
+     140.4249
+    ],
+    "build_median_s": 140.425,
+    "search": {
+     "32": 0.79066,
+     "64": 0.891,
+     "128": 0.94874,
+     "256": 0.97724,
+     "512": 0.99011
+    },
+    "qps": {
+     "32": 781800.2,
+     "64": 423110.9,
+     "128": 209973.7,
+     "256": 91924.2,
+     "512": 32610.5
+    },
+    "search_tool": "cagra_eval (worktree build, float32/int8/uint8)",
+    "defects": {
+     "bad_ids": 0,
+     "self_loops": 0,
+     "dup_edges": 0
+    }
+   }
+  }
+ },
+ "sift100M": {
+  "label": "CAGRA ACE 64->32",
+  "config": "cuVS 26.10 cagra::build ACE (partitioned, disk mode chosen by cuVS: 13 partitions), intermediate 64 -> graph 32, 1 run; graph converted from ACE artifacts by cagra_ace_to_graph.py (convert_s not in build_s)",
+  "status": "ok",
+  "build_s": [
+   737.9719
+  ],
+  "wall_s": 751.4,
+  "peak_rss_gb": 19.78,
+  "gpu_peak_mib": 6222,
+  "convert_s": 155.49,
+  "search": {
+   "32": 0.7672,
+   "64": 0.8697,
+   "128": 0.9374,
+   "256": 0.9756,
+   "512": 0.9917
+  },
+  "qps": {
+   "32": 62583.4,
+   "64": 56843.3,
+   "128": 33774.9,
+   "256": 20169.6,
+   "512": 11204.4
+  },
+  "search_tool": "DiskANN in-memory (diskann_search.py, L, medoid entry)",
+  "defects": {
+   "bad_ids": 0,
+   "self_loops": 0,
+   "dup_edges": 0
+  },
+  "build_median_s": 737.9719,
+  "configs": {
+   "deg64": {
+    "label": "CAGRA ACE 128->64",
+    "config": "cuVS 26.10 cagra::build ACE (partitioned, disk mode chosen by cuVS: 25 partitions), intermediate 128 -> graph 64, 1 run; graph converted from ACE artifacts by cagra_ace_to_graph.py (convert_s not in build_s)",
+    "status": "ok",
+    "build_s": [
+     900.3593
+    ],
+    "wall_s": 915.21,
+    "peak_rss_gb": 20.57,
+    "gpu_peak_mib": 5782,
+    "convert_s": 266.46,
+    "search": {
+     "32": 0.8682,
+     "64": 0.9379,
+     "128": 0.9755,
+     "256": 0.9921,
+     "512": 0.9977
+    },
+    "qps": {
+     "32": 41476.4,
+     "64": 30172.5,
+     "128": 17508.1,
+     "256": 9888.0,
+     "512": 4672.6
+    },
+    "search_tool": "DiskANN in-memory (diskann_search.py, L, medoid entry)",
+    "defects": {
+     "bad_ids": 0,
+     "self_loops": 0,
+     "dup_edges": 0
+    },
+    "build_median_s": 900.3593
+   }
+  }
+ },
+ "msTuring100M": {
+  "label": "CAGRA ACE 64->32",
+  "config": "cuVS 26.10 cagra::build ACE (partitioned, disk mode chosen by cuVS: 20 partitions), intermediate 64 -> graph 32, 1 run; graph converted from ACE artifacts by cagra_ace_to_graph.py (convert_s not in build_s)",
+  "status": "ok",
+  "build_s": [
+   1205.0791
+  ],
+  "wall_s": 1256.49,
+  "peak_rss_gb": 44.06,
+  "gpu_peak_mib": 9200,
+  "convert_s": 162.41,
+  "search": {
+   "32": 0.6295,
+   "64": 0.7513,
+   "128": 0.8456,
+   "256": 0.91,
+   "512": 0.9511
+  },
+  "qps": {
+   "32": 38610.0,
+   "64": 25784.1,
+   "128": 15580.4,
+   "256": 9250.5,
+   "512": 5161.0
+  },
+  "search_tool": "DiskANN in-memory (diskann_search.py, L, medoid entry)",
+  "defects": {
+   "bad_ids": 0,
+   "self_loops": 0,
+   "dup_edges": 0
+  },
+  "build_median_s": 1205.0791,
+  "note": "cagra_eval segfaulted at teardown after ACE reported completion and committed its artifacts; graph converted and searched normally",
+  "configs": {
+   "deg64": {
+    "label": "CAGRA ACE 128->64",
+    "config": "cuVS 26.10 cagra::build ACE (partitioned, disk mode chosen by cuVS: 25 partitions), intermediate 128 -> graph 64, 1 run; graph converted from ACE artifacts by cagra_ace_to_graph.py (convert_s not in build_s)",
+    "status": "ok",
+    "build_s": [
+     1411.5469
+    ],
+    "wall_s": 1483.46,
+    "peak_rss_gb": 47.38,
+    "gpu_peak_mib": 10508,
+    "convert_s": 292.58,
+    "search": {
+     "32": 0.7548,
+     "64": 0.8473,
+     "128": 0.9111,
+     "256": 0.9517,
+     "512": 0.9749
+    },
+    "qps": {
+     "32": 5041.9,
+     "64": 12481.6,
+     "128": 8944.8,
+     "256": 5489.9,
+     "512": 3138.0
+    },
+    "search_tool": "DiskANN in-memory (diskann_search.py, L, medoid entry)",
+    "defects": {
+     "bad_ids": 0,
+     "self_loops": 0,
+     "dup_edges": 0
+    },
+    "build_median_s": 1411.5469
+   }
   }
  }
 }

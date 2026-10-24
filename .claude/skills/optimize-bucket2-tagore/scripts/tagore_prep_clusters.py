@@ -2,7 +2,7 @@
 """Step B helper: input files for Tagore.largeIndex from our u8bin base, written straight from the u8bin
 (no full fvecs copy). Runs on the GPU (cupy), timed as TAGORE's "prep".
 
-usage: tagore_prep_clusters.py BASE.u8bin OUTDIR [--clusters 100] [--max-points 2500000] [--sample 1000000]
+usage: tagore_prep_clusters.py BASE.{u8bin,i8bin,fbin} OUTDIR [--pad-dim 128] [--clusters 100] [--max-points 2500000] [--sample 1000000]
                                [--iters 20] [--seed 0]
 1. k-means (Lloyd, fp32) on a uniform sample -> centers;
 2. every point -> its 2 nearest distinct centers (GPU GEMM, chunks of 2M);
@@ -13,6 +13,7 @@ usage: tagore_prep_clusters.py BASE.u8bin OUTDIR [--clusters 100] [--max-points 
    members in increasing id order (= largeIndex's clusters[i] order). Vectors are multiplied by the same
    power-of-10 norm_factor GNN_descent applies (largeIndex's f2h has none; raw SIFT values overflow fp16 in
    cal_power), which leaves neighbor order and the alpha test unchanged.
+--pad-dim appends zero columns to the cluster files (L2 unchanged; TAGORE kernels assume D = 128).
 prints JSON: cluster count after split, sizes, norm_factor, per-phase seconds.
 """
 import argparse, json, os, sys, time
@@ -22,12 +23,14 @@ ap = argparse.ArgumentParser()
 ap.add_argument("base"); ap.add_argument("out")
 ap.add_argument("--clusters", type=int, default=100); ap.add_argument("--max-points", type=int, default=2_500_000)
 ap.add_argument("--sample", type=int, default=1_000_000); ap.add_argument("--iters", type=int, default=20)
-ap.add_argument("--seed", type=int, default=0)
+ap.add_argument("--seed", type=int, default=0); ap.add_argument("--pad-dim", type=int, default=0)
 a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
 T = {}; t0 = time.time()
+dt = np.float32 if a.base.endswith(".fbin") else np.int8 if a.base.endswith(".i8bin") else np.uint8
 n, d = (int(x) for x in np.fromfile(a.base, dtype=np.int32, count=2))
-B = np.memmap(a.base, dtype=np.uint8, mode="r", offset=8, shape=(n, d))
+B = np.memmap(a.base, dtype=dt, mode="r", offset=8, shape=(n, d))
+dp = max(d, a.pad_dim)
 
 # norm_factor as in pybind.cu GNN_descent (from the first vector's mean |x|)
 avg = float(np.abs(B[0].astype(np.float32)).mean()); nf = 1.0
@@ -95,7 +98,7 @@ for c in range(KC):
     f = open(os.path.join(a.out, f"cluster{c}"), "wb", buffering=8 << 20)
     f.write(np.uint32(sizes[c]).tobytes()); fs.append(f)
 for s in range(0, n, CH):
-    x = np.asarray(B[s:s + CH], dtype=np.float32) * np.float32(nf)
+    x = np.zeros((min(CH, n - s), dp), dtype=np.float32); x[:, :d] = np.asarray(B[s:s + CH], dtype=np.float32) * np.float32(nf)
     lab2 = np.concatenate([first[s:s + CH], second[s:s + CH]]); rows = np.concatenate([np.arange(x.shape[0])] * 2)
     o = np.lexsort((rows, lab2)); lab2, rows = lab2[o], rows[o]
     cb = np.searchsorted(lab2, np.arange(KC + 1))
@@ -104,6 +107,6 @@ for s in range(0, n, CH):
 for f in fs: f.close()
 T["write_s"] = round(time.time() - t3, 2)
 T["total_s"] = round(time.time() - t0, 2)
-print(json.dumps({"n": n, "dim": d, "clusters_kmeans": K0, "clusters": int(KC), "max_points": a.max_points,
+print(json.dumps({"n": n, "dim": d, "pad_dim": dp, "clusters_kmeans": K0, "clusters": int(KC), "max_points": a.max_points,
                   "size_min": int(sizes.min()), "size_max": int(sizes.max()), "size_mean": float(sizes.mean()),
                   "norm_factor": nf, **T}))
