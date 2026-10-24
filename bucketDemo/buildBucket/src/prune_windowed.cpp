@@ -51,6 +51,7 @@
 #include <omp.h>
 #include <string>
 #include <vector>
+#include <type_traits>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -287,6 +288,7 @@ int main(int argc, char** argv)
         // BucketWindow，剪枝语义不变)，再用一个并行区域处理这一批的全部行。放不进预算时走下面原来
         // 的逐 position 路径 (可能淘汰，需要防御性拷贝)。
         constexpr int32_t kBatch = 64;
+        const int pw_elem = (dataset_ext == ".fbin") ? 4 : 1;   // GPU prune 的向量元素字节数
         const size_t total_window_bytes = static_cast<size_t>(N) *
             (static_cast<size_t>(M_in) * sizeof(int32_t) + static_cast<size_t>(dataset_D_peek) * sizeof(float));
         bool batched = total_window_bytes <= (cache_mb << 20);
@@ -303,13 +305,17 @@ int main(int argc, char** argv)
             const size_t n_cand = static_cast<size_t>(N) * M_in;
             const size_t n_vec  = static_cast<size_t>(N) * D_all;
             const bool u8_data = (dataset_ext == ".u8bin" || dataset_ext == ".i8bin");
+            const bool i8_data = dataset_ext == ".i8bin";
+            const bool f32_data = dataset_ext == ".fbin";   // GPU kernel 直接用 float 向量 (P2.2)
             // GPU 路径只读原始 u8 字节: 先判定，走 GPU 时不再分配 / 转换整份 float 向量
             // (SIFT10M: 5.1 GB 内存 + 一遍转换，GPU kernel 根本不用)
             const int32_t Wmax = static_cast<int32_t>(ck.K) + 1;
-            const bool use_gpu = u8_data &&
-                prune_windowed_gpu::available(N, M_in, D_all, n_buckets, Wmax, output_degree);
+            // BUCKET2_PRUNE_GPU=0: 强制 CPU kernel (对照 / 调试)
+            const bool gpu_off = std::getenv("BUCKET2_PRUNE_GPU") && std::getenv("BUCKET2_PRUNE_GPU")[0] == '0';
+            const bool use_gpu = (u8_data || f32_data) && !gpu_off &&
+                prune_windowed_gpu::available(N, M_in, D_all, n_buckets, Wmax, output_degree, f32_data ? 4 : 1);
             std::unique_ptr<int32_t[]> all_cand_buf(new int32_t[n_cand]);   // 不初始化，pread 直接填
-            std::unique_ptr<float[]>   all_vec_buf(use_gpu ? nullptr : new float[n_vec]);
+            std::unique_ptr<float[]>   all_vec_buf(use_gpu && !f32_data ? nullptr : new float[n_vec]);
             std::unique_ptr<uint8_t[]> raw_u8;   // u8 数据集时保留原始字节给 GPU kernel
             // vector_knn.bin: int64 N + int32 M header (12 B)，之后 (N, M) int32
             parallel_pread(vknn_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)),
@@ -320,10 +326,16 @@ int main(int argc, char** argv)
                 parallel_pread(dataset_path, static_cast<off_t>(2 * sizeof(int32_t)), n_vec, raw_u8.get());
                 if (!use_gpu) {
                     float* out = all_vec_buf.get();
+                    const int8_t* raw_i8 = reinterpret_cast<const int8_t*>(raw_u8.get());
                     #pragma omp parallel for schedule(static)
                     for (int64_t i = 0; i < static_cast<int64_t>(n_vec); ++i)
-                        out[i] = static_cast<float>(raw_u8[static_cast<size_t>(i)]);
+                        out[i] = i8_data ? static_cast<float>(raw_i8[static_cast<size_t>(i)])
+                                         : static_cast<float>(raw_u8[static_cast<size_t>(i)]);
                 }
+            } else if (f32_data) {
+                // .fbin: header int32 N, D 之后就是 (N, D) float，跟 u8 一样并行 pread 直接读进来
+                parallel_pread(dataset_path, static_cast<off_t>(2 * sizeof(int32_t)), n_vec * sizeof(float),
+                               all_vec_buf.get());
             } else {
                 std::vector<float> tmp;
                 int32_t D_tmp = 0;
@@ -368,14 +380,21 @@ int main(int argc, char** argv)
                 // 结果按行块经 pinned 暂存区直接流给 writer (不再先拷进一份 N*out_deg
                 // 的 host buffer 再写)；写盘时间跟后续块的 D2H 重叠
                 double t_sink = 0;
-                prune_windowed_gpu::run(all_cand, raw_u8.get(), N, M_in, D_all,
-                                        offsets_new.data(), n_buckets, win, win_len, Wmax,
-                                        output_degree,
-                                        [&](const uint32_t* rows, int64_t row0, int64_t n) {
-                                            auto tw0 = Clock::now();
-                                            writer.write_rows(rows, row0, n);
-                                            t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
-                                        });
+                auto sink = [&](const uint32_t* rows, int64_t row0, int64_t n) {
+                    auto tw0 = Clock::now();
+                    writer.write_rows(rows, row0, n);
+                    t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
+                };
+                if (f32_data)
+                    prune_windowed_gpu::run<float>(all_cand, all_vec, N, M_in, D_all, offsets_new.data(), n_buckets,
+                                                   win, win_len, Wmax, output_degree, sink);
+                else if (i8_data)
+                    prune_windowed_gpu::run<int8_t>(all_cand, reinterpret_cast<const int8_t*>(raw_u8.get()), N, M_in,
+                                                    D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
+                                                    output_degree, sink);
+                else
+                    prune_windowed_gpu::run<uint8_t>(all_cand, raw_u8.get(), N, M_in, D_all, offsets_new.data(),
+                                                     n_buckets, win, win_len, Wmax, output_degree, sink);
                 t_write += t_sink;
                 t_compute += std::chrono::duration<double>(Clock::now() - tg0).count() - t_sink;
                 min_center_count = max_center_count = 0;
@@ -462,9 +481,10 @@ int main(int argc, char** argv)
         // 显存 / host 内存都只跟块大小有关。原来走下面的逐 position CPU 路径 +
         // Belady cache: SIFT100M 窗口 76.8 GB vs 16 GB 预算，fetch 1181 s / 共 1453 s
         // (缓存反复淘汰 720 万次)。BUCKET2_PRUNE_CHUNKED=0 关掉。
-        if (!batched && (dataset_ext == ".u8bin" || dataset_ext == ".i8bin") &&
+        // float32 (.fbin) 同样走 GPU (P2.2: kernel 按元素类型模板化, fp32 距离)
+        if (!batched && (dataset_ext == ".u8bin" || dataset_ext == ".i8bin" || dataset_ext == ".fbin") &&
             !(std::getenv("BUCKET2_PRUNE_CHUNKED") && std::getenv("BUCKET2_PRUNE_CHUNKED")[0] == '0') &&
-            prune_windowed_gpu::available(1, M_in, dataset_D_peek, n_buckets, static_cast<int32_t>(ck.K) + 1, output_degree)) {
+            prune_windowed_gpu::available(1, M_in, dataset_D_peek, n_buckets, static_cast<int32_t>(ck.K) + 1, output_degree, pw_elem)) {
             auto tg0 = Clock::now();
             const int32_t D_all = dataset_D_peek;
             const int32_t Wmax = static_cast<int32_t>(ck.K) + 1;
@@ -493,24 +513,32 @@ int main(int argc, char** argv)
                     p += r; n -= static_cast<size_t>(r); off += r;
                 }
             };
-            auto load_rows = [&](int64_t lo, int64_t n, int32_t* cand, uint8_t* vec) {
+            auto load_rows = [&](int64_t lo, int64_t n, int32_t* cand, void* vec) {
                 if (lo < 0 || lo + n > N) throw std::runtime_error("prune_windowed: chunk rows out of range");   // bounds check
                 pread_all(fd_k, reinterpret_cast<char*>(cand), static_cast<size_t>(n) * M_in * sizeof(int32_t),
                           static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(lo) * M_in * sizeof(int32_t));
-                pread_all(fd_d, reinterpret_cast<char*>(vec), static_cast<size_t>(n) * D_all,
-                          static_cast<off_t>(2 * sizeof(int32_t)) + static_cast<off_t>(lo) * D_all);
+                pread_all(fd_d, static_cast<char*>(vec), static_cast<size_t>(n) * D_all * pw_elem,
+                          static_cast<off_t>(2 * sizeof(int32_t)) + static_cast<off_t>(lo) * D_all * pw_elem);
             };
             // 块大小: cand + vec 行 ≤ host 预算的一半，且 ≤ 4 GB (显存另有 out / 窗口表)
             const size_t budget = std::min<size_t>((cache_mb << 20) / 2, size_t(4) << 30);
             double t_sink = 0;
             prune_windowed_gpu::ChunkStats cst;
-            prune_windowed_gpu::run_chunked(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
-                                            output_degree, budget, load_rows,
-                                            [&](const uint32_t* rows, int64_t row0, int64_t n) {
-                                                auto tw0 = Clock::now();
-                                                writer.write_rows(rows, row0, n);
-                                                t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
-                                            }, &cst);
+            auto sink = [&](const uint32_t* rows, int64_t row0, int64_t n) {
+                auto tw0 = Clock::now();
+                writer.write_rows(rows, row0, n);
+                t_sink += std::chrono::duration<double>(Clock::now() - tw0).count();
+            };
+            auto chunked = [&](auto* tag) {
+                using T = std::remove_pointer_t<decltype(tag)>;
+                prune_windowed_gpu::run_chunked<T>(N, M_in, D_all, offsets_new.data(), n_buckets, win, win_len, Wmax,
+                                                   output_degree, budget,
+                                                   [&](int64_t lo, int64_t n, int32_t* c, T* v) { load_rows(lo, n, c, v); },
+                                                   sink, &cst);
+            };
+            if (dataset_ext == ".fbin") chunked(static_cast<float*>(nullptr));
+            else if (dataset_ext == ".i8bin") chunked(static_cast<int8_t*>(nullptr));
+            else chunked(static_cast<uint8_t*>(nullptr));
             ::close(fd_k); ::close(fd_d);
             t_write += t_sink;
             t_compute += std::chrono::duration<double>(Clock::now() - tg0).count() - t_sink;

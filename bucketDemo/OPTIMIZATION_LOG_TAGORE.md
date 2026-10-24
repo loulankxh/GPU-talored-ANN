@@ -1118,3 +1118,33 @@ Verification: msTuring1M large 21.67 s (bucket2 18.68, prune 1.88), 0 defects, i
 **Judge: REJECT** — (a) msTuring1M / 10M below the CAGRA degree-32 floor at every itopk (expected: SIFT-derived CENTROID_RATIO / NPROBE, calibration is P4), (b) sift1M_large +3.8 % (Step 2 k-means 0.30 → 0.44 s, untouched code; the best's own reps span 8.21–8.71 s), sift100M_auto +3.2 % (now a median of 3: 726.9 / 700.3 / 709.7 vs the single-run best 687.9; rep 0 has a 26 s stall outside the round-1 loop breakdown), no gain.
 **Kept anyway (P2 correctness fix, not a speed claim):** the changed function is not executed on any uint8 bench config (see above), so (b) cannot come from it, and P2.1 requires the fix. best.json unchanged (`--add-new` skips configs with failures, so the msTuring entries are recorded only once they pass the CAGRA gate: P3/P4). Flagged to the user.
 Observations: msTuring10M is the slowest config relative to references (262.7 s = 1.14× TAGORE, 2.21× CAGRA) → P2.2 / P2.3 are worth it; ours msTuring1M resident beats TAGORE at every itopk but is 0.03–0.04 under CAGRA.
+
+### #24 — P2.2: GPU windowed prune for float32 (kernel + loaders templated on uint8 / int8 / float) (2026-10-24)
+**Idea:** `prune_windowed_gpu` (cuVS `kern_fused_prune`-style warp-per-point windowed CAGRA prune, #76 / #16 / #21) took only raw u8 bytes, so `.fbin` datasets ran the CPU kernel (msTuring10M prune 21.5 s). Templated `prune_kernel<T>`, `run<T>`, `run_chunked<T>` (explicit instantiations uint8_t / int8_t / float; device row copies now by row bytes; `available(..., elem_bytes)`), `prune_windowed.cpp` picks T by extension (`.fbin` → float read with the parallel pread, `.i8bin` → int8 — also the CPU conversion of `.i8bin` in the batched path now reads int8), fp32 distances (exact for 8-bit data as before). New debug switch `BUCKET2_PRUNE_GPU=0` forces the CPU kernel in the batched path. Implementation (same prune rule).
+**Exactness check** (`scratchpad/prune_ref.py`: float64 distances, window = center position + centroid-knn neighbour positions, detour count against all closer in-window candidates, first 32 by (count, rank); 2000 random points): GPU = reference on **100 %** of rows for msTuring1M (float) and SIFT1M (uint8); batched GPU == chunked GPU byte-identical (msTuring1M, `--cache-mb 300` → 95 chunks).
+**New finding — P2.5: the CPU prune kernel deviates from the rule**: CPU batched path = reference on only 33 % (msTuring1M) / 62 % (SIFT1M) of rows. No uint8 bench config uses it (all take batched+GPU or chunked+GPU), but every float32 run did until now — part of msTuring's low recall: msTuring1M large itopk 64 0.692 (CPU prune, #23) → 0.735 (GPU prune). The CPU path remains the fallback (no GPU, `.ibin`, M_in > 64): root cause still open (P2.5).
+
+**Build time (s, median of reps; sum of all stages)**
+
+| config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 3 | 5.10 | -1.6% | +18.5% | 0.56x | 0.44x | bucket2 5.10 | 4748 | 1.61 |
+| sift1M_large | large | 3 | 8.77 | -4.5% | +9.5% | 0.96x | 0.76x | bucket2 6.99, prune 0.71, optimize_chunked 0.72, translate 0.35 | 1286 | 1.90 |
+| sift10M_auto | large | 3 | 70.89 | +1.2% | +14.0% | 0.33x | 0.58x | bucket2 61.67, prune 3.81, optimize_chunked 2.88, translate 2.53 | 8996 | 11.72 |
+| msTuring1M_auto | resident | 3 | 7.21 | — | — | 0.77x | 0.63x | bucket2 7.21 | 7782 | 1.64 |
+| msTuring10M_auto | large | 3 | 238.25 | — | — | 1.03x | 2.00x | bucket2 227.89, prune 4.63, optimize_chunked 2.96, translate 2.64 | 8996 | 28.00 |
+| sift100M_auto | large | 3 | 694.75 | -1.0% | +78.4% | 0.32x | 0.94x | bucket2 504.93, prune 102.29, optimize_chunked 63.79, translate 22.55 | 14588 | 45.92 |
+
+**bucket2 step breakdown (s)**
+| graph | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| ours sift1M_auto | 0.9259 / 1940K | 0.9765 / 1033K | 0.9941 / 510K | 0.9986 / 187K | 0.9997 / 68K |
+| ours sift1M_large | 0.9127 / 2224K | 0.9704 / 1190K | 0.9919 / 561K | 0.9981 / 185K | 0.9995 / 68K |
+| ours sift10M_auto | 0.8347 / 1871K | 0.9258 / 969K | 0.9707 / 536K | 0.9908 / 186K | 0.9978 / 68K |
+| ours msTuring1M_auto | 0.6201 / 1452K | 0.7562 / 733K | 0.8582 / 365K | 0.9259 / 147K | 0.9655 / 47K |
+| ours msTuring10M_auto | 0.5662 / 1427K | 0.7129 / 735K | 0.8234 / 373K | 0.8962 / 151K | 0.9409 / 48K |
+| ours sift100M_auto | 0.7323 / 61K | 0.8407 / 59K | 0.9168 / 36K | 0.9632 / 21K | 0.9853 / 12K |
+msTuring1M large (not in the bench set): 20.56 s (bucket2 18.72, prune 0.77 ← 1.88), itopk 32…512 0.596 / 0.735 / 0.842 / 0.912 / 0.956 (← 0.551 / 0.692 / 0.807 / 0.886 / 0.938).
+
+**Judge: REJECT** — sift1M_large +4.5 % (8.77 vs best 8.39), no gain on an existing best (msTuring has no best entry: still under the CAGRA floor, P4). msTuring10M 262.71 → **238.25 s (−9.3 %)**, prune 21.46 → 4.63 s, recall@10 itopk 64 0.682 → 0.713.
+**A/B for the sift1M_large "regression"** (same session, back to back under the lock): pre-P2 code (aeac5c0, built in the scratchpad) 8.46 / 8.72 / 8.95 → median **8.72 s**; this iteration 8.43 / 8.80 / 8.56 → **8.56 s**. The 8.39 s best was an optimistic run; the uint8 code path is unchanged (#23, #24). **Kept** as the P2.2 port (float gains, uint8 unchanged); sift1M_large and SIFT100M (now 3-run medians) get re-baselined in P3 as planned.
