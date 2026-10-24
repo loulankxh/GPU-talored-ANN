@@ -1175,3 +1175,30 @@ msTuring1M large (not in the bench set): 20.56 s (bucket2 18.72, prune 0.77 ← 
 | ours sift100M_auto | 0.7350 / 65K | 0.8409 / 65K | 0.9155 / 39K | 0.9623 / 23K | 0.9854 / 13K |
 msTuring1M large: 20.56 → **14.37 s** (bucket2 18.72 → 12.55). msTuring10M: 238.25 → **156.66 s (−34 %)** = 0.68× TAGORE, 1.32× CAGRA; Step 6 50.3 s, **Step 4 71.3 s** is now its largest stage (float32 assignment goes through cuVS brute force / CAGRA, the exact fp16 GEMM + top-2 is 8-bit only → P2.4).
 **Judge: REJECT** — only sift1M_large +3.2 % (8.66 s; same drift as #24's A/B: pre-P2 code 8.72 s) and no gain on an existing best. **Kept** (P2.3 port: float −34 %, uint8 unchanged).
+
+### #26 — P2.4a: Step 4 exact fp32 SGEMM + top-2 for float32 (replaces cuVS brute_force) (2026-10-24)
+**Idea:** float32 Step 4 assigned points with `cuvs::neighbors::brute_force` (L2Expanded tiled GEMM + select_k, msTuring10M 40K centroids: 17.2 s/round); the 8-bit path already has an exact fp16 GEMM + warp-per-row top-2 (`step4_top2_kernel`). Added the fp32 twin: `cublasSgemm` per query tile (tile = min(4096, 512 MB / (4·C)) rows, so 400K centroids at 100M stay bounded) + the same top-2 kernel (d = ‖c‖² − 2q·c, ties → smaller centroid id). Same rule (exact 2 nearest centroids); fp32 rounding differs from brute force (no per-row ‖q‖²), so near-equidistant points may pick the other centroid. `BUCKET2_F32_ASSIGN=0` restores brute force. Implementation.
+**Finding (logged, not changed):** bucket2 is not run-to-run deterministic for any dtype: Step 4's balanced assignment (`s2 < 0.8·s1` → second centroid) reads/updates `cluster_sizes` with relaxed atomics inside an OpenMP loop, so the chosen bucket depends on thread timing (that is why `bucket_offsets.bin` differs between two runs of one binary). Making it deterministic would change the assignment rule (algorithm); results only differ in noise (msTuring1M pre-prune recall@10 0.684–0.691 over 5 runs).
+
+**Build time (s, median of reps; sum of all stages)**
+
+| config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 3 | 5.09 | -1.4% | +18.7% | 0.55x | 0.44x | bucket2 5.09 | 5508 | 1.61 |
+| sift1M_large | large | 3 | 8.89 | -6.0% | +8.3% | 0.97x | 0.77x | bucket2 7.02, prune 0.70, optimize_chunked 0.71, translate 0.34 | 1286 | 1.91 |
+| sift10M_auto | large | 3 | 71.36 | +0.5% | +13.4% | 0.33x | 0.58x | bucket2 62.08, prune 3.81, optimize_chunked 2.85, translate 2.60 | 8996 | 11.76 |
+| msTuring1M_auto | resident | 3 | 7.01 | — | — | 0.75x | 0.61x | bucket2 7.01 | 7838 | 1.64 |
+| msTuring10M_auto | large | 3 | 128.35 | — | — | 0.56x | 1.08x | bucket2 118.28, prune 4.57, optimize_chunked 2.93, translate 2.60 | 8996 | 18.39 |
+| sift100M_auto | large | 3 | 691.56 | -0.5% | +78.5% | 0.32x | 0.94x | bucket2 506.20, prune 101.07, optimize_chunked 61.56, translate 21.71 | 14588 | 46.13 |
+
+**bucket2 step breakdown (s)**
+| graph | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| ours sift1M_auto | 0.9275 / 1947K | 0.9767 / 1036K | 0.9944 / 468K | 0.9985 / 186K | 0.9997 / 68K |
+| ours sift1M_large | 0.9135 / 2218K | 0.9709 / 1190K | 0.9920 / 562K | 0.9981 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8330 / 1870K | 0.9247 / 1010K | 0.9721 / 508K | 0.9911 / 183K | 0.9976 / 68K |
+| ours msTuring1M_auto | 0.6236 / 1452K | 0.7574 / 734K | 0.8605 / 365K | 0.9262 / 147K | 0.9654 / 47K |
+| ours msTuring10M_auto | 0.5731 / 1425K | 0.7188 / 735K | 0.8230 / 373K | 0.8961 / 151K | 0.9394 / 48K |
+| ours sift100M_auto | 0.7317 / 62K | 0.8398 / 55K | 0.9164 / 33K | 0.9623 / 19K | 0.9852 / 10K |
+msTuring10M: 156.66 → **128.35 s (−18 %)** = 0.56× TAGORE, 1.08× CAGRA (Step 4 71.3 → 44.7 s: search 17.2 → 8.4 s/round; `read` 3.3 s/round = float base re-read from disk every round, uint8 keeps it in host memory → P2.4b). msTuring1M large 14.37 → 14.09 s. Recall unchanged (msTuring10M itopk 64 0.717 → 0.719).
+**Judge: REJECT** — sift1M_large +6.0 % (8.89 s; #23–#26: 8.71 / 8.77 / 8.66 / 8.89, pre-P2 code 8.72 in #24's A/B; the uint8 Step 4 path is untouched: `kExactF32` is float-only) and no gain on an existing best. **Kept** (P2.4a: float −18 %).

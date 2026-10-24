@@ -1436,6 +1436,15 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         return e ? std::atoll(e) : static_cast<int64_t>(32768);
     }();
     const bool exact_f16 = kExactF16 && n_centroids <= exact_max;
+    // float32 数据: 精确 fp32 SGEMM + 同一个 top-2 kernel (P2.4)，代替 cuVS brute_force
+    // (L2Expanded 分块 GEMM + select_k，msTuring10M 40K centroids 17 s/轮)。同样是精确
+    // top-2；只是 fp32 舍入顺序不同 (不加每行常数 ‖q‖²)，距离几乎相等的点可能换一个 centroid。
+    // query tile 按 dots ≤ 512 MB 定 (centroid 多时 tile 变小)。BUCKET2_F32_ASSIGN=0 关掉。
+    constexpr bool kExactF32 = !is_pq && std::is_same<T, float>::value;
+    const bool exact_f32 = kExactF32 && n_centroids >= 2 &&
+        !(std::getenv("BUCKET2_F32_ASSIGN") && std::getenv("BUCKET2_F32_ASSIGN")[0] == '0');
+    const int64_t f32_tile = std::max<int64_t>(32, std::min<int64_t>(kF16Tile,
+        (int64_t(512) << 20) / (std::max<int64_t>(n_centroids, 1) * static_cast<int64_t>(sizeof(float)))));
     cublasHandle_t f16_cublas = nullptr;
     __half*   d_cent_h  = nullptr;
     float*    d_cnorm   = nullptr;
@@ -1459,11 +1468,21 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             d_cent_f, d_cnorm, n_centroids, static_cast<int>(D));
         CUDA_CHECK(cudaGetLastError());
     }
+    if (exact_f32) {
+        if (cublasCreate(&f16_cublas) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("batch_assign: cublasCreate failed");
+        CUDA_CHECK(cudaMalloc(&d_cnorm, n_centroids * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_f16_dots, f32_tile * n_centroids * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_top2_u32, Nv * TOP_K * sizeof(uint32_t)));
+        step4_row_norms_kernel<<<static_cast<unsigned>((n_centroids + 255) / 256), 256>>>(
+            reinterpret_cast<const float*>(d_centroids), d_cnorm, n_centroids, static_cast<int>(D));
+        CUDA_CHECK(cudaGetLastError());
+    }
     std::optional<cuvs::neighbors::brute_force::index<float, float>> bf_idx;
     int64_t* d_top2_i64 = nullptr;
     std::vector<int64_t> h_top2_i64;
     if constexpr (!is_pq && !kExactF16) {
-        if (use_bf) {
+        if (use_bf && !exact_f32) {
             cuvs::neighbors::brute_force::index_params bp;
             bp.metric = cuvs::distance::DistanceType::L2Expanded;
             bf_idx.emplace(cuvs::neighbors::brute_force::build(res, bp,
@@ -1603,8 +1622,28 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             }
             searched_f16 = true;
         }
+        if (exact_f32) {
+            // 同上，fp32: dots (tn, C) = q_tile · centroidsᵀ，结果走 fp16 路径的下载 / 检查
+            const float alpha = 1.0f, beta = 0.0f;
+            const float* d_q_f = reinterpret_cast<const float*>(d_queries);
+            const float* d_c_f = reinterpret_cast<const float*>(d_centroids);
+            for (int64_t t0 = 0; t0 < batch_size; t0 += f32_tile) {
+                const int64_t tn = std::min(f32_tile, batch_size - t0);
+                cublasStatus_t st = cublasSgemm(f16_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    static_cast<int>(n_centroids), static_cast<int>(tn), static_cast<int>(D), &alpha,
+                    d_c_f, static_cast<int>(D), d_q_f + t0 * D, static_cast<int>(D), &beta,
+                    d_f16_dots, static_cast<int>(n_centroids));
+                if (st != CUBLAS_STATUS_SUCCESS)
+                    throw std::runtime_error("batch_assign: fp32 GEMM failed, status=" + std::to_string(st));
+                const int64_t threads = tn * 32;
+                step4_top2_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
+                    d_f16_dots, d_cnorm, tn, static_cast<int>(n_centroids), d_top2_u32 + t0 * TOP_K);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            searched_f16 = true;   // 跟 fp16 路径共用下载 + 越界检查
+        }
         if constexpr (!is_pq && !kExactF16) {
-            if (use_bf) {
+            if (use_bf && !exact_f32) {
                 cuvs::neighbors::brute_force::search(res, *bf_idx,
                     raft::make_device_matrix_view<const float, int64_t>(
                         d_queries, batch_size, static_cast<int64_t>(D)),
