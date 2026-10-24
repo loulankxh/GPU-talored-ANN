@@ -1,0 +1,29 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 536c373..dafc305 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -5340,8 +5340,14 @@ void build_vector_knn_with_tensorcore(
+     // dots 按 bucket 行分块 (每行的 top-M 互相独立，分块结果完全一样)：dots buffer 只要
+     // kDotsRowTile 行，不随最大 bucket 变大 (参考 TAGORE gpu_construct: 缓冲区按固定上界分配)。
+     // M > 256 的 raft 回退路径不分块 (只在 bucket ≤ 分块行数时可用，见 3e 的检查)。
++    // 分块行数: 至少 256 行，按每 slot 的 dots 预算 (256 MB) 尽量放大——SIFT B 512 (#33) 以后 256 行
++    // 把一半以上的桶切成 2 块，每块一个 GEMM + 一个 top-M launch，而 Step 6 的主线程正是被每桶的
++    // CUDA API 调用卡住 (gpu_submit, #34)。每行的 top-M 互相独立，分块大小不影响结果。
+     constexpr size_t kDotsRowTile = 256;
+-    const size_t dots_rows    = std::min(max_bucket_size, kDotsRowTile);
++    constexpr size_t kDotsSlotBytes = size_t(256) << 20;
++    const size_t dots_ldd_ub  = (max_pool_size_ub + 3) / 4 * 4;
++    const size_t dots_rows    = std::min(max_bucket_size,
++        std::max(kDotsRowTile, kDotsSlotBytes / (std::max<size_t>(1, dots_ldd_ub) * sizeof(GemmOutT))));
+     size_t bytes_dots         = dots_rows * ((max_pool_size_ub + 3) / 4 * 4) * sizeof(GemmOutT);
+     size_t bytes_norms_pool   = max_pool_size_ub * sizeof(float);
+     size_t bytes_ids_bucket   = max_bucket_size * sizeof(int32_t);
+@@ -5407,7 +5413,7 @@ void build_vector_knn_with_tensorcore(
+             + " GB usable. Increase n_centroids (smaller buckets) or lower K.");
+     }
+ 
+-    std::cout << "  [VectorKNN] buffer plan: dots(max)=" << bytes_dots/1e9 << "GB, "
++    std::cout << "  [VectorKNN] buffer plan: dots(max)=" << bytes_dots/1e9 << "GB (rows " << dots_rows << "), "
+               << "per-slot=" << bytes_per_slot/1e9 << "GB × " << num_slots
+               << " + global=" << bytes_global/1e9 << "GB / usable="
+               << usable_bytes/1e9 << "GB"
