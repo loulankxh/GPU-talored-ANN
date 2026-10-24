@@ -6,7 +6,7 @@ Prints DS_DIR, BASE, EXT, DTYPE, N, DIM, DEF_REPS, SEARCH, plus the adaptive par
 exported environment variable (sweeps) > datasets.json "params" (per-dataset calibration, step C) > rules.
 
 Adaptive rules (user decisions 2026-10-22/23; they reproduce the hand-tuned SIFT100M values of #3/#9/#14/#21):
-  CENTROID_RATIO  = 1 / B, B = average bucket size, target 250 points, kept in [128, 512]; B grows beyond 512
+  CENTROID_RATIO  = 1 / B, B = average bucket size, target 512 points (#33, A2; was 250), kept in [128, 512]; B grows beyond 512
                     only when the centroid matrix (N/B x DIM x 4 B) would exceed CENTROID_GPU_MB (huge sets,
                     e.g. SIFT1B) -- semantics unchanged, only the bucket count
   NPROBE          = ceil(POOL_ROWS / B), POOL_ROWS = 20000 rows per query pool ((NPROBE+1) x B ~ constant)
@@ -26,7 +26,7 @@ ITEM = {".u8bin": ("uint8", 1), ".i8bin": ("int8", 1), ".fbin": ("float32", 4)}
 GPU_MB = int(os.environ.get("GPU_MB", 16384))            # V100-SXM2-16GB
 HOST_BUDGET_MB = int(os.environ.get("HOST_BUDGET_MB", 204800))
 CENTROID_GPU_MB = int(os.environ.get("CENTROID_GPU_MB", 1024))
-B_TARGET, B_MIN, B_MAX, POOL_ROWS = 250, 128, 512, 20000
+B_TARGET, B_MIN, B_MAX, POOL_ROWS = 512, 128, 512, 20000   # target 250 -> 512: #33 (A2)
 
 reg = json.load(open(os.path.join(HERE, "datasets.json")))
 name = sys.argv[1] if len(sys.argv) > 1 else ""
