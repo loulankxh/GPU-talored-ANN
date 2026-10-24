@@ -1,0 +1,224 @@
+diff --git a/bucketDemo/buildBucket/src/prune_windowed.cpp b/bucketDemo/buildBucket/src/prune_windowed.cpp
+index 37a1aec..8037f3b 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed.cpp
++++ b/bucketDemo/buildBucket/src/prune_windowed.cpp
+@@ -151,6 +151,9 @@ int main(int argc, char** argv)
+                 "or leave both at their auto default)")
+             ("cache-mb", po::value<size_t>()->default_value(4000),
+                 "Host memory budget (MB) for the Belady bucket cache (candidate rows + vectors)")
++            ("chunk-budget-mb", po::value<size_t>()->default_value(0),
++                "Chunked GPU prune: rows (candidates + vectors) per chunk in MB "
++                "(0 = cache-mb / 2; always capped by free GPU memory)")
+             ("save-npy", po::bool_switch()->default_value(false),
+                 "Also write a .npy alongside the .bin");
+ 
+@@ -168,6 +171,7 @@ int main(int argc, char** argv)
+         const int32_t output_degree   = vm["output-degree"].as<int32_t>();
+         const int32_t order_window_arg= vm["order-window"].as<int32_t>();
+         const size_t cache_mb         = vm["cache-mb"].as<size_t>();
++        const size_t chunk_budget_mb  = vm["chunk-budget-mb"].as<size_t>();
+         const bool save_npy           = vm["save-npy"].as<bool>();
+ 
+         using Clock = std::chrono::steady_clock;
+@@ -520,8 +524,9 @@ int main(int argc, char** argv)
+                 pread_all(fd_d, static_cast<char*>(vec), static_cast<size_t>(n) * D_all * pw_elem,
+                           static_cast<off_t>(2 * sizeof(int32_t)) + static_cast<off_t>(lo) * D_all * pw_elem);
+             };
+-            // 块大小: cand + vec 行 ≤ host 预算的一半，且 ≤ 4 GB (显存另有 out / 窗口表)
+-            const size_t budget = std::min<size_t>((cache_mb << 20) / 2, size_t(4) << 30);
++            // 块大小: cand + vec 行 ≤ host 预算的一半 (pinned 两套 = 整个预算)；run_chunked 再按空闲显存收紧
++            // (原来另有固定 4 GB 上限: SIFT100M 113 块、每行平均装 9.98 次)
++            const size_t budget = chunk_budget_mb > 0 ? (chunk_budget_mb << 20) : (cache_mb << 20) / 2;
+             double t_sink = 0;
+             prune_windowed_gpu::ChunkStats cst;
+             auto sink = [&](const uint32_t* rows, int64_t row0, int64_t n) {
+@@ -546,7 +551,8 @@ int main(int argc, char** argv)
+             t_iter_total += std::chrono::duration<double>(Clock::now() - tg0).count();
+             std::cout << "  mode=chunked+GPU (" << cst.chunks << " chunks, " << cst.loaded_rows << " rows loaded = "
+                       << std::fixed << std::setprecision(2) << static_cast<double>(cst.loaded_rows) / N << " x N, budget "
+-                      << budget / 1e6 << " MB)\n";
++                      << cst.budget_bytes / 1e6 << " MB (asked " << budget / 1e6 << "); plan " << cst.t_plan << " s, load " << cst.t_load << " s (pread " << cst.t_pread << " s), gpu wait "
++                      << cst.t_wait << " s, d2h+write " << cst.t_out << " s)\n";
+             batched = true;   // 跳过下面的逐 position 路径
+         }
+ 
+diff --git a/bucketDemo/buildBucket/src/prune_windowed_gpu.cu b/bucketDemo/buildBucket/src/prune_windowed_gpu.cu
+index 30070fe..40d4b61 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed_gpu.cu
++++ b/bucketDemo/buildBucket/src/prune_windowed_gpu.cu
+@@ -17,6 +17,7 @@
+ // cuVS 26.12 reference: detail/cagra/graph_core.cuh::kern_fused_prune (warp
+ // per node, detours counted against the node's sorted row in shared memory).
+ 
++#include <chrono>
+ #include <cstdint>
+ #include <stdexcept>
+ #include <string>
+@@ -364,6 +365,21 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+     const size_t row_bytes = static_cast<size_t>(M) * sizeof(int32_t) + vec_row;
+     int64_t max_bucket = 0;
+     for (int q = 0; q < n_buckets; ++q) max_bucket = std::max<int64_t>(max_bucket, h_offsets[q + 1] - h_offsets[q]);
++    // 块越大，相邻位置窗口的重叠越多被同一块吃掉、重复装载越少 (SIFT100M: 4 GB 块 9.98 × N 行，
++    // 6 GB 8.41 × N)。显存里是两套行缓冲 + 输出 (每行 out_deg × 4 B) + 窗口表等：按空闲显存的 90%
++    // 收紧调用方给的上限
++    {
++        size_t free_b = 0, total_b = 0;
++        PWG_CHECK(cudaMemGetInfo(&free_b, &total_b));
++        const size_t fixed = h_win.size() * sizeof(int32_t) + h_win_len.size() * sizeof(int32_t)
++                           + static_cast<size_t>(n_buckets) * (sizeof(RowRun) + sizeof(int64_t) + sizeof(uint32_t))
++                           + (size_t(64) << 20);
++        const double per_budget_byte = 2.0 + static_cast<double>(out_deg) * sizeof(uint32_t) / static_cast<double>(row_bytes);
++        const double usable = 0.9 * static_cast<double>(free_b) - static_cast<double>(fixed);
++        const size_t fit = usable > 0 ? static_cast<size_t>(usable / per_budget_byte) : 0;
++        budget_bytes = std::min(budget_bytes, fit);
++        if (stats) stats->budget_bytes = budget_bytes;
++    }
+     // 一个位置的窗口最多 W 个桶，块至少要装得下一个窗口
+     const int64_t cap_rows = std::max<int64_t>(static_cast<int64_t>(budget_bytes / row_bytes),
+                                                static_cast<int64_t>(W) * max_bucket);
+@@ -399,15 +415,46 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+ 
+         // 新读的行直接 pread 进 pinned 缓冲，一次 DMA 上传 (原来 pageable → 64 MB pinned 双缓冲中转，
+         // H2D 只有 ~5 GB/s: SIFT10M 强制分块时 h2d 占 prune 计算的一大半)；大小跟原来的 host 缓冲一样
++        using PClock = std::chrono::steady_clock;
++        auto secs = [](PClock::time_point a, PClock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+         struct PinnedBuf {
+             void* p = nullptr;
+             explicit PinnedBuf(size_t n) { PWG_CHECK(cudaMallocHost(&p, std::max<size_t>(n, 1))); }
+             ~PinnedBuf() { cudaFreeHost(p); }
+         };
+-        PinnedBuf pin_cand(static_cast<size_t>(cap_rows) * M * sizeof(int32_t));
+-        PinnedBuf pin_vec(static_cast<size_t>(cap_rows) * vec_row);
+-        int32_t* h_cand = static_cast<int32_t*>(pin_cand.p);
+-        T* h_vec = static_cast<T*>(pin_vec.p);
++        // 两套 pinned 缓冲 (按块号轮换): 第 k 块的 kernel / DMA 在 GPU 上跑的时候，CPU 已经在
++        // pread 第 k+1 块的新行 (参考 TAGORE largeIndex: GPU 构建跟 CPU 合并经 graph_pool 双缓冲重叠)。
++        // 原来每块 pread → H2D → kernel → D2H 全串行，SIFT100M 113 块里 GPU 那段 ~20 s 都在等。
++        PinnedBuf pin_cand0(static_cast<size_t>(cap_rows) * M * sizeof(int32_t));
++        PinnedBuf pin_vec0(static_cast<size_t>(cap_rows) * vec_row);
++        PinnedBuf pin_cand1(static_cast<size_t>(cap_rows) * M * sizeof(int32_t));
++        PinnedBuf pin_vec1(static_cast<size_t>(cap_rows) * vec_row);
++        int32_t* h_candP[2] = {static_cast<int32_t*>(pin_cand0.p), static_cast<int32_t*>(pin_cand1.p)};
++        T* h_vecP[2] = {static_cast<T*>(pin_vec0.p), static_cast<T*>(pin_vec1.p)};
++        PinnedBuf pin_err(sizeof(int));   // 错误标志异步读回 (pageable 目标会让 memcpyAsync 同步等整条 stream)
++        int* h_err = static_cast<int*>(pin_err.p);
++        *h_err = 0;
++        // 上一块: kernel 已发出、结果还没取 (下一块的 pread 之后再收)
++        struct Inflight { bool active = false; int64_t row0 = 0, n_rows = 0, fresh = 0; double t_plan = 0, t_load = 0; };
++        Inflight inflight;
++        auto finish_inflight = [&] {
++            if (!inflight.active) return;
++            const auto tw0 = PClock::now();
++            PWG_CHECK(cudaStreamSynchronize(stg.st));
++            const auto tw1 = PClock::now();
++            if (*h_err)
++                throw std::runtime_error(*h_err == 2 ? "prune_windowed_gpu: center bucket not loaded in chunk"
++                                                     : "prune_windowed_gpu: fewer than output_degree valid candidates "
++                                                       "(check --output-degree <= M_in and padding)");
++            const int64_t row0 = inflight.row0;
++            stg.d2h_rows(d_out, inflight.n_rows, out_deg, [&](const uint32_t* r, int64_t r0, int64_t n) { sink(r, row0 + r0, n); });
++            if (stats) {
++                stats->chunks++; stats->loaded_rows += inflight.fresh;
++                stats->t_plan += inflight.t_plan; stats->t_load += inflight.t_load;
++                stats->t_wait += secs(tw0, tw1); stats->t_out += secs(tw1, PClock::now());
++            }
++            inflight.active = false;
++        };
+         std::vector<int64_t> cbase(static_cast<size_t>(n_buckets), -1);
+         std::vector<int64_t> prev_cbase(static_cast<size_t>(n_buckets), -1);   // 上一块里桶的行 (在 d_*B[cur ^ 1])
+         std::vector<int32_t> stamp(static_cast<size_t>(n_buckets), -1);
+@@ -416,6 +463,9 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+         int cur = 0;
+         int32_t chunk_id = 0;
+         for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
++            int32_t* h_cand = h_candP[chunk_id & 1];
++            T* h_vec = h_vecP[chunk_id & 1];
++            const auto tc0 = PClock::now();
+             // ---- 并集 U(p0..p1): 加位置直到行数到上限 ----
+             for (int q : prevU) prev_cbase[static_cast<size_t>(q)] = -1;
+             for (int q : U) prev_cbase[static_cast<size_t>(q)] = cbase[static_cast<size_t>(q)];   // 上一块的布局
+@@ -476,19 +526,38 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+                     reinterpret_cast<uint8_t*>(d_vecB[nb]), M, static_cast<int>(vec_row));
+                 PWG_CHECK(cudaGetLastError());
+             }
+-            #pragma omp parallel for schedule(dynamic, 1)
+-            for (int64_t i = 0; i < static_cast<int64_t>(runs.size()); ++i) {
+-                const Run& r = runs[static_cast<size_t>(i)];
+-                const int64_t hd = r.dst - reuse_rows;   // host 缓冲里只放新读的行
+-                load_rows(r.lo, r.n, h_cand + static_cast<size_t>(hd) * M, h_vec + static_cast<size_t>(hd) * D);
+-            }
+             const int64_t fresh_rows = dst - reuse_rows;
+-            // pinned → 直接 DMA (同一 stream: 排在上面的 device 内搬运之后、kernel 之前；
+-            // 下一块重写 h_cand/h_vec 前，本块的 d2h_rows 已经同步过这个 stream)
+-            PWG_CHECK(cudaMemcpyAsync(d_candB[nb] + static_cast<size_t>(reuse_rows) * M, h_cand,
+-                                      static_cast<size_t>(fresh_rows) * M * sizeof(int32_t), cudaMemcpyHostToDevice, stg.st));
+-            PWG_CHECK(cudaMemcpyAsync(d_vecB[nb] + static_cast<size_t>(reuse_rows) * D, h_vec,
+-                                      static_cast<size_t>(fresh_rows) * vec_row, cudaMemcpyHostToDevice, stg.st));
++            const auto tc1 = PClock::now();
++            // 新读的行分组装载: 一组 (~kGroupRows 行，host 缓冲里连续) 读完就发它的 pinned → DMA，
++            // DMA 跟下一组的 pread 重叠 (原来整块读完再一次性 H2D，SIFT100M 每行 ~95 ns 里 H2D 占约 1/3)。
++            // 同一 stream: 排在上面的 device 内搬运之后、kernel 之前；下一块重写 h_cand/h_vec 前，
++            // 本块的 d2h_rows 已经同步过这个 stream
++            constexpr int64_t kGroupRows = int64_t(1) << 19;   // 512K 行 (SIFT: ~200 MB)
++            size_t g0 = 0;
++            while (g0 < runs.size()) {
++                size_t g1 = g0;
++                int64_t grows = 0;
++                while (g1 < runs.size() && (g1 == g0 || grows < kGroupRows)) grows += runs[g1++].n;
++                const auto tp0 = PClock::now();
++                #pragma omp parallel for schedule(dynamic, 1)
++                for (int64_t i = static_cast<int64_t>(g0); i < static_cast<int64_t>(g1); ++i) {
++                    const Run& r = runs[static_cast<size_t>(i)];
++                    const int64_t hd = r.dst - reuse_rows;   // host 缓冲里只放新读的行
++                    load_rows(r.lo, r.n, h_cand + static_cast<size_t>(hd) * M, h_vec + static_cast<size_t>(hd) * D);
++                }
++                if (stats) stats->t_pread += secs(tp0, PClock::now());
++                const int64_t h0 = runs[g0].dst - reuse_rows;
++                PWG_CHECK(cudaMemcpyAsync(d_candB[nb] + static_cast<size_t>(reuse_rows + h0) * M,
++                                          h_cand + static_cast<size_t>(h0) * M,
++                                          static_cast<size_t>(grows) * M * sizeof(int32_t), cudaMemcpyHostToDevice, stg.st));
++                PWG_CHECK(cudaMemcpyAsync(d_vecB[nb] + static_cast<size_t>(reuse_rows + h0) * D,
++                                          h_vec + static_cast<size_t>(h0) * D,
++                                          static_cast<size_t>(grows) * vec_row, cudaMemcpyHostToDevice, stg.st));
++                g0 = g1;
++            }
++            const auto tc2 = PClock::now();
++            // 上一块的结果现在收 (它的 kernel 跟上面的 pread 重叠)；之后 d_out / d_cbase 才能给这一块用
++            finish_inflight();
+             stg.h2d(d_cbase, cbase.data(), cbase.size() * sizeof(int64_t));
+             int32_t* d_cand = d_candB[nb]; T* d_vec = d_vecB[nb];
+             cur = nb;
+@@ -498,17 +567,11 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+                 prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
+                     d_cand, d_vec, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_out, d_err);
+             PWG_CHECK(cudaGetLastError());
+-            int h_err = 0;
+-            PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
+-            PWG_CHECK(cudaStreamSynchronize(stg.st));
+-            if (h_err)
+-                throw std::runtime_error(h_err == 2 ? "prune_windowed_gpu: center bucket not loaded in chunk"
+-                                                    : "prune_windowed_gpu: fewer than output_degree valid candidates "
+-                                                      "(check --output-degree <= M_in and padding)");
+-            stg.d2h_rows(d_out, n_rows, out_deg, [&](const uint32_t* r, int64_t r0, int64_t n) { sink(r, row0 + r0, n); });
+-            if (stats) { stats->chunks++; stats->loaded_rows += fresh_rows; }
++            PWG_CHECK(cudaMemcpyAsync(h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
++            inflight = {true, row0, n_rows, fresh_rows, secs(tc0, tc1), secs(tc1, tc2)};
+             p0 = p1;
+         }
++        finish_inflight();
+     } catch (...) {
+         cleanup();
+         throw;
+diff --git a/bucketDemo/buildBucket/src/prune_windowed_gpu.hpp b/bucketDemo/buildBucket/src/prune_windowed_gpu.hpp
+index 73823d1..e265e02 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed_gpu.hpp
++++ b/bucketDemo/buildBucket/src/prune_windowed_gpu.hpp
+@@ -20,7 +20,7 @@ void run(const int32_t* cand, const T* vec, int64_t N, int M, int D,
+          // 结果按行块交回 (rows 指向 pinned 暂存区，row0 起 n 行，行宽 out_deg)，
+          // 依次递增、覆盖 [0, N)；回调返回后暂存区会被复用
+          const std::function<void(const uint32_t* rows, int64_t row0, int64_t n)>& sink);
+-struct ChunkStats { int64_t chunks = 0, loaded_rows = 0; };
++struct ChunkStats { int64_t chunks = 0, loaded_rows = 0; size_t budget_bytes = 0; double t_plan = 0, t_load = 0, t_pread = 0, t_wait = 0, t_out = 0; };
+ // Same prune, out-of-core: positions are processed in chunks whose window union (rows of the
+ // buckets in the windows of those positions) fits budget_bytes (cand + vec rows); load_rows(lo, n,
+ // cand, vec) must fill n consecutive rows (new ids lo..lo+n) of candidates (int32, M per row) and
