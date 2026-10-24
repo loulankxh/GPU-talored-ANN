@@ -1148,3 +1148,30 @@ msTuring1M large (not in the bench set): 20.56 s (bucket2 18.72, prune 0.77 ← 
 
 **Judge: REJECT** — sift1M_large +4.5 % (8.77 vs best 8.39), no gain on an existing best (msTuring has no best entry: still under the CAGRA floor, P4). msTuring10M 262.71 → **238.25 s (−9.3 %)**, prune 21.46 → 4.63 s, recall@10 itopk 64 0.682 → 0.713.
 **A/B for the sift1M_large "regression"** (same session, back to back under the lock): pre-P2 code (aeac5c0, built in the scratchpad) 8.46 / 8.72 / 8.95 → median **8.72 s**; this iteration 8.43 / 8.80 / 8.56 → **8.56 s**. The 8.39 s best was an optimistic run; the uint8 code path is unchanged (#23, #24). **Kept** as the P2.2 port (float gains, uint8 unchanged); sift1M_large and SIFT100M (now 3-run medians) get re-baselined in P3 as planned.
+
+### #25 — P2.3: Step 6 GPU bucket cache / blob upload / batched misses for float32 (2026-10-24)
+**Idea:** `use_dev_cache` was `kIsInt8Path && …`, so float32 Step 6 copied every pool through the host Belady cache + per-bucket H2D. `devcache_gather_pool_kernel<DataT, OutT>` now also writes fp32 rows (OutT = float, the fp32 GEMM input); `‖row‖²` is computed by lane 0 in exactly `compute_row_norms_kernel`'s order (`s += v*v` per dimension), so the GEMM input and norms are bit-identical to the old per-bucket path. Everything else of the cache (blob upload, Belady dev cache, batched misses, deferred frees, arena reuse — #1/#2/#21) is element-size generic already. Source: the cuVS-loop / #21 cache design (TAGORE `largeIndex` graph_pool idea); class: implementation. fp16 GEMM for float data stays out (would change results without an exact re-rank → would be an A<k>).
+**Check:** float32 bucket2 is not run-to-run deterministic (two runs of the same binary differ already in `bucket_offsets.bin`: Step 4 assignment of float data, cuVS brute force / CAGRA search), so no byte comparison across runs; pre-prune recall@10 msTuring1M large 0.684 (old) vs 0.691 / 0.687 (new, two runs), final itopk 64 0.735 → 0.735.
+
+**Build time (s, median of reps; sum of all stages)**
+
+| config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift1M_auto | resident | 3 | 5.09 | -1.4% | +18.7% | 0.55x | 0.44x | bucket2 5.09 | 5104 | 1.61 |
+| sift1M_large | large | 3 | 8.66 | -3.2% | +10.6% | 0.94x | 0.75x | bucket2 6.88, prune 0.71, optimize_chunked 0.74, translate 0.38 | 1286 | 1.92 |
+| sift10M_auto | large | 3 | 71.71 | +0.1% | +13.0% | 0.33x | 0.58x | bucket2 62.42, prune 3.84, optimize_chunked 2.88, translate 2.59 | 8996 | 11.73 |
+| msTuring1M_auto | resident | 3 | 7.22 | — | — | 0.77x | 0.63x | bucket2 7.22 | 7782 | 1.64 |
+| msTuring10M_auto | large | 3 | 156.66 | — | — | 0.68x | 1.32x | bucket2 146.56, prune 4.59, optimize_chunked 2.94, translate 2.61 | 8996 | 20.65 |
+| sift100M_auto | large | 3 | 695.79 | -1.1% | +78.4% | 0.32x | 0.94x | bucket2 507.01, prune 102.61, optimize_chunked 62.12, translate 22.65 | 14588 | 45.35 |
+
+**bucket2 step breakdown (s)**
+| graph | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|
+| ours sift1M_auto | 0.9277 / 1947K | 0.9768 / 1034K | 0.9939 / 532K | 0.9987 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9136 / 2219K | 0.9702 / 1189K | 0.9921 / 561K | 0.9982 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8327 / 1869K | 0.9252 / 941K | 0.9721 / 526K | 0.9914 / 186K | 0.9978 / 67K |
+| ours msTuring1M_auto | 0.6231 / 1449K | 0.7564 / 754K | 0.8595 / 367K | 0.9261 / 147K | 0.9660 / 47K |
+| ours msTuring10M_auto | 0.5698 / 1429K | 0.7168 / 735K | 0.8229 / 374K | 0.8951 / 151K | 0.9401 / 48K |
+| ours sift100M_auto | 0.7350 / 65K | 0.8409 / 65K | 0.9155 / 39K | 0.9623 / 23K | 0.9854 / 13K |
+msTuring1M large: 20.56 → **14.37 s** (bucket2 18.72 → 12.55). msTuring10M: 238.25 → **156.66 s (−34 %)** = 0.68× TAGORE, 1.32× CAGRA; Step 6 50.3 s, **Step 4 71.3 s** is now its largest stage (float32 assignment goes through cuVS brute force / CAGRA, the exact fp16 GEMM + top-2 is 8-bit only → P2.4).
+**Judge: REJECT** — only sift1M_large +3.2 % (8.66 s; same drift as #24's A/B: pre-P2 code 8.72 s) and no gain on an existing best. **Kept** (P2.3 port: float −34 %, uint8 unchanged).

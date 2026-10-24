@@ -4858,9 +4858,10 @@ __global__ void devcache_scatter_misses_kernel(const char* __restrict__ stage, c
     for (uint64_t i = n16 * 16 + threadIdx.x; i < j.bytes; i += blockDim.x) j.dst[i] = src[i];
 }
 
-template <typename DataT>
+// OutT = __half (8-bit 数据, fp16 Tensor Core GEMM) 或 float (float32 数据, fp32 GEMM; P2.3)。
+template <typename DataT, typename OutT>
 __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
-                                            __half* __restrict__ B, int32_t* __restrict__ ids_pool,
+                                            OutT* __restrict__ B, int32_t* __restrict__ ids_pool,
                                             float* __restrict__ norms_pool, int D)
 {
     const DevPoolJob jb = jobs[blockIdx.x];
@@ -4870,9 +4871,25 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
         const char* rec = static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride;
         const DataT* src = (jb.mode == 1) ? reinterpret_cast<const DataT*>(rec + sizeof(int64_t))
                                           : v + static_cast<int64_t>(r) * D;
-        __half* dst = B + static_cast<int64_t>(jb.dest + r) * D;
+        OutT* dst = B + static_cast<int64_t>(jb.dest + r) * D;
         float acc = 0.f;
-        if (sizeof(DataT) == 1 && (D & 3) == 0) {
+        if constexpr (std::is_same<OutT, float>::value) {
+            // fp32 行原样拷贝；‖row‖² 由 lane 0 按 compute_row_norms_kernel 完全相同的顺序累加
+            // (逐维 s += v*v)，跟不走 dev 缓存时从 d_B 现算的 norms 逐位相同
+            for (int e = lane; e < D; e += 32) dst[e] = static_cast<float>(src[e]);
+            if (lane == 0) {
+                float sq = 0.0f;
+                for (int e = 0; e < D; ++e) {
+                    float x = static_cast<float>(src[e]);
+                    sq += x * x;
+                }
+                norms_pool[jb.dest + r] = sq;
+                ids_pool[jb.dest + r] = (jb.mode == 0) ? jb.ids[r]
+                                      : (jb.mode == 1) ? static_cast<int32_t>(*reinterpret_cast<const int64_t*>(rec))
+                                      : static_cast<int32_t>(jb.gid0 + r);
+            }
+            continue;
+        } else if (sizeof(DataT) == 1 && (D & 3) == 0) {
             // 8-bit 且 D%4==0: 每 lane 一次读 4 个字节 (uchar4)、写 2 个 half2，
             // D=128 一个 warp 一趟读完一行 (原来逐字节读、逐 half 写要 4 趟)。
             // 对齐: 桶向量区 16B 对齐 (见 DevBucket)、行宽 D 字节是 4 的倍数；
@@ -5086,8 +5103,10 @@ void build_vector_knn_with_tensorcore(
     double t_setup_order = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - func_t0).count() - t_setup_bucket_count;
 
-    // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (只在 8-bit 数据、预算 > 0 时用)
-    const bool use_dev_cache = kIsInt8Path && gpu_cache_bytes > 0;
+    // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (8-bit / float32 数据、预算 > 0 时用)
+    // float32 数据也用 (P2.3: gather kernel 写 fp32 行，结果跟逐桶上传路径逐位相同)
+    constexpr bool kDevCacheType = kIsInt8Path || std::is_same<DataT, float>::value;
+    const bool use_dev_cache = kDevCacheType && gpu_cache_bytes > 0;
     // blob 模式: 这一轮的桶数据整块就在 host 内存里 (round 1: 重排后的 raw_host；
     // round 2..t: BucketVectorAccumulator 内存模式的记录缓冲区)，而且放得进 GPU bucket
     // 缓存预算 → 整块上传一次 (pinned 双缓冲)，dev 缓存的 loader 只发出指向 blob
@@ -5124,7 +5143,7 @@ void build_vector_knn_with_tensorcore(
     auto vec_bucket_bytes = [](const VecBucket<DataT>& b) {
         return b.ids.size() * sizeof(int64_t) + b.vecs.size() * sizeof(DataT);
     };
-    // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (只在 8-bit 数据、预算 > 0 时用)
+    // GPU 端 bucket 缓存跟 host 缓存用同一份未来访问表 (8-bit / float32 数据、预算 > 0 时用)
     std::vector<std::vector<int32_t>> future_access_dev;
     if (use_dev_cache) future_access_dev = future_access;
     bucket_order::BeladyBucketCache<VecBucket<DataT>> bucket_cache(
@@ -5867,8 +5886,8 @@ void build_vector_knn_with_tensorcore(
                         if (!jobs_mapped)
                             CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
                                                        cudaMemcpyHostToDevice, streams[slot]));
-                        devcache_gather_pool_kernel<DataT><<<nj, 256, 0, streams[slot]>>>(
-                            jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<__half*>(d_B[slot]),
+                        devcache_gather_pool_kernel<DataT, GemmInT><<<nj, 256, 0, streams[slot]>>>(
+                            jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]),
                             d_ids_pool[slot], d_norms_pool[slot], static_cast<int>(D));
                         CUDA_CHECK(cudaGetLastError());
                         CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));   // job 表读完 (下次重写前等)
@@ -6022,8 +6041,8 @@ void build_vector_knn_with_tensorcore(
             if (!jobs_mapped)
                 CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
                                            cudaMemcpyHostToDevice, streams[slot]));
-            devcache_gather_pool_kernel<DataT><<<nj, 256, 0, streams[slot]>>>(
-                jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<__half*>(d_B[slot]), d_ids_pool[slot],
+            devcache_gather_pool_kernel<DataT, GemmInT><<<nj, 256, 0, streams[slot]>>>(
+                jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]), d_ids_pool[slot],
                 d_norms_pool[slot], static_cast<int>(D));
             CUDA_CHECK(cudaGetLastError());
             // 生产者等 ev_h2d 之后才重写 h_jobs[slot]: 映射模式下 kernel 读完才算完
