@@ -5086,7 +5086,7 @@ void build_vector_knn_with_tensorcore(
               << "  N=" << N << ", D=" << D
               << ", n_centroids=" << n_centroids
               << ", K=" << K << ", M=" << M
-              << ", path=" << (kIsInt8Path ? "INT8 IMMA" : "FP32 TF32") << "\n";
+              << ", path=" << (kIsInt8Path ? "fp16 Tensor Core (8-bit exact)" : "fp32 SGEMM") << "\n";   // V100 没有 TF32
 
     // launch_extract_topM 最大特化档位是 K_OUT=1024；超过会跑错。
     if (M > 1024) {

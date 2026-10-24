@@ -1215,3 +1215,18 @@ Idea: `ooc_host_raw` required 2 × N·D·sizeof ≤ cpu-limit/4 (default 16 GB �
 **Cause found** (`scratchpad/prune_var.py`, SIFT1M large, 3000 points): of 10 886 edges where the CPU fallback and the GPU kernel disagreed, 10 884 were candidates **outside the prune window** (their distance is +inf). The GPU kernel sorts by (dist, original column), the CPU core used an unstable `std::sort` on dist alone, so the +inf group came out in arbitrary order instead of bucket2's KNN rank order. On average 28 of a point's 64 candidates are outside the window and ~12.6 of the 32 kept edges per row are such candidates, so the order matters a lot.
 **Fix:** `sort_row_by_l2` uses `std::stable_sort` (candidates are pushed in column order) → CPU == GPU on **100 %** of rows (SIFT1M uint8) and 99.998 % (msTuring1M float: 17 rows, fp32 near-ties). Affects only the CPU fallback (no GPU, `.ibin`, M_in > 64, `BUCKET2_PRUNE_GPU=0`); no bench config runs it → no timed bench. Implementation (the fallback now follows the GPU kernel's documented rule).
 **Follow-up proposal A4** (Awaiting approval): a prune window covering all of a candidate's probe buckets, so the ~40 % unverified edges get real distances (quality idea, changes the prune result).
+
+### Phase P2 done — every uint8-only path ported to float32 / int8 or has a recorded reason (2026-10-24)
+| P2 inventory item | status |
+|---|---|
+| 1 float32 large-path crash (`ReorderedDatasetBucketReader`) | fixed #23 |
+| 2 GPU windowed prune only for u8 | templated uint8 / int8 / float #24 (msTuring10M prune 21.5 → 4.6 s) |
+| 3 Step 6 GPU bucket cache 8-bit only | float32 #25 (msTuring10M 238 → 157 s) |
+| 4 int8 read as uint8 | fixed #27 (signed loaders + Step 6 gather; GPU prune in #24) |
+| 5a Step 4 exact top-2 8-bit only | fp32 SGEMM + top-2 #26 (157 → 128 s) |
+| 5b float base re-read every Step 4 round | tried #28, −2.7 % (< 3 %), rejected; patch kept |
+| 6 "FP32 TF32" label | V100 has no TF32: the float GEMMs are plain fp32 SGEMM (label fixed in the #29 tree, no behaviour change) |
+| KMeans‖ / centroid KNN fp16 fast path 8-bit only | kept: fp16 is exact only for 8-bit data; for float it would change results (would be an A<k>); float Step 2 is 7.7 s on msTuring10M |
+| CPU prune fallback deviates from the rule (found in #24) | fixed #29 (stable sort), A4 proposed |
+| Step 4 balanced assignment is nondeterministic (all dtypes) | found #26; algorithm property (relaxed atomics in an OpenMP loop), not changed |
+msTuring10M over P2: 262.71 → **128.35 s** (best #26 config; 1.14× → 0.56× TAGORE, 2.21× → 1.08× CAGRA), recall@10 itopk 64 0.682 → 0.719 (CPU-prune fix of #24). uint8 configs unchanged (sift1M_large's 8.39 s best is optimistic: A/B in #24). Next: P3 (end-to-end check of all datasets incl. msTuring100M, 3-run re-baseline, summary).
