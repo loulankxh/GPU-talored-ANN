@@ -1,0 +1,61 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 536c373..bf27d4e 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -4993,6 +4993,56 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+         }
+         return;
+     }
++    if constexpr (sizeof(DataT) == 1) {
++        // 8-bit、D%4==0 且一行 ≤ 32 个 uchar4 (D ≤ 128，每 lane 最多一个)：一个 warp 一次处理 4 行，
++        // 先发 4 个 load 再转换 / 写 / 归约 (原来一 warp 一行、每 lane 只有一个 4 B load 在途，
++        // SIFT10M nsys: ~30 GB/s，262 µs/桶，#34)。每行的运算跟下面的通用路径完全一样 → 结果逐位相同。
++        if ((D & 3) == 0 && (D >> 2) <= 32) {
++            using V4 = typename std::conditional<std::is_same<DataT, int8_t>::value, char4, uchar4>::type;
++            const int q = lane;
++            const bool has_q = q < (D >> 2);
++            constexpr int R = 4;
++            for (int r0 = warp; r0 < jb.count; r0 += R * nwarps) {
++                V4 u[R];
++                #pragma unroll
++                for (int k = 0; k < R; ++k) {
++                    const int r = r0 + k * nwarps;
++                    u[k] = V4{};
++                    if (r < jb.count && has_q) {
++                        const char* rec = static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride;
++                        const DataT* src = (jb.mode == 1) ? reinterpret_cast<const DataT*>(rec + sizeof(int64_t))
++                                                          : v + static_cast<int64_t>(r) * D;
++                        u[k] = reinterpret_cast<const V4*>(src)[q];
++                    }
++                }
++                #pragma unroll
++                for (int k = 0; k < R; ++k) {
++                    const int r = r0 + k * nwarps;
++                    if (r >= jb.count) break;   // warp 内一致
++                    float acc = 0.f;
++                    if (has_q) {
++                        __half2* dst2 = reinterpret_cast<__half2*>(B + static_cast<int64_t>(jb.dest + r) * D);
++                        __half2 h01 = __floats2half2_rn(static_cast<float>(u[k].x), static_cast<float>(u[k].y));
++                        __half2 h23 = __floats2half2_rn(static_cast<float>(u[k].z), static_cast<float>(u[k].w));
++                        dst2[2 * q]     = h01;
++                        dst2[2 * q + 1] = h23;
++                        float2 f01 = __half22float2(h01), f23 = __half22float2(h23);
++                        acc += f01.x * f01.x + f01.y * f01.y + f23.x * f23.x + f23.y * f23.y;
++                    }
++                    #pragma unroll
++                    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
++                    if (lane == 0) {
++                        const char* rec = static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride;
++                        norms_pool[jb.dest + r] = acc;
++                        ids_pool[jb.dest + r] = (jb.mode == 0) ? jb.ids[r]
++                                              : (jb.mode == 1) ? static_cast<int32_t>(*reinterpret_cast<const int64_t*>(rec))
++                                              : static_cast<int32_t>(jb.gid0 + r);
++                    }
++                }
++            }
++            return;
++        }
++    }
+     for (int r = warp; r < jb.count; r += nwarps) {
+         const char* rec = static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride;
+         const DataT* src = (jb.mode == 1) ? reinterpret_cast<const DataT*>(rec + sizeof(int64_t))
