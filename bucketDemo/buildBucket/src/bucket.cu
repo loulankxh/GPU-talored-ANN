@@ -4919,6 +4919,80 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
     const DevPoolJob jb = jobs[blockIdx.x];
     const DataT* v = static_cast<const DataT*>(jb.vecs);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+    if constexpr (std::is_same<OutT, float>::value) {
+        // fp32: 按行块经 shared memory 中转 (行宽 D+1 错开 bank)：global 读写都按扁平下标合并访问，
+        // 每个线程再从 shared 里串行算一行的 ‖row‖²，按 compute_row_norms_kernel 完全相同的顺序累加
+        // (逐维 s += v*v)，跟不走 dev 缓存时从 d_B 现算的 norms 逐位相同。原来一个 warp 一行、lane 0
+        // 串行累加 (31 个 lane 空等、行间 400 B 跨度的非合并读)，这个 kernel 占 msTuring Step 6 GPU
+        // 时间的 41% (nsys, #31)。
+        (void)lane; (void)warp; (void)nwarps;
+        constexpr int kTileFloats = 12288;   // 48 KB
+        __shared__ float tile[kTileFloats];
+        const float* src0 = (jb.mode == 1)
+            ? reinterpret_cast<const float*>(static_cast<const char*>(jb.vecs) + sizeof(int64_t))
+            : reinterpret_cast<const float*>(v);
+        const int src_ld = (jb.mode == 1) ? jb.stride / static_cast<int>(sizeof(float)) : D;
+        float* dst0 = reinterpret_cast<float*>(B) + static_cast<int64_t>(jb.dest) * D;
+        const int n = jb.count, P = D + 1, bd = blockDim.x;
+        const int TR = kTileFloats / P;   // 每块行数 (D=100: 121)
+        auto id_of = [&](int r) -> int32_t {
+            return (jb.mode == 0) ? jb.ids[r]
+                 : (jb.mode == 1) ? static_cast<int32_t>(*reinterpret_cast<const int64_t*>(
+                       static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride))
+                 : static_cast<int32_t>(jb.gid0 + r);
+        };
+        if (TR == 0) {   // D 太大放不下一行: 直接逐线程一行 (慢路径，顺序不变)
+            for (int r = threadIdx.x; r < n; r += bd) {
+                const float* s = src0 + static_cast<int64_t>(r) * src_ld;
+                float* d = dst0 + static_cast<int64_t>(r) * D;
+                float sq = 0.0f;
+                for (int c = 0; c < D; ++c) { float x = s[c]; d[c] = x; sq += x * x; }
+                norms_pool[jb.dest + r] = sq;
+                ids_pool[jb.dest + r] = id_of(r);
+            }
+            return;
+        }
+        for (int t0 = 0; t0 < n; t0 += TR) {
+            const int rows = min(TR, n - t0);
+            const int total = rows * D;
+            const float* s = src0 + static_cast<int64_t>(t0) * src_ld;
+            float* d = dst0 + static_cast<int64_t>(t0) * D;
+            int k = threadIdx.x;
+            for (; k + 3 * bd < total; k += 4 * bd) {   // 4 路展开: 多个 load 在途
+                float x[4];
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const int kk = k + u * bd, r = kk / D, c = kk - r * D;
+                    x[u] = s[r * src_ld + c];
+                }
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const int kk = k + u * bd, r = kk / D, c = kk - r * D;
+                    tile[r * P + c] = x[u];
+                    d[kk] = x[u];
+                }
+            }
+            for (; k < total; k += bd) {
+                const int r = k / D, c = k - r * D;
+                const float x = s[r * src_ld + c];
+                tile[r * P + c] = x;
+                d[k] = x;
+            }
+            __syncthreads();
+            for (int r = threadIdx.x; r < rows; r += bd) {
+                const float* row = tile + r * P;
+                float sq = 0.0f;
+                for (int c = 0; c < D; ++c) {
+                    float x = row[c];
+                    sq += x * x;
+                }
+                norms_pool[jb.dest + t0 + r] = sq;
+                ids_pool[jb.dest + t0 + r] = id_of(t0 + r);
+            }
+            __syncthreads();
+        }
+        return;
+    }
     for (int r = warp; r < jb.count; r += nwarps) {
         const char* rec = static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride;
         const DataT* src = (jb.mode == 1) ? reinterpret_cast<const DataT*>(rec + sizeof(int64_t))
@@ -4926,21 +5000,7 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
         OutT* dst = B + static_cast<int64_t>(jb.dest + r) * D;
         float acc = 0.f;
         if constexpr (std::is_same<OutT, float>::value) {
-            // fp32 行原样拷贝；‖row‖² 由 lane 0 按 compute_row_norms_kernel 完全相同的顺序累加
-            // (逐维 s += v*v)，跟不走 dev 缓存时从 d_B 现算的 norms 逐位相同
-            for (int e = lane; e < D; e += 32) dst[e] = static_cast<float>(src[e]);
-            if (lane == 0) {
-                float sq = 0.0f;
-                for (int e = 0; e < D; ++e) {
-                    float x = static_cast<float>(src[e]);
-                    sq += x * x;
-                }
-                norms_pool[jb.dest + r] = sq;
-                ids_pool[jb.dest + r] = (jb.mode == 0) ? jb.ids[r]
-                                      : (jb.mode == 1) ? static_cast<int32_t>(*reinterpret_cast<const int64_t*>(rec))
-                                      : static_cast<int32_t>(jb.gid0 + r);
-            }
-            continue;
+            // fp32 已在上面按 32 行一组处理
         } else if (sizeof(DataT) == 1 && (D & 3) == 0) {
             // 8-bit 且 D%4==0: 每 lane 一次读 4 个字节 (uchar4)、写 2 个 half2，
             // D=128 一个 warp 一趟读完一行 (原来逐字节读、逐 half 写要 4 趟)。
