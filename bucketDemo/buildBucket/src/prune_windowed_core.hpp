@@ -163,8 +163,11 @@ inline void sort_row_by_l2(
         }
         cands.push_back(Cand{dist, id});
     }
-    std::sort(cands.begin(), cands.end(),
-              [](const Cand& x, const Cand& y) { return x.dist < y.dist; });
+    // stable: 距离相同 (尤其窗口外的 +inf 候选，平均 64 个里 ~28 个) 保持原列顺序 = bucket2 KNN 的
+    // 距离序，跟 GPU kernel 的 (dist, k) 排序一致。原来 std::sort 不稳定，窗口外候选的先后是任意的
+    // (P2.5: CPU 跟 GPU / 规则只有 33–62 % 的行相同，差别几乎全在窗口外候选上)
+    std::stable_sort(cands.begin(), cands.end(),
+                     [](const Cand& x, const Cand& y) { return x.dist < y.dist; });
 
     out_sorted.assign(static_cast<size_t>(M_in), -1);
     for (size_t k = 0; k < cands.size() && k < static_cast<size_t>(M_in); ++k)
