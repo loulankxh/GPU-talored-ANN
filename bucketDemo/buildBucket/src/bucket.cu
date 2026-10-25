@@ -5497,6 +5497,10 @@ void build_vector_knn_with_tensorcore(
     // blob 模式 (数据整块在显存) 没有这个瓶颈，保持原来的 slot 数。
     constexpr int kMinSlotsCacheMiss = 6;
     if (use_dev_cache && !d_blob) target_streams = std::min(MAX_SLOTS, std::max(target_streams, kMinSlotsCacheMiss));
+    // 至少 4 个 slot (显存放得下时): B 512 (#33) 以后 est_blocks/kernel = 128 → OVERSUB 公式只给 2 个，
+    // blob 模式下 GPU 在相邻两个桶之间空等。msTuring10M Step 6 每轮 2 → 4 slot: 17.6 → 15.7 s (#47)
+    constexpr int kMinSlots = 4;
+    target_streams = std::min(MAX_SLOTS, std::max(target_streams, kMinSlots));
 
     // 内存上限：从 target_streams 往下试，挑能装下的最大值
     int num_slots = 1;
