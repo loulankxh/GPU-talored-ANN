@@ -1,0 +1,279 @@
+diff --git a/bucketDemo/buildBucket/src/prune_windowed_gpu.cu b/bucketDemo/buildBucket/src/prune_windowed_gpu.cu
+index 30070fe..c5c602e 100644
+--- a/bucketDemo/buildBucket/src/prune_windowed_gpu.cu
++++ b/bucketDemo/buildBucket/src/prune_windowed_gpu.cu
+@@ -17,6 +17,8 @@
+ // cuVS 26.12 reference: detail/cagra/graph_core.cuh::kern_fused_prune (warp
+ // per node, detours counted against the node's sorted row in shared memory).
+ 
++#include <iostream>
++#include <cstdlib>
+ #include <cstdint>
+ #include <stdexcept>
+ #include <string>
+@@ -58,6 +60,132 @@ __device__ __forceinline__ bool in_window(const int32_t* __restrict__ win, int w
+     return lo < wlen && win[lo] == q;
+ }
+ 
++// ---- A1-L (用户批准的 A1，大路径): 窗口内 local join，prune 之前精修中心点自己的候选行 ----
++// 点 a 的候选 = a 的前 S 个邻居 u 各自的前 S 个邻居 v (2 跳)，只取窗口里已装入的 (u、v 都在窗口)；
++// 算精确距离，比 a 的窗口内原候选里最远的还近才参与；窗口内部分按距离取前 m_in 个 (m_in = 原窗口内
++// 候选数，不变)，窗口外的原候选原样接在后面 (prune 本来就把它们当 +inf 排最后)。结果写到 own
++// (按 a - row0 行)，prune_kernel 只对 a 自己的行用它，别的点的行 (detour 计数) 仍是原表。
++struct A1LCounters { unsigned long long points, cand, pass, inserted, dbg[6]; };
++constexpr int kA1LMaxS = 16;
++template <typename T>
++__global__ void __launch_bounds__(kWarpsPerBlock * 32) a1l_window_join_kernel(
++    const int32_t* __restrict__ cand, const T* __restrict__ vec, const uint32_t* __restrict__ offsets,
++    const int32_t* __restrict__ win, const int32_t* __restrict__ win_len, const int64_t* __restrict__ cbase,
++    int64_t row0, int64_t n_rows, int M, int D, int n_buckets, int W, int S,
++    int32_t* __restrict__ own, A1LCounters* __restrict__ ctr)
++{
++    constexpr int kC = kA1LMaxS * kA1LMaxS;
++    __shared__ float   s_od[kWarpsPerBlock][kMaxM];
++    __shared__ int32_t s_oid[kWarpsPerBlock][kMaxM];
++    __shared__ float   s_cd[kWarpsPerBlock][kC];
++    __shared__ int32_t s_cid[kWarpsPerBlock][kC];
++    __shared__ int s_n[kWarpsPerBlock];
++    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int64_t a = row0 + static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + w;
++    if (a >= row0 + n_rows) return;
++    const uint32_t total = offsets[n_buckets];
++    const int p = find_pos(offsets, n_buckets, static_cast<uint32_t>(a));
++    const int32_t* wp = win + static_cast<int64_t>(p) * W;
++    const int wl = win_len[p];
++    auto row_of = [&](int q, uint32_t id) { return cbase[q] + (static_cast<int64_t>(id) - offsets[q]); };
++    // 窗口里已装入的点 → 行号，否则 -1
++    auto loaded_row = [&](int32_t id) -> int64_t {
++        if (id < 0 || static_cast<uint32_t>(id) >= total) return -1;
++        const int q = find_pos(offsets, n_buckets, static_cast<uint32_t>(id));
++        if (!in_window(wp, wl, q) || cbase[q] < 0) return -1;
++        return row_of(q, static_cast<uint32_t>(id));
++    };
++    int32_t* orow = own + (a - row0) * M;
++    if (cbase[p] < 0) {   // center not loaded (prune_kernel reports the error)
++        for (int k = lane; k < M; k += 32) orow[k] = -1;
++        return;
++    }
++    const int64_t arow = row_of(p, static_cast<uint32_t>(a));
++    const T* va = vec + arow * D;
++    auto dist_to = [&](int64_t r) {   // 一个 lane 算一整个距离 (跟 prune_kernel 同样的逐维顺序)
++        const T* vc = vec + r * D;
++        float acc = 0.f;
++        for (int d = 0; d < D; ++d) { float df = static_cast<float>(va[d]) - static_cast<float>(vc[d]); acc += df * df; }
++        return acc;
++    };
++    // 原候选: 窗口内的算距离，窗口外的 +inf
++    float kth = -INFINITY;
++    int m_in = 0;
++    for (int k = lane; k < kMaxM; k += 32) {
++        float d = INFINITY; int32_t id = -1;
++        if (k < M) {
++            id = cand[arow * M + k];
++            const int64_t r = loaded_row(id);
++            if (r >= 0) d = dist_to(r);
++        }
++        s_od[w][k] = d; s_oid[w][k] = id;
++        if (d < INFINITY) { kth = fmaxf(kth, d); ++m_in; }
++    }
++    #pragma unroll
++    for (int off = 16; off > 0; off >>= 1) {
++        kth = fmaxf(kth, __shfl_xor_sync(0xffffffffu, kth, off));
++        m_in += __shfl_xor_sync(0xffffffffu, m_in, off);
++    }
++    if (lane == 0) s_n[w] = 0;
++    __syncwarp();
++    // 2 跳候选 (前 S 个窗口内邻居 u 的前 S 个邻居)
++    const int nc = S * S;
++    for (int c = lane; c < nc; c += 32) {
++        const int32_t u = s_oid[w][c / S];
++        const int64_t ur = (s_od[w][c / S] < INFINITY) ? loaded_row(u) : -1;
++        if (ur < 0) continue;
++        atomicAdd(&ctr->dbg[0], 1ull);
++        const int32_t v = cand[ur * M + (c % S)];
++        if (v < 0 || v == static_cast<int32_t>(a)) continue;
++        atomicAdd(&ctr->dbg[1], 1ull);
++        bool dup = false;
++        for (int k = 0; k < M && !dup; ++k) dup = (s_oid[w][k] == v);
++        if (dup) continue;
++        atomicAdd(&ctr->dbg[2], 1ull);
++        const int64_t vr = loaded_row(v);
++        if (vr < 0) continue;
++        atomicAdd(&ctr->dbg[3], 1ull);
++        const float d = dist_to(vr);
++        if (!(d < kth)) continue;
++        atomicAdd(&ctr->dbg[4], 1ull);
++        const int slot = atomicAdd(&s_n[w], 1);
++        if (slot < kC) { s_cid[w][slot] = v; s_cd[w][slot] = d; }
++    }
++    __syncwarp();
++    const int np = min(s_n[w], kC);
++    for (int i = lane; i < np; i += 32) {   // 候选之间去重 (同一个 v 距离相同，留最前的)
++        const int32_t v = s_cid[w][i];
++        for (int o = 0; o < i; ++o) if (s_cid[w][o] == v) { s_cd[w][i] = INFINITY; break; }
++    }
++    __syncwarp();
++    // 窗口内并集按 (距离, 原表在前, 下标) 取前 m_in 个，依次写到 orow[0..m_in)
++    int ins = 0;
++    const int tot = M + np;
++    for (int e = lane; e < tot; e += 32) {
++        const bool orig = e < M;
++        const float d = orig ? s_od[w][e] : s_cd[w][e - M];
++        if (!(d < INFINITY)) continue;
++        const int32_t id = orig ? s_oid[w][e] : s_cid[w][e - M];
++        int rank = 0;
++        for (int o = 0; o < tot; ++o) {
++            const float od = o < M ? s_od[w][o] : s_cd[w][o - M];
++            rank += (od < d) || (od == d && o < e);
++        }
++        if (rank < m_in) { orow[rank] = id; if (!orig) ++ins; }
++    }
++    // 窗口外的原候选按原顺序接在后面
++    if (lane == 0) {
++        int pos = m_in;
++        for (int k = 0; k < M; ++k) if (!(s_od[w][k] < INFINITY)) orow[pos++] = s_oid[w][k];
++    }
++    #pragma unroll
++    for (int off = 16; off > 0; off >>= 1) ins += __shfl_xor_sync(0xffffffffu, ins, off);
++    if (lane == 0) {
++        atomicAdd(&ctr->points, 1ull); atomicAdd(&ctr->cand, static_cast<unsigned long long>(nc));
++        atomicAdd(&ctr->pass, static_cast<unsigned long long>(np)); atomicAdd(&ctr->inserted, static_cast<unsigned long long>(ins));
++    }
++}
++
+ template <typename T>
+ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
+     const int32_t* __restrict__ cand,      // (N, M)
+@@ -69,7 +197,8 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
+     int64_t row0, int64_t n_rows,          // points to prune: [row0, row0 + n_rows) (new ids)
+     int M, int D, int n_buckets, int W, int out_deg,
+     uint32_t* __restrict__ out,            // (n_rows, out_deg)
+-    int* __restrict__ err)
++    int* __restrict__ err,
++    const int32_t* __restrict__ own = nullptr)   // A1-L: 中心点自己的精修候选行 (按 a - row0)
+ {
+     __shared__ float   s_dist[kWarpsPerBlock][kMaxM];
+     __shared__ int32_t s_id  [kWarpsPerBlock][kMaxM];
+@@ -98,7 +227,7 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
+         int32_t id = -1;
+         bool valid = false;
+         if (k < M) {
+-            id = cand[arow * M + k];
++            id = own ? own[(a - row0) * M + k] : cand[arow * M + k];
+             if (id >= 0) {
+                 valid = true;
+                 const int q = (static_cast<uint32_t>(id) < total) ? find_pos(offsets, n_buckets, static_cast<uint32_t>(id)) : -1;
+@@ -206,7 +335,9 @@ bool available(int64_t N, int M, int D, int n_buckets, int W, int out_deg, int e
+     if (cudaGetDeviceCount(&dev_count) != cudaSuccess || dev_count == 0) return false;
+     size_t free_b = 0, total_b = 0;
+     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+-    const size_t need = static_cast<size_t>(N) * (M * 4 + static_cast<size_t>(D) * elem_bytes + out_deg * 4)
++    const bool a1 = std::getenv("BUCKET2_A1L_SAMPLE") && std::atoi(std::getenv("BUCKET2_A1L_SAMPLE")) > 0;
++    const size_t need = static_cast<size_t>(N) * (M * 4 + static_cast<size_t>(D) * elem_bytes + out_deg * 4
++                                                  + (a1 ? M * 4 : 0))   // A1-L 精修行
+                       + static_cast<size_t>(n_buckets) * (W + 2) * 4;
+     return need < free_b * 0.8;
+ }
+@@ -306,8 +437,35 @@ void run(const int32_t* h_cand, const T* h_vec, int64_t N, int M, int D,
+         stg.h2d(d_cbase, cbase.data(), cbase.size() * sizeof(int64_t));
+         PWG_CHECK(cudaMemsetAsync(d_err, 0, sizeof(int), stg.st));
+         const int64_t blocks = (N + kWarpsPerBlock - 1) / kWarpsPerBlock;
++        // A1-L (用户批准的 A1): 见 a1l_window_join_kernel；BUCKET2_A1L_SAMPLE = S (≤ 16)
++        const char* a1e = std::getenv("BUCKET2_A1L_SAMPLE");
++        const int a1_S = a1e ? std::min(std::atoi(a1e), std::min(kA1LMaxS, M)) : 0;
++        int32_t* d_own = nullptr;
++        if (a1_S > 0) {
++            A1LCounters* d_a1 = nullptr;
++            PWG_CHECK(cudaMalloc(&d_own, static_cast<size_t>(N) * M * sizeof(int32_t)));
++            PWG_CHECK(cudaMalloc(&d_a1, sizeof(A1LCounters)));
++            PWG_CHECK(cudaMemsetAsync(d_a1, 0, sizeof(A1LCounters), stg.st));
++            cudaEvent_t e0, e1; PWG_CHECK(cudaEventCreate(&e0)); PWG_CHECK(cudaEventCreate(&e1));
++            PWG_CHECK(cudaEventRecord(e0, stg.st));
++            a1l_window_join_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
++                d_cand, d_vec, d_off, d_win, d_wl, d_cbase, 0, N, M, D, n_buckets, W, a1_S, d_own, d_a1);
++            PWG_CHECK(cudaGetLastError());
++            PWG_CHECK(cudaEventRecord(e1, stg.st));
++            PWG_CHECK(cudaEventSynchronize(e1));
++            float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
++            cudaEventDestroy(e0); cudaEventDestroy(e1);
++            A1LCounters h{};
++            PWG_CHECK(cudaMemcpy(&h, d_a1, sizeof(A1LCounters), cudaMemcpyDeviceToHost));
++            cudaFree(d_a1);
++            const double np_ = h.points ? static_cast<double>(h.points) : 1.0;
++            std::cout << "A1_stats: path=large variant=window_pull2hop pass=1 sample=" << a1_S << " points=" << h.points
++                      << " dist_computed_avg=" << h.cand / np_ << " cand_pass_avg=" << h.pass / np_
++                      << " inserted_avg=" << h.inserted / np_ << " seconds=" << ms / 1e3
++                      << " dbg=" << h.dbg[0] / np_ << "," << h.dbg[1] / np_ << "," << h.dbg[2] / np_ << "," << h.dbg[3] / np_ << "," << h.dbg[4] / np_ << "\n";
++        }
+         prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
+-            d_cand, d_vec, d_off, d_win, d_wl, d_cbase, 0, N, M, D, n_buckets, W, out_deg, d_out, d_err);
++            d_cand, d_vec, d_off, d_win, d_wl, d_cbase, 0, N, M, D, n_buckets, W, out_deg, d_out, d_err, d_own);
+         PWG_CHECK(cudaGetLastError());
+         int h_err = 0;
+         PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
+@@ -316,6 +474,7 @@ void run(const int32_t* h_cand, const T* h_vec, int64_t N, int M, int D,
+             throw std::runtime_error("prune_windowed_gpu: fewer than output_degree valid candidates "
+                                      "(check --output-degree <= M_in and padding)");
+         stg.d2h_rows(d_out, N, out_deg, sink);
++        cudaFree(d_own);
+     } catch (...) {
+         cleanup();
+         throw;
+@@ -392,6 +551,17 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+         PWG_CHECK(cudaMalloc(&d_wl,   h_win_len.size() * sizeof(int32_t)));
+         PWG_CHECK(cudaMalloc(&d_cbase, static_cast<size_t>(n_buckets) * sizeof(int64_t)));
+         PWG_CHECK(cudaMalloc(&d_err,  sizeof(int)));
++        // A1-L (用户批准的 A1): BUCKET2_A1L_SAMPLE = S > 0 时 prune 前做窗口内 local join (S ≤ 16)
++        const char* a1e = std::getenv("BUCKET2_A1L_SAMPLE");
++        const int a1_S = a1e ? std::min(std::atoi(a1e), std::min(kA1LMaxS, M)) : 0;
++        int32_t* d_own = nullptr;
++        A1LCounters* d_a1 = nullptr;
++        if (a1_S > 0) {
++            PWG_CHECK(cudaMalloc(&d_own, static_cast<size_t>(cap_rows) * M * sizeof(int32_t)));
++            PWG_CHECK(cudaMalloc(&d_a1, sizeof(A1LCounters)));
++            PWG_CHECK(cudaMemset(d_a1, 0, sizeof(A1LCounters)));
++        }
++        double t_a1 = 0;
+         stg.h2d(d_off, h_offsets, (static_cast<size_t>(n_buckets) + 1) * sizeof(uint32_t));
+         stg.h2d(d_win, h_win.data(), h_win.size() * sizeof(int32_t));
+         stg.h2d(d_wl,  h_win_len.data(), h_win_len.size() * sizeof(int32_t));
+@@ -494,9 +664,22 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+             cur = nb;
+             const int64_t row0 = h_offsets[p0], n_rows = static_cast<int64_t>(h_offsets[p1]) - row0;
+             const int64_t blocks = (n_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
++            if (blocks > 0 && a1_S > 0) {
++                if (n_rows > cap_rows) throw std::runtime_error("prune_windowed_gpu: A1-L center rows exceed capacity");
++                cudaEvent_t e0, e1; PWG_CHECK(cudaEventCreate(&e0)); PWG_CHECK(cudaEventCreate(&e1));
++                PWG_CHECK(cudaEventRecord(e0, stg.st));
++                a1l_window_join_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
++                    d_cand, d_vec, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, a1_S, d_own, d_a1);
++                PWG_CHECK(cudaGetLastError());
++                PWG_CHECK(cudaEventRecord(e1, stg.st));
++                PWG_CHECK(cudaEventSynchronize(e1));
++                float ms = 0; cudaEventElapsedTime(&ms, e0, e1); t_a1 += ms / 1e3;
++                cudaEventDestroy(e0); cudaEventDestroy(e1);
++            }
+             if (blocks > 0)
+                 prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
+-                    d_cand, d_vec, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_out, d_err);
++                    d_cand, d_vec, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_out, d_err,
++                    a1_S > 0 ? d_own : nullptr);
+             PWG_CHECK(cudaGetLastError());
+             int h_err = 0;
+             PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
+@@ -509,6 +692,15 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
+             if (stats) { stats->chunks++; stats->loaded_rows += fresh_rows; }
+             p0 = p1;
+         }
++        if (a1_S > 0) {
++            A1LCounters h{};
++            PWG_CHECK(cudaMemcpy(&h, d_a1, sizeof(A1LCounters), cudaMemcpyDeviceToHost));
++            const double np_ = h.points ? static_cast<double>(h.points) : 1.0;
++            std::cout << "A1_stats: path=large variant=window_pull2hop pass=1 sample=" << a1_S << " points=" << h.points
++                      << " dist_computed_avg=" << h.cand / np_ << " cand_pass_avg=" << h.pass / np_
++                      << " inserted_avg=" << h.inserted / np_ << " seconds=" << t_a1 << "\n";
++            cudaFree(d_own); cudaFree(d_a1);
++        }
+     } catch (...) {
+         cleanup();
+         throw;
