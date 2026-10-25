@@ -30,40 +30,40 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#44 (msTuring10M float base kept in host memory) + #45 (msTuring1M 6 × 80 + 1 A1 pass, quality margin)**, 2026-10-25 (`runs/tagore46`), re-baselined (only the msTuring1M speed rule failed, see #45). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
+After **#46 (msTuring10M 7 rounds × NPROBE 64, quality margin)**, 2026-10-25 (`runs/tagore47`), re-baselined (only the msTuring10M speed rule failed, see #46). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
 
 **Build time (s, median of reps; sum of all stages)**
 
 | config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | resident | 3 | 4.90 | +1.0% | +21.7% | 0.53x | 0.42x | bucket2 4.90 | 4992 | 1.59 |
-| sift1M_large | large | 3 | 8.21 | +0.0% | +15.3% | 0.89x | 0.71x | bucket2 6.43, prune 0.72, optimize_chunked 0.72, translate 0.35 | 1252 | 1.91 |
-| sift10M_auto | large | 3 | 64.64 | -0.9% | +21.6% | 0.30x | 0.53x | bucket2 55.14, prune 3.85, optimize_chunked 2.96, translate 2.63 | 8996 | 11.58 |
-| msTuring1M_auto | resident | 3 | 14.61 | -11.8% | +11.0% | 1.56x | 1.27x | bucket2 14.61 | 5128 | 1.64 |
-| msTuring10M_auto | large | 3 | 191.42 | +7.9% | +20.5% | 0.83x | 1.61x | bucket2 181.33, prune 4.44, optimize_chunked 3.00, translate 2.66 | 8996 | 20.62 |
-| sift100M_auto | large | 3 | 603.10 | -0.7% | +81.2% | 0.28x | 0.82x | bucket2 419.84, prune 95.63, optimize_chunked 61.25, translate 22.58 | 14588 | 48.33 |
+| sift1M_auto | resident | 3 | 4.92 | -0.4% | +21.4% | 0.54x | 0.43x | bucket2 4.92 | 5002 | 1.59 |
+| sift1M_large | large | 3 | 8.33 | -1.5% | +14.0% | 0.91x | 0.72x | bucket2 6.52, prune 0.71, optimize_chunked 0.73, translate 0.35 | 1252 | 1.90 |
+| sift10M_auto | large | 3 | 65.00 | -0.6% | +21.2% | 0.30x | 0.53x | bucket2 55.65, prune 3.85, optimize_chunked 2.93, translate 2.59 | 8996 | 11.67 |
+| msTuring1M_auto | resident | 3 | 14.88 | -1.8% | +9.4% | 1.59x | 1.30x | bucket2 14.88 | 5128 | 1.64 |
+| msTuring10M_auto | large | 3 | 220.05 | -15.0% | +8.6% | 0.95x | 1.85x | bucket2 209.99, prune 4.49, optimize_chunked 3.02, translate 2.66 | 8996 | 20.07 |
+| sift100M_auto | large | 3 | 576.91 | +4.3% | +82.1% | 0.27x | 0.78x | bucket2 386.50, prune 95.81, optimize_chunked 71.02, translate 21.79 | 14588 | 44.86 |
 
 **bucket2 step breakdown (s)**
 
 | config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | 0.69 | 0.16 | 0.06 | 0.00 | 0.40 | 0.21 | 0.01 | 1.89 | 0.00 | 0.99 |
-| sift1M_large | 0.16 | 0.37 | 0.13 | 0.00 | 1.24 | 0.17 | 0.03 | 3.26 | 0.53 | 0.00 |
-| sift10M_auto | 1.13 | 2.47 | 0.35 | 0.00 | 16.54 | 1.67 | 0.17 | 27.36 | 4.71 | 0.00 |
-| msTuring1M_auto | 0.91 | 0.39 | 0.03 | 0.00 | 0.69 | 0.48 | 0.01 | 9.87 | 0.00 | 1.02 |
-| msTuring10M_auto | 8.10 | 8.91 | 0.36 | 0.00 | 48.43 | 4.34 | 0.22 | 105.05 | 4.07 | 0.00 |
-| sift100M_auto | 11.60 | 5.24 | 2.65 | 0.00 | 135.68 | 27.56 | 2.83 | 192.99 | 27.39 | 0.00 |
+| sift1M_auto | 0.64 | 0.15 | 0.06 | 0.00 | 0.39 | 0.21 | 0.01 | 1.89 | 0.00 | 1.02 |
+| sift1M_large | 0.15 | 0.28 | 0.14 | 0.00 | 1.13 | 0.24 | 0.04 | 3.30 | 0.54 | 0.00 |
+| sift10M_auto | 1.13 | 2.47 | 0.22 | 0.00 | 16.99 | 1.71 | 0.17 | 27.32 | 4.66 | 0.00 |
+| msTuring1M_auto | 0.92 | 0.39 | 0.03 | 0.00 | 0.72 | 0.47 | 0.01 | 10.06 | 0.00 | 0.97 |
+| msTuring10M_auto | 7.79 | 10.52 | 0.50 | 0.00 | 57.98 | 4.34 | 0.20 | 121.44 | 4.23 | 0.00 |
+| sift100M_auto | 11.63 | 5.22 | 2.79 | 0.00 | 135.14 | 27.43 | 3.10 | 171.44 | 25.31 | 0.00 |
 
 **(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
 
 | config | recall@1 | recall@10 | recall@32 | recall@64 |
 |---|---|---|---|---|
-| sift1M_auto | 0.9385 | 0.9236 | 0.9113 | 0.9023 |
-| sift1M_large | 0.9359 | 0.9234 | 0.9114 | 0.9022 |
-| sift10M_auto | 0.8502 | 0.8215 | 0.8009 | 0.7855 |
-| msTuring1M_auto | 0.9866 | 0.9736 | 0.9568 | 0.9402 |
-| msTuring10M_auto | 0.8893 | 0.8532 | 0.8270 | 0.8071 |
-| sift100M_auto | 0.6524 | 0.6175 | 0.5916 | 0.5744 |
+| sift1M_auto | 0.9379 | 0.9221 | 0.9094 | 0.9003 |
+| sift1M_large | 0.9374 | 0.9224 | 0.9113 | 0.9029 |
+| sift10M_auto | 0.8540 | 0.8210 | 0.8011 | 0.7860 |
+| msTuring1M_auto | 0.9852 | 0.9736 | 0.9572 | 0.9408 |
+| msTuring10M_auto | 0.9120 | 0.8817 | 0.8572 | 0.8390 |
+| sift100M_auto | 0.6568 | 0.6174 | 0.5930 | 0.5758 |
 
 **(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
 
@@ -79,12 +79,12 @@ After **#44 (msTuring10M float base kept in host memory) + #45 (msTuring1M 6 × 
 | CAGRA CAGRA NN-Descent 64->32, msTuring10M | 0.6621 / 1418K | 0.7995 / 740K | 0.8922 / 370K | 0.9451 / 150K | 0.9741 / 47K |
 | TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
 | CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
-| ours sift1M_auto | 0.9263 / 1950K | 0.9760 / 1034K | 0.9940 / 533K | 0.9986 / 189K | 0.9997 / 68K |
-| ours sift1M_large | 0.9115 / 2218K | 0.9698 / 1190K | 0.9918 / 561K | 0.9978 / 189K | 0.9996 / 68K |
-| ours sift10M_auto | 0.8294 / 1871K | 0.9219 / 1010K | 0.9690 / 494K | 0.9897 / 184K | 0.9975 / 68K |
-| ours msTuring1M_auto | 0.6570 / 1454K | 0.7889 / 734K | 0.8835 / 362K | 0.9431 / 147K | 0.9765 / 47K |
-| ours msTuring10M_auto | 0.6151 / 1453K | 0.7602 / 764K | 0.8645 / 378K | 0.9269 / 151K | 0.9612 / 48K |
-| ours sift100M_auto | 0.7262 / 66K | 0.8342 / 65K | 0.9105 / 39K | 0.9588 / 22K | 0.9840 / 13K |
+| ours sift1M_auto | 0.9248 / 2221K | 0.9750 / 1191K | 0.9938 / 562K | 0.9986 / 189K | 0.9998 / 68K |
+| ours sift1M_large | 0.9127 / 1949K | 0.9704 / 1034K | 0.9919 / 501K | 0.9979 / 186K | 0.9994 / 68K |
+| ours sift10M_auto | 0.8297 / 2010K | 0.9220 / 970K | 0.9699 / 554K | 0.9899 / 186K | 0.9974 / 68K |
+| ours msTuring1M_auto | 0.6558 / 1455K | 0.7901 / 736K | 0.8838 / 363K | 0.9439 / 148K | 0.9768 / 47K |
+| ours msTuring10M_auto | 0.6219 / 1433K | 0.7663 / 738K | 0.8648 / 371K | 0.9281 / 151K | 0.9628 / 48K |
+| ours sift100M_auto | 0.7251 / 62K | 0.8327 / 65K | 0.9099 / 39K | 0.9590 / 23K | 0.9834 / 12K |
 
 ## Baseline verification
 
@@ -1374,4 +1374,9 @@ Pareto (passing): 4 × 128 197.4 s (itopk 32 margin +0.0013) < 6 × 64 206.8 s (
 ### #45 — msTuring1M quality margin: 6 rounds × NPROBE 80 + 1 A1 pass (was 6 × 64 + 1) (2026-10-25) — KEPT (judge REJECT on speed, re-baselined)
 - **Why:** #43's 6 × 64 + 1 had itopk 32 min margin ~0.001; run-to-run spread (Step 4 nondeterminism) measured with 4 smoke runs each (`runs/tagore45/spread`): 6 × 64 + 1: 0.6540 / 0.6548 / **0.6523** / 0.6542 (fails 1 of 4); 5 × 96 + 1: 0.6572 / **0.6520** / 0.6534 / 0.6545; 8 × 64 + 0: 0.6580 / 0.6551 / 0.6587 / 0.6556; 6 × 64 + 2: 0.6548 / 0.6561 / 0.6536 / 0.6567; **6 × 80 + 1: 0.6550 / 0.6555 / 0.6552 / 0.6564** (tightest, min margin +0.0022) → chosen.
 - **Result (×3):** msTuring1M **14.61 s** (13.07 s best of #43 was a configuration that fails the gate ~1 in 4 runs; still faster than #40's 16.4 s), recall@10 0.6570 / 1454K | 0.7889 / 734K | 0.8835 / 362K | 0.9431 / 147K | 0.9765 / 47K. Judge: −11.8% vs the fragile best → REJECT on speed only; kept and re-baselined (`--rebaseline`) because the old best was not reproducibly inside the quality gate. Flagged to the user.
+
+### #46 — msTuring10M quality margin: 7 rounds × NPROBE 64 (was 6 × 64, #42) (2026-10-25) — KEPT (judge REJECT on speed, re-baselined)
+- **Why:** like msTuring1M (#45), #42's 6 × 64 sits too close to the CAGRA floor (itopk 32 0.6121): 4 smoke runs (`runs/tagore47/spread`, GPU 2) 0.6181 / **0.6111** / 0.6183 / 0.6165 (fails 1 of 4). Candidates, 3 smoke runs each: 6 × 96 0.6196 / 0.6204 / 0.6248; **7 × 64 0.6226 / 0.6208 / 0.6233** (min margin +0.0087, chosen: one more round is cheaper than 1.5× pool); 8 × 48 0.6212 / 0.6219 / 0.6191.
+- **Result (×3):** msTuring10M **220.05 s** (0.95× TAGORE, 1.85× CAGRA; still faster than the 223.93 s of 3 × 256 before #42), Step 6 121.4 s, Step 4 58.0 s, recall@10 0.6219 / 1433K | 0.7663 / 738K | 0.8648 / 371K | 0.9281 / 151K | 0.9628 / 48K. Judge: −15.0% vs the fragile 191.42 s → REJECT on speed only; kept and re-baselined (`--rebaseline`). Others ±1.9% (sift100M +4.3%). Flagged to the user.
+- Lesson for later param changes: with Step 4's nondeterminism (spread ≈ ±0.004 at itopk 32 on msTuring), a configuration is only accepted when several runs clear the gate, not one.
 
