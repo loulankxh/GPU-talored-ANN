@@ -56,7 +56,7 @@
   "dir": "/home/lanlu/microBenchmark/dataset/msTuring10M",
   "base": "base.10M.fbin",
   "reps": 3,
-  "iterations": null,
+  "iterations": 6,
   "search": "cagra",
   "ref": "cagra",
   "bench": [
@@ -64,9 +64,9 @@
   ],
   "params": {
    "CENTROID_RATIO": "0.001953125",
-   "NPROBE": "256"
+   "NPROBE": "64"
   },
-  "params_note": "P4 calibration 2026-10-24 (A2): avg bucket 512, pool ~131K rows; passes CAGRA gate -0.05 (runs/tagoreP4)"
+  "params_note": "#42 (user priority 3 grid, A2 params): avg bucket 512, NPROBE 64, 6 rounds; passes CAGRA gate -0.05 (was NPROBE 256 x 3 rounds, P4)"
  },
  "msTuring100M": {
   "dir": "/home/lanlu/microBenchmark/dataset/msTuring100M",

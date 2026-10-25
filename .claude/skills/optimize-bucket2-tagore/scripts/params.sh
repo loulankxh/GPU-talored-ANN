@@ -9,7 +9,7 @@ OUTPUT_DEGREE=32
 # dataset_env.py (size-adaptive, reproduces the hand-tuned SIFT100M values; export a value to override it).
 SEED=42
 : "${KNN_K:=32}"
-ITERATIONS=3   # default; datasets.json "iterations" overrides (SIFT100M / msTuring100M: 2)
+: "${ITERATIONS:=3}"   # default (exported value wins, for sweeps); datasets.json "iterations" overrides (SIFT100M / msTuring100M: 2)
 
 PRUNE_CACHE_MB=16000
 CHUNKED_GPU_BUDGET_MB=16000
