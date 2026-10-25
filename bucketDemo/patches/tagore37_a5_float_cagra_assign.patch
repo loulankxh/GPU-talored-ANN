@@ -1,0 +1,100 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 536c373..9fb766b 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -1440,11 +1440,17 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+     // (L2Expanded 分块 GEMM + select_k，msTuring10M 40K centroids 17 s/轮)。同样是精确
+     // top-2；只是 fp32 舍入顺序不同 (不加每行常数 ‖q‖²)，距离几乎相等的点可能换一个 centroid。
+     // query tile 按 dots ≤ 512 MB 定 (centroid 多时 tile 变小)。BUCKET2_F32_ASSIGN=0 关掉。
++    // A5 (user 2026-10-24): 跟 8-bit 同一条规则——centroid 数超过 BUCKET2_EXACT_ASSIGN_MAX 时改走
++    // CAGRA 图搜索 (精确 GEMM 的代价 ∝ N × n_centroids: msTuring100M 400K centroids 1170 s/轮)
+     constexpr bool kExactF32 = !is_pq && std::is_same<T, float>::value;
+-    const bool exact_f32 = kExactF32 && n_centroids >= 2 &&
++    const bool f32_cagra = kExactF32 && n_centroids > exact_max;
++    const bool exact_f32 = kExactF32 && n_centroids >= 2 && !f32_cagra &&
+         !(std::getenv("BUCKET2_F32_ASSIGN") && std::getenv("BUCKET2_F32_ASSIGN")[0] == '0');
+     const int64_t f32_tile = std::max<int64_t>(32, std::min<int64_t>(kF16Tile,
+         (int64_t(512) << 20) / (std::max<int64_t>(n_centroids, 1) * static_cast<int64_t>(sizeof(float)))));
++    std::cout << "[BatchAssign] method=" << (exact_f16 ? "exact fp16 GEMM top-2" : exact_f32 ? "exact fp32 GEMM top-2"
++                                             : (kExactF16 || f32_cagra) ? "CAGRA search (n_centroids > exact max)" : "other")
++              << " (n_centroids=" << n_centroids << ", exact max=" << exact_max << ")\n";
+     cublasHandle_t f16_cublas = nullptr;
+     __half*   d_cent_h  = nullptr;
+     float*    d_cnorm   = nullptr;
+@@ -1482,7 +1488,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+     int64_t* d_top2_i64 = nullptr;
+     std::vector<int64_t> h_top2_i64;
+     if constexpr (!is_pq && !kExactF16) {
+-        if (use_bf && !exact_f32) {
++        if (use_bf && !exact_f32 && !f32_cagra) {
+             cuvs::neighbors::brute_force::index_params bp;
+             bp.metric = cuvs::distance::DistanceType::L2Expanded;
+             bf_idx.emplace(cuvs::neighbors::brute_force::build(res, bp,
+@@ -1643,7 +1649,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
+             searched_f16 = true;   // 跟 fp16 路径共用下载 + 越界检查
+         }
+         if constexpr (!is_pq && !kExactF16) {
+-            if (use_bf && !exact_f32) {
++            if (use_bf && !exact_f32 && !f32_cagra) {
+                 cuvs::neighbors::brute_force::search(res, *bf_idx,
+                     raft::make_device_matrix_view<const float, int64_t>(
+                         d_queries, batch_size, static_cast<int64_t>(D)),
+@@ -5392,15 +5398,34 @@ void build_vector_knn_with_tensorcore(
+     constexpr int kMinSlotsCacheMiss = 6;
+     if (use_dev_cache && !d_blob) target_streams = std::min(MAX_SLOTS, std::max(target_streams, kMinSlotsCacheMiss));
+ 
++    // 逐桶加载的 GPU bucket 缓存是后面按需分配的，slot 规划要先给它留出来 (原来没留: A5 之后
++    // msTuring100M 有 36K 行的大桶，6 × 2.27 GB slot + 8.6 GB 缓存 → Step 6 OOM, #37)。
++    // 留下缓存后连 2 个 slot 都放不下时缩小缓存 (缓存只影响速度)。
++    // 逐桶加载时每个 slot 另有一块显存未命中暂存区 (≈ pool 上界 × (4 + D·sizeof))；缓存本身
++    // 最多占预算 + 1/8 (延迟释放的 arena，见 arena_free_cap)
++    size_t slot_usable = usable_bytes;
++    if (use_dev_cache && !d_blob) {
++        bytes_per_slot += max_pool_size_ub * (sizeof(int32_t) + static_cast<size_t>(D) * sizeof(DataT));
++        const size_t need_min = bytes_global + 2 * bytes_per_slot;
++        // 缓存最多拿剩余空间的 3/4: 其余给 arena 空闲链表 (≤ 1/8)、延迟释放中的块和 cudaMallocAsync 池的碎片
++        const size_t cache_room = usable_bytes > need_min ? (usable_bytes - need_min) / 4 * 3 : 0;
++        if (cache_room < gpu_cache_bytes) {
++            std::cout << "  [VectorKNN] GPU bucket cache shrunk " << gpu_cache_bytes / 1e6 << " -> "
++                      << cache_room / 1e6 << " MB to fit 2 slots\n";
++            gpu_cache_bytes = cache_room;
++        }
++        const size_t cache_reserve = gpu_cache_bytes / 8 * 9;
++        slot_usable = usable_bytes > cache_reserve ? usable_bytes - cache_reserve : 0;
++    }
+     // 内存上限：从 target_streams 往下试，挑能装下的最大值
+     int num_slots = 1;
+     for (int try_slots = target_streams; try_slots >= 1; --try_slots) {
+-        if (bytes_global + try_slots * bytes_per_slot <= usable_bytes) {
++        if (bytes_global + try_slots * bytes_per_slot <= slot_usable) {
+             num_slots = try_slots;
+             break;
+         }
+     }
+-    if (bytes_global + bytes_per_slot > usable_bytes) {
++    if (bytes_global + bytes_per_slot > slot_usable) {
+         throw std::runtime_error(
+             "[VectorKNN] Need at least " + std::to_string((bytes_global + bytes_per_slot) / 1e9)
+             + " GB GPU mem but only " + std::to_string(usable_bytes / 1e9)
+@@ -5731,7 +5756,20 @@ void build_vector_knn_with_tensorcore(
+             }
+         }
+         void* b = nullptr;
+-        CUDA_CHECK(cudaMallocAsync(&b, bytes, copy_stream));
++        cudaError_t e = cudaMallocAsync(&b, bytes, copy_stream);
++        if (e == cudaErrorMemoryAllocation) {
++            // 显存紧 (大桶 + 大 pool): 空闲链表全部还给池、裁剪池后重试一次
++            cudaGetLastError();
++            for (auto& kv : arena_free) for (char* p : kv.second) cudaFreeAsync(p, copy_stream);
++            arena_free.clear(); arena_free_bytes = 0;
++            CUDA_CHECK(cudaStreamSynchronize(copy_stream));
++            cudaMemPool_t pool = nullptr; int dev = 0;
++            CUDA_CHECK(cudaGetDevice(&dev));
++            CUDA_CHECK(cudaDeviceGetDefaultMemPool(&pool, dev));
++            CUDA_CHECK(cudaMemPoolTrimTo(pool, 0));
++            e = cudaMallocAsync(&b, bytes, copy_stream);
++        }
++        CUDA_CHECK(e);
+         ++n_arena_fallback;
+         return static_cast<char*>(b);
+     };
