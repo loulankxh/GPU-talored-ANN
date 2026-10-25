@@ -3694,6 +3694,86 @@ static inline bool launch_block_topM_bucket(
     return true;
 }
 
+// ---------------- A1-R (用户批准的 A1，resident 路径): local join 精修 ----------------
+// GNN-Descent 的 local join 换成 "拉" 的写法：点 a 的候选 = 它前 S 个邻居 u 各自的前 S 个邻居
+// (邻居的邻居)，算精确距离，小于 a 当前第 M 近的才参与合并；新表写到另一份缓冲 (本趟所有点读的
+// 都是上一趟的表)。TAGORE GNN-Descent 是把 u 的采样邻居两两配对推给对方 (nn_descent_opt_cal /
+// _merge)；这里候选集合同为 2 跳邻居，按点独立计算，不需要 atomic 写别人的表。
+constexpr int kA1MaxCand = 1024;   // S × S 上限 (S ≤ 32)
+struct A1Counters { unsigned long long cand, pass, inserted; };
+
+template <typename GemmT>
+__global__ void __launch_bounds__(256) a1_pull_join_kernel(
+    const GemmT* __restrict__ data, const float* __restrict__ norms, int64_t N, int D,
+    const int32_t* __restrict__ in_n, const float* __restrict__ in_d, int M, int S,
+    int32_t* __restrict__ out_n, float* __restrict__ out_d, A1Counters* __restrict__ ctr)
+{
+    const int64_t a = blockIdx.x;
+    if (a >= N) return;
+    __shared__ float s_a[256];                     // a 的向量 (D ≤ 256)
+    __shared__ int32_t s_cid[kA1MaxCand + 256];    // 通过阈值的候选 + 原表
+    __shared__ float   s_cd[kA1MaxCand + 256];
+    __shared__ int32_t s_old[256];
+    __shared__ int s_np;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = blockDim.x >> 5;
+    for (int e = tid; e < D; e += blockDim.x) s_a[e] = static_cast<float>(data[a * D + e]);
+    for (int k = tid; k < M; k += blockDim.x) s_old[k] = in_n[a * M + k];
+    if (tid == 0) s_np = 0;
+    __syncthreads();
+    const float kth = in_d[a * M + M - 1];
+    const float na = norms[a];
+    const int nc = S * S;
+    // 候选距离: 一个 warp 一个候选，lane 跨维
+    for (int c = warp; c < nc; c += nw) {
+        const int32_t u = s_old[c / S];
+        int32_t v = (u >= 0 && u < N) ? in_n[static_cast<int64_t>(u) * M + (c % S)] : -1;
+        if (v < 0 || v >= N || v == a) continue;   // bounds check
+        bool dup = false;                           // 已在 a 的表里
+        for (int k = lane; k < M; k += 32) dup |= (s_old[k] == v);
+        if (__any_sync(0xffffffffu, dup)) continue;
+        float part = 0.0f;
+        const GemmT* pv = data + static_cast<int64_t>(v) * D;
+        for (int e = lane; e < D; e += 32) part += s_a[e] * static_cast<float>(pv[e]);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
+        const float d = na + norms[v] - 2.0f * part;
+        if (lane == 0 && d < kth) {
+            const int p = atomicAdd(&s_np, 1);
+            if (p < kA1MaxCand) { s_cid[p] = v; s_cd[p] = d; }
+        }
+    }
+    __syncthreads();
+    const int np = min(s_np, kA1MaxCand);
+    // 候选之间去重: 同一个 v 的距离是同一种算法算的，值相同；保留下标最小的那份
+    for (int p = tid; p < np; p += blockDim.x) {
+        const int32_t v = s_cid[p];
+        for (int o = 0; o < p; ++o) if (s_cid[o] == v) { s_cd[p] = INFINITY; break; }
+    }
+    __syncthreads();
+    for (int p = tid; p < np; p += blockDim.x) if (!(s_cd[p] < INFINITY)) s_cid[p] = INT_MAX;   // 重复的排到最后
+    // 原表接在后面
+    for (int k = tid; k < M; k += blockDim.x) { s_cid[np + k] = in_n[a * M + k]; s_cd[np + k] = in_d[a * M + k]; }
+    __syncthreads();
+    // 按 (距离, id) 排名，前 M 个写出 (无效 / 重复的是 INF，排在后面)
+    const int tot = np + M;
+    int ins = 0;
+    for (int p = tid; p < tot; p += blockDim.x) {
+        const float d = s_cd[p]; const int32_t id = s_cid[p];
+        if (!(d < INFINITY) && p < np) continue;
+        int rank = 0;
+        for (int o = 0; o < tot; ++o) {
+            const float od = s_cd[o]; const int32_t oid = s_cid[o];
+            rank += (od < d) || (od == d && (oid < id || (oid == id && o < p)));
+        }
+        if (rank < M) {
+            out_n[a * M + rank] = id; out_d[a * M + rank] = d;
+            if (p < np) ++ins;
+        }
+    }
+    if (ins) atomicAdd(&ctr->inserted, static_cast<unsigned long long>(ins));
+    if (tid == 0) { atomicAdd(&ctr->cand, static_cast<unsigned long long>(nc)); atomicAdd(&ctr->pass, static_cast<unsigned long long>(np)); }
+}
+
 // ============== GPU-resident fast path (数据集 + running KNN 都放得进显存时) ==============
 //
 // 下面的 build_vector_knn_with_tensorcore + ChunkedKnnAccumulator 是 out-of-core
@@ -4163,6 +4243,32 @@ struct GpuResidentKnn {
     }
 
     // 释放全部显存 (收尾阶段把显存让给 cuVS optimize)；之后对象只能析构
+    // A1-R: passes 趟 local join (S = 每点取前 S 个邻居、每个邻居再取前 S 个)，打印 A1_stats
+    void refine_local_join(int passes, int S) {
+        if (passes <= 0 || !has_run) return;
+        if (D > 256 || S < 1 || S > 32 || S > M) throw std::runtime_error("A1-R: needs D <= 256 and 1 <= S <= min(32, M)");
+        A1Counters* d_ctr = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_ctr, sizeof(A1Counters)));
+        for (int it = 0; it < passes; ++it) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            CUDA_CHECK(cudaMemset(d_ctr, 0, sizeof(A1Counters)));
+            a1_pull_join_kernel<GemmT><<<static_cast<unsigned>(N), 256>>>(
+                d_data, d_norms, N, D, d_run_n, d_run_d, M, S, d_tmp_n, d_tmp_d, d_ctr);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::swap(d_run_n, d_tmp_n); std::swap(d_run_d, d_tmp_d);
+            A1Counters h{};
+            CUDA_CHECK(cudaMemcpy(&h, d_ctr, sizeof(A1Counters), cudaMemcpyDeviceToHost));
+            const double s = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+            std::cout << "A1_stats: path=resident variant=pull2hop pass=" << it + 1 << " sample=" << S
+                      << " points=" << N << " dist_computed_avg=" << static_cast<double>(h.cand) / N
+                      << " cand_pass_avg=" << static_cast<double>(h.pass) / N
+                      << " inserted_avg=" << static_cast<double>(h.inserted) / N
+                      << " seconds=" << std::fixed << std::setprecision(3) << s << "\n";
+        }
+        cudaFree(d_ctr);
+    }
+
     void release_device() {
         for (auto& s : slots) {
             cudaFree(s.pool); cudaFree(s.pool_norms); cudaFree(s.pool_ids); cudaFree(s.dots);
@@ -7879,6 +7985,15 @@ int run_pipeline_impl(
         // 把按 chunk 分片的 running 状态 (跨全部 iteration 合并去重后的最终
         // 结果) 按 chunk 顺序拼接成 vector_knn.bin / vector_dists.bin。
         if (gres) {
+            // A1-R (用户批准): BUCKET2_A1_PASSES 趟 local join，BUCKET2_A1_SAMPLE (默认 32)
+            if (const char* e = std::getenv("BUCKET2_A1_PASSES")) {
+                const int passes = std::atoi(e);
+                const char* es = std::getenv("BUCKET2_A1_SAMPLE");
+                auto ta = Clock::now();
+                gres->refine_local_join(passes, es ? std::atoi(es) : 32);
+                if (passes > 0)
+                    std::cout << "  [A1-R] local join: " << std::chrono::duration<double>(Clock::now() - ta).count() << "s\n";
+            }
             auto t_write = Clock::now();
             // --fused-optimize-degree: 下载完就在写盘的同时做 prune/反向边/id 翻译
             std::function<void(const std::vector<int32_t>&)> tail;

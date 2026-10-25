@@ -41,6 +41,7 @@ DSDIR=$DS_DIR
 : "${REPS:=$DEF_REPS}"
 BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
 CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
+export BUCKET2_A1_PASSES=$A1_PASSES   # A1-R local join passes (resident path, #40)
 echo "[$DS] $DTYPE N=$N D=$DIM reps=$REPS iters=$ITERATIONS ratio=$CENTROID_RATIO nprobe=$NPROBE search=$SEARCH ($ADAPT_NOTE)"
 : "${OUT:=$BB/runs/$(date +%Y%m%d_%H%M%S)_${DS}_${MODE}}"
 mkdir -p "$OUT"

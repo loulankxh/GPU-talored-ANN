@@ -47,9 +47,10 @@
   ],
   "params": {
    "CENTROID_RATIO": "0.001953125",
-   "NPROBE": "256"
+   "NPROBE": "160",
+   "A1_PASSES": "2"
   },
-  "params_note": "P4/#30 calibration 2026-10-24 (A2): avg bucket 512, pool ~131K rows; passes CAGRA gate -0.01 (needs #30 resident dots row tiling; runs/tagore30)"
+  "params_note": "#40 (A1-R + A2): avg bucket 512, NPROBE 160 + 2 local-join passes; passes CAGRA gate -0.01 (was NPROBE 256 without A1, #30)"
  },
  "msTuring10M": {
   "dir": "/home/lanlu/microBenchmark/dataset/msTuring10M",
