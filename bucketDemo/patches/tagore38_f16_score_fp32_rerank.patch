@@ -1,0 +1,252 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 536c373..c4eb6b4 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -1,5 +1,6 @@
+ #include <iostream>
+ #include <vector>
++#include <climits>
+ #include <cstdint>
+ #include <string>
+ #include <filesystem>
+@@ -3647,6 +3648,68 @@ __global__ void __launch_bounds__(G * 32) block_topK_from_dots_kernel(
+     }
+ }
+ 
++// float32 Step 6 (#38, 用户优先级 1): fp16 Tensor Core GEMM 给整个 pool 打分，block top-M 留每行前 R 个
++// (pool 内下标)，这里对这 R 个用 fp32 精确重算 ‖p‖² - 2·q·p (逐维顺序累加) 再取前 M。
++// 一个 warp 一行；同距离按 pool 下标小的在前。输出格式跟 block top-M 的 bucket 模式一样:
++// 第 q 行 (bucket 内行号) 的 ids = ids_pool[j]，dists = 真实 L2² (+ ‖q‖²)。
++constexpr int kRerankMaxR = 256;
++__global__ void __launch_bounds__(128) f16_rerank_topM_kernel(
++    const float* __restrict__ pool,        // (pool_size, D) fp32
++    const float* __restrict__ norms_pool,  // (pool_size,)
++    const int32_t* __restrict__ ids_pool,  // (pool_size,) gid
++    const int32_t* __restrict__ cand,      // 第 q 行 R 个 pool 下标 (-1 = 空)，行宽 R
++    int R, int D, int M, int row0, int rows,
++    int32_t* __restrict__ out_ids, float* __restrict__ out_dists)   // 行宽 M
++{
++    constexpr int LANES = 32, WPB = 4;
++    __shared__ float s_d[WPB][kRerankMaxR];
++    __shared__ int32_t s_j[WPB][kRerankMaxR];
++    const int warp = threadIdx.x / LANES, lane = threadIdx.x & (LANES - 1);
++    const int lr = blockIdx.x * WPB + warp;
++    if (lr >= rows) return;
++    const int q = row0 + lr;
++    const float* qv = pool + static_cast<int64_t>(q) * D;
++    // 一个 warp 一起算一个候选的点积: lane 取第 lane, lane+32, … 维 (合并读)，固定顺序的 xor 归约
++    constexpr int kMaxDPerLane = 8;   // D ≤ 256
++    float qr[kMaxDPerLane];
++    #pragma unroll
++    for (int u = 0; u < kMaxDPerLane; ++u) { const int e = lane + u * LANES; qr[u] = e < D ? qv[e] : 0.0f; }
++    for (int c = 0; c < R; ++c) {
++        const int32_t j = cand[static_cast<int64_t>(q) * R + c];   // warp 内一致
++        float d = INFINITY;
++        if (j >= 0) {
++            const float* pv = pool + static_cast<int64_t>(j) * D;
++            float part = 0.0f;
++            #pragma unroll
++            for (int u = 0; u < kMaxDPerLane; ++u) { const int e = lane + u * LANES; if (e < D) part += qr[u] * pv[e]; }
++            #pragma unroll
++            for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
++            d = norms_pool[j] - 2.0f * part;
++        }
++        if (lane == 0) { s_d[warp][c] = d; s_j[warp][c] = j >= 0 ? j : INT_MAX; }
++    }
++    for (int k = lane; k < M; k += LANES) {   // 候选不足 M 个时剩下的位置
++        out_ids[static_cast<int64_t>(q) * M + k] = -1;
++        out_dists[static_cast<int64_t>(q) * M + k] = INFINITY;
++    }
++    __syncwarp();
++    const float qn = norms_pool[q];
++    for (int c = lane; c < R; c += LANES) {
++        const float d = s_d[warp][c];
++        const int32_t j = s_j[warp][c];
++        if (j == INT_MAX) continue;
++        int rank = 0;
++        for (int o = 0; o < R; ++o) {
++            const float od = s_d[warp][o];
++            rank += (od < d) || (od == d && s_j[warp][o] < j);
++        }
++        if (rank < M) {
++            out_ids[static_cast<int64_t>(q) * M + rank] = ids_pool[j];
++            out_dists[static_cast<int64_t>(q) * M + rank] = d + qn;
++        }
++    }
++}
++
+ // GPU-resident 路径的 top-M dispatcher；M > 256 时 shared memory 不够，回退到
+ // 一 warp 一 query 的 warp_topK_from_dots_kernel。
+ static inline void launch_block_topM_resident(
+@@ -4914,7 +4977,9 @@ __global__ void devcache_scatter_misses_kernel(const char* __restrict__ stage, c
+ template <typename DataT, typename OutT>
+ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+                                             OutT* __restrict__ B, int32_t* __restrict__ ids_pool,
+-                                            float* __restrict__ norms_pool, int D)
++                                            float* __restrict__ norms_pool, int D,
++                                            __half* __restrict__ Bh = nullptr,   // fp32 数据: 可选 fp16 副本 (#38)
++                                            int Dh = 0)                          // 副本行宽 (D 补到 8 的倍数，补位为 0)
+ {
+     const DevPoolJob jb = jobs[blockIdx.x];
+     const DataT* v = static_cast<const DataT*>(jb.vecs);
+@@ -4933,6 +4998,7 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+             : reinterpret_cast<const float*>(v);
+         const int src_ld = (jb.mode == 1) ? jb.stride / static_cast<int>(sizeof(float)) : D;
+         float* dst0 = reinterpret_cast<float*>(B) + static_cast<int64_t>(jb.dest) * D;
++        __half* hdst0 = Bh ? Bh + static_cast<int64_t>(jb.dest) * Dh : nullptr;
+         const int n = jb.count, P = D + 1, bd = blockDim.x;
+         const int TR = kTileFloats / P;   // 每块行数 (D=100: 121)
+         auto id_of = [&](int r) -> int32_t {
+@@ -4946,7 +5012,10 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+                 const float* s = src0 + static_cast<int64_t>(r) * src_ld;
+                 float* d = dst0 + static_cast<int64_t>(r) * D;
+                 float sq = 0.0f;
+-                for (int c = 0; c < D; ++c) { float x = s[c]; d[c] = x; sq += x * x; }
++                for (int c = 0; c < D; ++c) {
++                    float x = s[c]; d[c] = x; sq += x * x;
++                    if (hdst0) hdst0[static_cast<int64_t>(r) * Dh + c] = __float2half_rn(x);
++                }
+                 norms_pool[jb.dest + r] = sq;
+                 ids_pool[jb.dest + r] = id_of(r);
+             }
+@@ -4957,6 +5026,7 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+             const int total = rows * D;
+             const float* s = src0 + static_cast<int64_t>(t0) * src_ld;
+             float* d = dst0 + static_cast<int64_t>(t0) * D;
++            __half* hd = hdst0 ? hdst0 + static_cast<int64_t>(t0) * Dh : nullptr;
+             int k = threadIdx.x;
+             for (; k + 3 * bd < total; k += 4 * bd) {   // 4 路展开: 多个 load 在途
+                 float x[4];
+@@ -4970,6 +5040,7 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+                     const int kk = k + u * bd, r = kk / D, c = kk - r * D;
+                     tile[r * P + c] = x[u];
+                     d[kk] = x[u];
++                    if (hd) hd[r * Dh + c] = __float2half_rn(x[u]);
+                 }
+             }
+             for (; k < total; k += bd) {
+@@ -4977,6 +5048,7 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+                 const float x = s[r * src_ld + c];
+                 tile[r * P + c] = x;
+                 d[k] = x;
++                if (hd) hd[r * Dh + c] = __float2half_rn(x);
+             }
+             __syncthreads();
+             for (int r = threadIdx.x; r < rows; r += bd) {
+@@ -5354,8 +5426,21 @@ void build_vector_knn_with_tensorcore(
+     size_t bytes_identity_idx = max_pool_size_ub * sizeof(int32_t);
+ 
+     size_t bytes_global   = bytes_identity_idx;
++    // float32 + dev 缓存: fp16 Tensor Core 打分 + fp32 精确重算前 R 个 (#38)。BUCKET2_F16_RERANK=0 关掉，
++    // BUCKET2_F16_R 改 R (默认 3 × M，≤ 256)
++    const bool f16_rerank = std::is_same<DataT, float>::value && use_dev_cache && M <= kRerankMaxR && D <= 256 &&
++        !(std::getenv("BUCKET2_F16_RERANK") && std::getenv("BUCKET2_F16_RERANK")[0] == '0');
++    const int rerank_R = std::max(M, std::min(kRerankMaxR,
++        std::getenv("BUCKET2_F16_R") ? std::atoi(std::getenv("BUCKET2_F16_R")) : 3 * M));
++    // fp16 副本行宽补到 8 的倍数 (16 B 对齐: cuBLAS 才选 align8 的 Tensor Core kernel；D=100 时是 align1/2)
++    const int64_t Dh = (D + 7) / 8 * 8;
++    const size_t bytes_Bh   = f16_rerank ? max_pool_size_ub * Dh * sizeof(__half) : 0;
++    const size_t bytes_cand = f16_rerank ? max_bucket_size * static_cast<size_t>(rerank_R) * 2 * sizeof(int32_t) : 0;
++    if (f16_rerank)
++        std::cout << "  [VectorKNN] float32: fp16 Tensor Core scoring + exact fp32 re-rank of top " << rerank_R << "\n";
+     size_t bytes_per_slot = bytes_B_raw + bytes_B + bytes_dots + bytes_norms_pool
+-                          + bytes_ids_bucket + bytes_ids_pool + bytes_out + bytes_out_dists;
++                          + bytes_ids_bucket + bytes_ids_pool + bytes_out + bytes_out_dists
++                          + bytes_Bh + bytes_cand;
+ 
+     // ---- 动态 num_slots ----
+     // 目标：让 num_slots × avg_blocks_per_kernel ≈ num_sm × OVERSUB，正好填满 SM 并留点
+@@ -5446,6 +5531,8 @@ void build_vector_knn_with_tensorcore(
+     // A 操作数 (resolve_bucket 总是先 resolve 自己，pool 前缀天然就是 A 的数据)。
+     DataT*       d_B_raw[MAX_SLOTS]         = {nullptr};
+     GemmInT*     d_B[MAX_SLOTS]             = {nullptr};
++    __half*      d_Bh[MAX_SLOTS]            = {nullptr};   // #38 fp16 副本 (float32 数据)
++    int32_t*     d_cand[MAX_SLOTS]          = {nullptr};   // #38 每行前 R 个 pool 下标 (+ 近似距离)
+     GemmOutT*    d_dots[MAX_SLOTS]          = {nullptr};
+     float*       d_norms_pool[MAX_SLOTS]    = {nullptr};
+     int32_t*     d_ids_bucket[MAX_SLOTS]    = {nullptr};
+@@ -5471,6 +5558,11 @@ void build_vector_knn_with_tensorcore(
+         CUDA_CHECK(cudaMalloc(&d_B_raw[s],         bytes_B_raw));
+         CUDA_CHECK(cudaMalloc(&d_B[s],             bytes_B));
+         CUDA_CHECK(cudaMalloc(&d_dots[s],          bytes_dots));
++        if (f16_rerank) {
++            CUDA_CHECK(cudaMalloc(&d_Bh[s],   bytes_Bh));
++            CUDA_CHECK(cudaMemset(d_Bh[s], 0, bytes_Bh));   // 补位列一直是 0 (gather 只写前 D 列)
++            CUDA_CHECK(cudaMalloc(&d_cand[s], bytes_cand));
++        }
+         CUDA_CHECK(cudaMalloc(&d_norms_pool[s],    bytes_norms_pool));
+         CUDA_CHECK(cudaMalloc(&d_ids_bucket[s],    bytes_ids_bucket));
+         CUDA_CHECK(cudaMalloc(&d_ids_pool[s],      bytes_ids_pool));
+@@ -6002,7 +6094,7 @@ void build_vector_knn_with_tensorcore(
+                                                        cudaMemcpyHostToDevice, streams[slot]));
+                         devcache_gather_pool_kernel<DataT, GemmInT><<<nj, 256, 0, streams[slot]>>>(
+                             jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]),
+-                            d_ids_pool[slot], d_norms_pool[slot], static_cast<int>(D));
++                            d_ids_pool[slot], d_norms_pool[slot], static_cast<int>(D), d_Bh[slot], static_cast<int>(Dh));
+                         CUDA_CHECK(cudaGetLastError());
+                         CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));   // job 表读完 (下次重写前等)
+                     }
+@@ -6157,7 +6249,7 @@ void build_vector_knn_with_tensorcore(
+                                            cudaMemcpyHostToDevice, streams[slot]));
+             devcache_gather_pool_kernel<DataT, GemmInT><<<nj, 256, 0, streams[slot]>>>(
+                 jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]), d_ids_pool[slot],
+-                d_norms_pool[slot], static_cast<int>(D));
++                d_norms_pool[slot], static_cast<int>(D), d_Bh[slot], static_cast<int>(Dh));
+             CUDA_CHECK(cudaGetLastError());
+             // 生产者等 ev_h2d 之后才重写 h_jobs[slot]: 映射模式下 kernel 读完才算完
+             CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));
+@@ -6259,6 +6351,22 @@ void build_vector_knn_with_tensorcore(
+                 if (stat != CUBLAS_STATUS_SUCCESS)
+                     throw std::runtime_error(
+                         "cublasGemmEx (fp16 Tensor Core) failed, status=" + std::to_string(stat));
++            } else if (f16_rerank) {
++                // fp16 副本打分 (fp32 累加)；只用来挑候选，距离在下面 f16_rerank_topM_kernel 里 fp32 重算
++                float alpha = 1.0f, beta = 0.0f;
++                stat = cublasGemmEx(
++                    cublas_handle,
++                    CUBLAS_OP_T, CUBLAS_OP_N,
++                    pool_size, rows, static_cast<int>(Dh),
++                    &alpha,
++                    d_Bh[slot], CUDA_R_16F, static_cast<int>(Dh),
++                    d_Bh[slot] + static_cast<size_t>(r0) * Dh, CUDA_R_16F, static_cast<int>(Dh),
++                    &beta,
++                    d_dots[slot], CUDA_R_32F, ldd_c,
++                    CUBLAS_COMPUTE_32F,
++                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
++                if (stat != CUBLAS_STATUS_SUCCESS)
++                    throw std::runtime_error("cublasGemmEx (fp16 scoring) failed, status=" + std::to_string(stat));
+             } else {
+                 float alpha = 1.0f, beta = 0.0f;
+                 stat = cublasSgemm(
+@@ -6291,6 +6399,22 @@ void build_vector_knn_with_tensorcore(
+             // actual_M ≤ 256: 单个 block top-M kernel (跟 GPU-resident 同一个，
+             // 输出按 bucket 内行号)，替代 dots_to_dist + raft select_k + gather
+             // 三个 kernel；更大的 M 回退到 raft select_k。
++            if (f16_rerank && actual_M <= 256) {
++                // 近似分数取前 R (pool 下标: ids 表用 identity)，不用跨轮阈值 (近似距离不能拿精确阈值剪)
++                const int aR = std::min(rerank_R, pool_size - 1);
++                int32_t* cids = d_cand[slot];
++                float* cdst = reinterpret_cast<float*>(d_cand[slot] + max_bucket_size * static_cast<size_t>(rerank_R));
++                if (!launch_block_topM_bucket<GemmOutT>(
++                        streams[slot], d_dots[slot], d_norms_pool[slot], d_identity_idx, cids, cdst,
++                        rows, pool_size, ldd_c, aR, /*out_ld=*/aR, nullptr, 0, r0))
++                    throw std::runtime_error("VectorKNN: fp16 re-rank needs R <= 256");
++                f16_rerank_topM_kernel<<<static_cast<unsigned>((rows + 3) / 4), 128, 0, streams[slot]>>>(
++                    reinterpret_cast<const float*>(d_B[slot]), d_norms_pool[slot], d_ids_pool[slot], cids,
++                    aR, static_cast<int>(D), actual_M, r0, rows, d_out_neighbors[slot],
++                    reinterpret_cast<float*>(d_out_neighbors[slot] + static_cast<size_t>(bucket_size) * actual_M));
++                CUDA_CHECK(cudaGetLastError());
++                fused_out = true;
++            } else
+             fused_out = launch_block_topM_bucket<GemmOutT>(
+                     streams[slot], d_dots[slot], d_norms_pool[slot], d_ids_pool[slot],
+                     d_out_neighbors[slot],
+@@ -6422,6 +6546,8 @@ void build_vector_knn_with_tensorcore(
+     for (int s = 0; s < num_slots; ++s) {
+         cudaFree(d_B_raw[s]);
+         cudaFree(d_B[s]);
++        cudaFree(d_Bh[s]);
++        cudaFree(d_cand[s]);
+         cudaFree(d_dots[s]);
+         cudaFree(d_norms_pool[s]);
+         cudaFree(d_ids_bucket[s]);
