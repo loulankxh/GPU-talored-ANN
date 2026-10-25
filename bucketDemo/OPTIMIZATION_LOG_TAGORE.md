@@ -147,6 +147,13 @@ Notes:
 - Judge reference (`judge.py`): SIFT1M → TAGORE k=96 row (resident ≥ TAGORE − 0.01, large ≥ TAGORE − 0.05);
   SIFT10M → TAGORE largeIndex cagra_eval row (≥ TAGORE − 0.05). Current best passes both.
 
+## User priorities (2026-10-24, relayed from the user's other session)
+
+0. **Finish A5** (#37): land it if it passes the bench set + msTuring100M ×3 milestone check.
+1. **Top priority next — float32 GEMMs on fp16 Tensor Cores + exact fp32 re-rank** (implementation only while the result is identical): Step 6 bucket × pool first, then Step 2 (KMeans‖ distances) and the exact Step 4 top-2 path (≤ 32768 centroids). Design: fp16 copy of the data for the GEMM (msTuring values within ±0.25; check range / scale like TAGORE's `norm_factor`), fp16-TC scoring of the whole pool, keep the top R per row (R = 2–4 × M), recompute those R exactly in fp32, select top-M. Verify vs the fp32 path on msTuring1M / 10M (bit-compare vector_knn, or per-row top-64 agreement + pre-prune recall); if agreement is not 100% at a reasonable R, report the mismatch rate and log the approximate variant as A<k> instead of keeping it. Context: cuVS nn_descent uses fp16 WMMA for dim > 16; V100 FP32 15.7 vs FP16-TC 125 TFLOPS; msTuring10M Step 6 159 of 223 s, msTuring100M Step 6 548 s / Step 2 316 s.
+2. **Then A1 (approved) on msTuring**: cut the calibrated pool (B 512 × NPROBE 256 ≈ 131K rows) by recovering missed neighbors via local join — resident (msTuring1M) via TAGORE GNN-Descent (`docs/A1_local_join.md` §1), large path (msTuring10M) via the fused prune + local join (§2); sweep NPROBE 256 → 128 / 64 / 40 with A1 on; report build time, pre-prune recall, search recall vs the CAGRA gate and the `A1_stats` line per point.
+3. **Then the user's multi-round idea** (approved to try): msTuring10M grid ITERATIONS ∈ {3, 4, 6, 8} × NPROBE ∈ {32, 64, 128, 256}, B 512 — time / pre-prune recall / search recall vs the gate, Pareto table in the log.
+
 ## Ideas backlog
 
 Ranked by expected SIFT100M saving (T0 study, 2026-10-22; details in `.claude/skills/optimize-bucket2-tagore/notes/tagore_map.md`).
