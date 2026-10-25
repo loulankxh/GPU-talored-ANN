@@ -50,6 +50,12 @@ files in `/home/lanlu/microBenchmark` (the cuVS loop's tree) except reading it.
   bundling are retired — one coherent change per iteration again, don't bundle to pass the gate).
 - **ACCEPT** iff the full bench set was run, at least one config gains, none regresses, search
   quality passes everywhere, 0 graph defects, path selection unchanged, large-path memory ≤ 1.2× best.
+- **Quality-margin rule (user, 2026-10-25):** search quality must *reliably* match or exceed the reference gate
+  (CAGRA for msTuring, TAGORE for SIFT), not just once — Step 4 is nondeterministic (msTuring itopk 32 spreads by
+  ≈ ±0.004 between runs). A parameter choice must clear the gate with margin in repeated runs (≥ 4 timed runs on GPU 0,
+  all above the floor; SMOKE runs understate the spread). A change that buys that robustness is accepted even if it is
+  slower: log it as **"quality-margin, accepted by rule"**, re-record the bests with `--rebaseline`, and put the multi-run
+  spread table (one row per candidate, itopk 32 per run, build time) in the log entry (examples: #45, #46, #48).
 - Pick ideas by SIFT100M stage times first (`state/best.json` → `sift100M_auto.stages_s`,
   `bucket2_steps_s`), then by msTuring10M (float path); ideas must scale with N (the large path
   stays out-of-core).
