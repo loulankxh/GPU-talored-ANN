@@ -47,10 +47,10 @@
   ],
   "params": {
    "CENTROID_RATIO": "0.001953125",
-   "NPROBE": "64",
+   "NPROBE": "80",
    "A1_PASSES": "1"
   },
-  "params_note": "#43 (multi-round + A1-R): avg bucket 512, 6 rounds x NPROBE 64 + 1 local-join pass; passes CAGRA gate -0.01 (#40: 3 x 160 + 2 passes)"
+  "params_note": "#45 (margin fix of #43): avg bucket 512, 6 rounds x NPROBE 80 + 1 local-join pass; itopk 32 min 0.6550 over 4 runs vs CAGRA gate 0.6528 (6 x 64 failed 1 of 4)"
  },
  "msTuring10M": {
   "dir": "/home/lanlu/microBenchmark/dataset/msTuring10M",

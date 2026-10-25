@@ -7080,8 +7080,12 @@ int run_pipeline_impl(
         // CPU 预算的 1/4 时：整份原始数据集读进 host 内存一次 (round 1 重排后
         // 换成新坐标系那份)，Step 4 的分配和 round 2..t 的 bucket 写入都直接
         // 用它，不再每轮读盘 2~3 遍。超预算时 (SIFT10M 以上) 照旧按区间读盘。
+        // 预算: 给了 --bucket-mem-mb (run_pipeline 按数据集算好的 host 记录预算) 就用它，否则
+        // cpu-limit/4 (P2.4b: msTuring10M float 两份 8 GB > 16 GB/4，原来 Step 4 每轮重读 3.3 s)
+        const size_t host_raw_budget = config.bucket_mem_mb > 0 ? (config.bucket_mem_mb << 20)
+                                                                : config.cpu_limit_bytes / 4;
         const bool ooc_host_raw = !gres &&
-            static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= config.cpu_limit_bytes / 4;
+            static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= host_raw_budget;
         if (x_lazy && !ooc_host_raw) {
             // raw_host 不会跨轮保留 (GPU-resident / 超预算): 照旧整份转 float
             X_sampled.resize(raw_host.size());
@@ -7584,7 +7588,7 @@ int run_pipeline_impl(
                 auto holder = std::make_shared<std::vector<DataT>>(std::move(reordered));
                 write_reordered_async(data_reordered_path, holder->data(), holder->size(), holder);
                 gres->permute(reorder_info.inverse_perm);
-            } else if (static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= config.cpu_limit_bytes / 4) {
+            } else if (static_cast<size_t>(N) * D * sizeof(DataT) * 2 <= host_raw_budget) {
                 // out-of-core 但原始数据 (两份: 读入 + 重排后) 放得进 CPU 预算的
                 // 1/4: 跟 GPU-resident 一样整份读入、按 inverse_perm 并行重排、一次
                 // 顺序写出 (SIFT1M 128 MB: 1.0 s → ~0.3 s)。超预算时走下面按桶缓冲
