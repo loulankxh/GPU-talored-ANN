@@ -1230,6 +1230,73 @@ __global__ void step4_top2_kernel(const float* __restrict__ dots,   // (n_rows, 
     }
 }
 
+// float32 Step 4 (#39, 用户优先级 1): fp16 Tensor Core 打分后每行留近似前 R 个 centroid，再用 fp32
+// 精确重算这 R 个的 ‖c‖² - 2·q·c 取前 2 (同距离取下标小的)。
+template <typename SrcT>
+__global__ void step4_to_f16_pad_kernel(const SrcT* __restrict__ x, __half* __restrict__ out,
+                                        int64_t n, int D, int Dh)   // (n, D) → (n, Dh)，补位 0
+{
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n * Dh) return;
+    const int64_t r = i / Dh; const int c = static_cast<int>(i - r * Dh);
+    out[i] = c < D ? __float2half_rn(static_cast<float>(x[r * D + c])) : __float2half_rn(0.0f);
+}
+
+// 4 个有序 (d, i) 寄存器槽的插入 (同 step4_top2_kernel 的 if 链)
+__device__ __forceinline__ void step4_ins4(float d, int c, float (&b)[4], int (&ix)[4])
+{
+    if (!step4_less(d, c, b[3], ix[3])) return;
+    if (step4_less(d, c, b[1], ix[1])) {
+        b[3] = b[2]; ix[3] = ix[2]; b[2] = b[1]; ix[2] = ix[1];
+        if (step4_less(d, c, b[0], ix[0])) { b[1] = b[0]; ix[1] = ix[0]; b[0] = d; ix[0] = c; }
+        else { b[1] = d; ix[1] = c; }
+    } else if (step4_less(d, c, b[2], ix[2])) { b[3] = b[2]; ix[3] = ix[2]; b[2] = d; ix[2] = c; }
+    else { b[3] = d; ix[3] = c; }
+}
+
+// fp16 近似分数取前 4，fp32 精确重算这 4 个取前 2
+__global__ void step4_top4_rerank_kernel(const float* __restrict__ dots,   // (n_rows, C) 近似点积
+                                         const float* __restrict__ cnorm,  // (C,) 精确
+                                         const float* __restrict__ cent,   // (C, D) fp32
+                                         const float* __restrict__ q,      // (n_rows, D) fp32
+                                         int64_t n_rows, int C, int D,
+                                         uint32_t* __restrict__ out)       // (n_rows, 2)
+{
+    const int64_t row = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= n_rows) return;
+    const float* r = dots + row * static_cast<int64_t>(C);
+    float b[4] = {INFINITY, INFINITY, INFINITY, INFINITY};
+    int ix[4] = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
+    for (int c = lane; c < C; c += 32) step4_ins4(cnorm[c] - 2.0f * r[c], c, b, ix);
+    for (int off = 16; off > 0; off >>= 1) {   // 两个有序 4 元组归并取前 4
+        float ob[4]; int oi[4];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) { ob[k] = __shfl_down_sync(0xffffffffu, b[k], off); oi[k] = __shfl_down_sync(0xffffffffu, ix[k], off); }
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) step4_ins4(ob[k], oi[k], b, ix);
+    }
+    const float* qv = q + row * static_cast<int64_t>(D);
+    float e1 = INFINITY, e2 = INFINITY; int j1 = 0x7fffffff, j2 = 0x7fffffff;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int c = __shfl_sync(0xffffffffu, ix[k], 0);
+        if (c < 0 || c >= C) continue;   // bounds check (不足 4 个)
+        const float* cv = cent + static_cast<int64_t>(c) * D;
+        float part = 0.0f;
+        for (int e = lane; e < D; e += 32) part += qv[e] * cv[e];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
+        const float d = cnorm[c] - 2.0f * part;
+        if (step4_less(d, c, e1, j1)) { e2 = e1; j2 = j1; e1 = d; j1 = c; }
+        else if (step4_less(d, c, e2, j2)) { e2 = d; j2 = c; }
+    }
+    if (lane == 0) {
+        out[row * 2]     = static_cast<uint32_t>(j1);
+        out[row * 2 + 1] = static_cast<uint32_t>(j2);
+    }
+}
+
 // ============== Phase 8: Batch Assignment via Graph ANNS ==============
 
 // 定义在后面 (Step 6 的 gather kernel)；Step 4 out-of-core 路径复用它在 GPU 上
@@ -1468,9 +1535,22 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             d_cent_f, d_cnorm, n_centroids, static_cast<int>(D));
         CUDA_CHECK(cudaGetLastError());
     }
+    // #39: fp32 数据的精确 top-2 用 fp16 Tensor Core 打分 + fp32 重算前 kStep4R 个 (BUCKET2_F32_F16SCORE=0 关掉)
+    const bool f32_f16score = exact_f32 &&
+        !(std::getenv("BUCKET2_F32_F16SCORE") && std::getenv("BUCKET2_F32_F16SCORE")[0] == '0');
+    const int64_t Dh4 = (static_cast<int64_t>(D) + 7) / 8 * 8;   // fp16 行宽补到 8 的倍数 (align8 Tensor Core kernel)
     if (exact_f32) {
         if (cublasCreate(&f16_cublas) != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error("batch_assign: cublasCreate failed");
+        if (f32_f16score) {
+            cublasSetMathMode(f16_cublas, CUBLAS_TENSOR_OP_MATH);
+            const int64_t ch = n_centroids * Dh4;
+            CUDA_CHECK(cudaMalloc(&d_cent_h, ch * sizeof(__half)));
+            CUDA_CHECK(cudaMalloc(&d_q_h, f32_tile * Dh4 * sizeof(__half)));
+            step4_to_f16_pad_kernel<float><<<static_cast<unsigned>((ch + 255) / 256), 256>>>(
+                reinterpret_cast<const float*>(d_centroids), d_cent_h, n_centroids, static_cast<int>(D), static_cast<int>(Dh4));
+            CUDA_CHECK(cudaGetLastError());
+        }
         CUDA_CHECK(cudaMalloc(&d_cnorm, n_centroids * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_f16_dots, f32_tile * n_centroids * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_top2_u32, Nv * TOP_K * sizeof(uint32_t)));
@@ -1629,6 +1709,25 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             const float* d_c_f = reinterpret_cast<const float*>(d_centroids);
             for (int64_t t0 = 0; t0 < batch_size; t0 += f32_tile) {
                 const int64_t tn = std::min(f32_tile, batch_size - t0);
+                if (f32_f16score) {
+                    const int64_t qe = tn * Dh4;
+                    step4_to_f16_pad_kernel<float><<<static_cast<unsigned>((qe + 255) / 256), 256>>>(
+                        d_q_f + t0 * D, d_q_h, tn, static_cast<int>(D), static_cast<int>(Dh4));
+                    cublasStatus_t st = cublasGemmEx(f16_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        static_cast<int>(n_centroids), static_cast<int>(tn), static_cast<int>(Dh4), &alpha,
+                        d_cent_h, CUDA_R_16F, static_cast<int>(Dh4),
+                        d_q_h, CUDA_R_16F, static_cast<int>(Dh4), &beta,
+                        d_f16_dots, CUDA_R_32F, static_cast<int>(n_centroids),
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    if (st != CUBLAS_STATUS_SUCCESS)
+                        throw std::runtime_error("batch_assign: fp16 scoring GEMM failed, status=" + std::to_string(st));
+                    const int64_t threads = tn * 32;
+                    step4_top4_rerank_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
+                        d_f16_dots, d_cnorm, d_c_f, d_q_f + t0 * D, tn, static_cast<int>(n_centroids),
+                        static_cast<int>(D), d_top2_u32 + t0 * TOP_K);
+                    CUDA_CHECK(cudaGetLastError());
+                    continue;
+                }
                 cublasStatus_t st = cublasSgemm(f16_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                     static_cast<int>(n_centroids), static_cast<int>(tn), static_cast<int>(D), &alpha,
                     d_c_f, static_cast<int>(D), d_q_f + t0 * D, static_cast<int>(D), &beta,
@@ -1636,6 +1735,11 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 if (st != CUBLAS_STATUS_SUCCESS)
                     throw std::runtime_error("batch_assign: fp32 GEMM failed, status=" + std::to_string(st));
                 const int64_t threads = tn * 32;
+                if (std::getenv("BUCKET2_F32_RERANK_REF"))   // 验证用: SGEMM 分数 + 同一个精确重算
+                    step4_top4_rerank_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
+                        d_f16_dots, d_cnorm, d_c_f, d_q_f + t0 * D, tn, static_cast<int>(n_centroids),
+                        static_cast<int>(D), d_top2_u32 + t0 * TOP_K);
+                else
                 step4_top2_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
                     d_f16_dots, d_cnorm, tn, static_cast<int>(n_centroids), d_top2_u32 + t0 * TOP_K);
                 CUDA_CHECK(cudaGetLastError());
