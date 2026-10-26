@@ -30,40 +30,40 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#56 (A7 on SIFT: SIFT10M 2 rounds + unwindowed prune, SIFT1M unwindowed prune)**, 2026-10-26 (`runs/tagore58`). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
+After **#58 (B12: prune GPU bucket pool across chunks)**, 2026-10-26 (`runs/tagore61`, re-baselined: the only failure was sift1M_large bucket2 noise, A/B in #58). msTuring100M (milestone, not in the bench set): 1559.90 s median (best entry `runs/tagore51` 1551.3 s kept, see #58 for the bucket2 RSS spread). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
 
 **Build time (s, median of reps; sum of all stages)**
 
 | config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | resident | 3 | 4.84 | +0.0% | +22.7% | 0.53x | 0.42x | bucket2 4.84 | 5000 | 1.59 |
-| sift1M_large | large | 3 | 7.75 | +0.9% | +20.0% | 0.84x | 0.67x | bucket2 5.87, prune 0.73, optimize_chunked 0.71, translate 0.39 | 1252 | 1.90 |
-| sift10M_auto | large | 3 | 46.64 | +20.5% | +43.4% | 0.22x | 0.38x | bucket2 37.04, prune 4.20, optimize_chunked 2.87, translate 2.56 | 8996 | 10.80 |
-| msTuring1M_auto | resident | 3 | 15.98 | +1.5% | +2.7% | 1.71x | 1.39x | bucket2 15.98 | 5154 | 1.67 |
-| msTuring10M_auto | large | 3 | 129.06 | -0.4% | +46.4% | 0.56x | 1.08x | bucket2 118.56, prune 4.96, optimize_chunked 2.97, translate 2.62 | 8996 | 20.46 |
-| sift100M_auto | large | 3 | 575.87 | +3.4% | +82.1% | 0.27x | 0.78x | bucket2 388.55, prune 96.02, optimize_chunked 70.26, translate 22.10 | 14588 | 44.88 |
+| sift1M_auto | resident | 3 | 4.89 | +0.0% | +21.9% | 0.53x | 0.42x | bucket2 4.89 | 4992 | 1.59 |
+| sift1M_large | large | 3 | 8.02 | +0.0% | +17.2% | 0.87x | 0.69x | bucket2 6.24, prune 0.73, optimize_chunked 0.71, translate 0.34 | 1252 | 1.90 |
+| sift10M_auto | large | 3 | 46.87 | +0.0% | +43.1% | 0.22x | 0.38x | bucket2 37.21, prune 4.20, optimize_chunked 2.89, translate 2.58 | 8996 | 10.85 |
+| msTuring1M_auto | resident | 3 | 16.42 | +0.0% | +0.0% | 1.76x | 1.43x | bucket2 16.42 | 5154 | 1.67 |
+| msTuring10M_auto | large | 3 | 131.22 | +0.0% | +45.5% | 0.57x | 1.10x | bucket2 120.68, prune 5.01, optimize_chunked 2.95, translate 2.58 | 8996 | 20.30 |
+| sift100M_auto | large | 3 | 557.30 | +0.0% | +82.7% | 0.26x | 0.76x | bucket2 394.22, prune 64.64, optimize_chunked 73.89, translate 23.26 | 14588 | 46.38 |
 
 **bucket2 step breakdown (s)**
 
 | config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | 0.65 | 0.16 | 0.06 | 0.00 | 0.38 | 0.21 | 0.01 | 1.89 | 0.00 | 0.95 |
-| sift1M_large | 0.16 | 0.31 | 0.16 | 0.00 | 1.04 | 0.17 | 0.02 | 2.86 | 0.61 | 0.00 |
-| sift10M_auto | 1.14 | 1.79 | 0.21 | 0.00 | 10.63 | 1.66 | 0.18 | 15.28 | 4.62 | 0.00 |
-| msTuring1M_auto | 0.90 | 0.39 | 0.04 | 0.00 | 0.81 | 0.48 | 0.01 | 11.30 | 0.00 | 0.96 |
-| msTuring10M_auto | 9.10 | 5.98 | 0.23 | 0.00 | 28.72 | 4.29 | 0.20 | 63.86 | 4.51 | 0.00 |
-| sift100M_auto | 11.79 | 5.34 | 2.74 | 0.00 | 137.37 | 27.52 | 3.31 | 168.22 | 27.30 | 0.00 |
+| sift1M_auto | 0.64 | 0.16 | 0.06 | 0.00 | 0.38 | 0.20 | 0.01 | 1.90 | 0.00 | 0.98 |
+| sift1M_large | 0.15 | 0.35 | 0.18 | 0.00 | 1.13 | 0.25 | 0.04 | 2.92 | 0.54 | 0.00 |
+| sift10M_auto | 1.16 | 1.75 | 0.21 | 0.00 | 10.92 | 1.65 | 0.18 | 15.32 | 4.56 | 0.00 |
+| msTuring1M_auto | 0.89 | 0.40 | 0.03 | 0.00 | 0.81 | 0.48 | 0.02 | 11.62 | 0.00 | 1.00 |
+| msTuring10M_auto | 7.79 | 6.09 | 0.25 | 0.00 | 32.08 | 4.27 | 0.21 | 64.62 | 4.59 | 0.00 |
+| sift100M_auto | 11.92 | 5.34 | 2.70 | 0.00 | 137.34 | 27.44 | 2.92 | 171.67 | 29.98 | 0.00 |
 
 **(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
 
 | config | recall@1 | recall@10 | recall@32 | recall@64 |
 |---|---|---|---|---|
-| sift1M_auto | 0.9364 | 0.9222 | 0.9112 | 0.9019 |
-| sift1M_large | 0.9427 | 0.9245 | 0.9119 | 0.9023 |
-| sift10M_auto | 0.7694 | 0.7242 | 0.7004 | 0.6841 |
-| msTuring1M_auto | 0.9878 | 0.9781 | 0.9646 | 0.9508 |
-| msTuring10M_auto | 0.8053 | 0.7624 | 0.7324 | 0.7110 |
-| sift100M_auto | 0.6520 | 0.6169 | 0.5909 | 0.5735 |
+| sift1M_auto | 0.9406 | 0.9243 | 0.9119 | 0.9022 |
+| sift1M_large | 0.9397 | 0.9232 | 0.9119 | 0.9021 |
+| sift10M_auto | 0.7606 | 0.7233 | 0.6997 | 0.6840 |
+| msTuring1M_auto | 0.9894 | 0.9796 | 0.9655 | 0.9519 |
+| msTuring10M_auto | 0.8145 | 0.7670 | 0.7366 | 0.7153 |
+| sift100M_auto | 0.6496 | 0.6162 | 0.5915 | 0.5740 |
 
 **(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
 
@@ -79,12 +79,12 @@ After **#56 (A7 on SIFT: SIFT10M 2 rounds + unwindowed prune, SIFT1M unwindowed 
 | CAGRA CAGRA NN-Descent 64->32, msTuring10M | 0.6621 / 1418K | 0.7995 / 740K | 0.8922 / 370K | 0.9451 / 150K | 0.9741 / 47K |
 | TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
 | CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
-| ours sift1M_auto | 0.9248 / 2216K | 0.9756 / 1190K | 0.9932 / 562K | 0.9985 / 189K | 0.9997 / 68K |
-| ours sift1M_large | 0.9251 / 1947K | 0.9754 / 1035K | 0.9936 / 520K | 0.9983 / 174K | 0.9997 / 68K |
-| ours sift10M_auto | 0.8307 / 1962K | 0.9218 / 1064K | 0.9701 / 528K | 0.9901 / 187K | 0.9970 / 66K |
-| ours msTuring1M_auto | 0.6574 / 1493K | 0.7877 / 800K | 0.8841 / 372K | 0.9445 / 147K | 0.9770 / 47K |
-| ours msTuring10M_auto | 0.6292 / 1424K | 0.7674 / 744K | 0.8655 / 370K | 0.9254 / 150K | 0.9603 / 47K |
-| ours sift100M_auto | 0.7256 / 57K | 0.8337 / 53K | 0.9117 / 33K | 0.9598 / 19K | 0.9843 / 11K |
+| ours sift1M_auto | 0.9250 / 1944K | 0.9756 / 1036K | 0.9938 / 508K | 0.9986 / 187K | 0.9997 / 68K |
+| ours sift1M_large | 0.9250 / 2221K | 0.9754 / 1190K | 0.9935 / 562K | 0.9984 / 189K | 0.9996 / 68K |
+| ours sift10M_auto | 0.8308 / 1867K | 0.9215 / 1011K | 0.9697 / 526K | 0.9897 / 186K | 0.9972 / 68K |
+| ours msTuring1M_auto | 0.6577 / 1492K | 0.7890 / 800K | 0.8842 / 371K | 0.9436 / 147K | 0.9767 / 47K |
+| ours msTuring10M_auto | 0.6209 / 1448K | 0.7655 / 770K | 0.8655 / 374K | 0.9258 / 150K | 0.9604 / 47K |
+| ours sift100M_auto | 0.7258 / 55K | 0.8341 / 52K | 0.9104 / 31K | 0.9583 / 18K | 0.9832 / 10K |
 
 ## Baseline verification
 
@@ -189,8 +189,9 @@ SIFT100M Step 6 = 1687 s of 3215 s, and ~1000 s of it is the producer waiting on
 | B6 | `optimize_chunked -m E`: reverse edges collected on the GPU per chunk (unbounded, same rule), disk edge accumulator only when a chunk does not fit | `filter_cagra` reverse push + `filter_reverse_1hop` | optimize_chunked 280 (acc.finish 91, Phase 1 53) | −80…−140 s |
 
 | B11 | **done #30** — Resident Step 6 holds pool-sized device buffers (`ensure_device` in `run_round`, `src/bucket.cu:3972`) across rounds → GPU OOM at large pools (msTuring1M B 512 / NPROBE ≥ 157: round-2 Step 4 alloc `:1475` with 15.8 GB used; B 512 / NPROBE 256 OOM at `:3972`). Tile the pool or free between rounds; on failure fall back to the large path instead of a FATAL. Unblocks msTuring1M calibration (needs pre@10 ≈ 0.9) | `largeIndex` fixed `graph_pool` | resident Step 6 memory | robustness; msTuring1M gate |
-| B12 | Prune: GPU Belady bucket cache across chunks (like Step 6 #1/#2) so a bucket loaded once stays on the GPU while its future windows need it — cut the 9.98 × N reload factor (each reload = pread + H2D, ~95 ns / row); pinned memory within the RSS guard | `largeIndex` reorder + buffer reuse | prune SIFT100M 102 s, msTuring100M 235 s | −40…−60 s |
+| B12 | **done #58** — Prune: GPU Belady bucket cache across chunks (like Step 6 #1/#2) so a bucket loaded once stays on the GPU while its future windows need it — cut the 9.98 × N reload factor (each reload = pread + H2D, ~95 ns / row); pinned memory within the RSS guard | `largeIndex` reorder + buffer reuse | prune SIFT100M 102 s, msTuring100M 235 s | −40…−60 s |
 | B13 | **tried #57: quality +0.015 at 100M but +60–100 s I/O, no round saved — off by default** — Chunked prune ranks out-of-window candidates by Step 6's exact distances: bucket2 keeps `vector_dists` (today `--skip-dists`), the prune uses them for the candidates whose vectors are not in the chunk instead of +inf (sorting correct; detour checks for those still missing). Half of A7's effect without loading extra rows — test first on SIFT10M with the chunked prune forced vs windowed vs unwindowed (#55 / #56) | — | prune quality on 100M (12.9 / 20.7 unverified edges per row) | quality → fewer rounds / smaller NPROBE at 100M | dists file I/O (N × 64 × 4 B: 25.6 GB at 100M) |
+| B14 | bucket2 peak RSS on msTuring100M is bimodal with unchanged code: 56–67 GB or 90–93 GB (tagore50 93 / 93 / 56, tagore51 57 / 57 / 67, tagore61 93 / 93 / 93); same plans, record sizes and cache budgets in the logs, no mmap. The ~37 GB gap ≈ one round's records (38 GiB) or the 47 GB VectorKNN host cache budget → find the buffer that is sometimes resident twice (per-step RSS probes), then bound it; also makes the 1.2× RSS guard meaningful for msTuring100M | — | bucket2 host memory | memory guard; 1B scalability |
 ## Awaiting approval
 
 | id | idea | TAGORE source | target stage | expected gain | what changes semantically | status |
@@ -1480,4 +1481,11 @@ User rule: "only if 10M shows a net gain, test the chunked 100M path" — 10M ga
 - **SIFT10M, chunked prune forced (`PRUNE_CACHE_MB=2000`, 2 rounds, 1 rep):** windowed 50.35 s, itopk 32 / 64 = 0.8095 / 0.9073, 11.1 unverified kept edges / row; **B13 50.54 s, 0.8242 / 0.9168** (prune +0.7 s) — about ¾ of the unwindowed batched prune's gain (0.8290 / 0.9210, #56).
 - **SIFT100M (1 rep):** current (2 rounds, NPROBE 40, #56 run) 575.87 s, DiskANN L 32 / 64 / 128 = 0.7256 / 0.8337 / 0.9117; B13 NPROBE 40: **648.63 s** (bucket2 +63 s: writing the 25.6 GB `vector_dists.bin`), 0.7458 / 0.8483 / 0.9218; B13 NPROBE 32: 676.29 s, 0.7344 / 0.8407 / 0.9164. To pay for itself the quality gain would have to save a round: 1 round + B13 520.31 s, 0.6579 / **0.7736** / 0.8635; 1 round without 418.95 s, 0.6489 / 0.7643 / 0.8564 — far below the 2-round quality.
 - **Verdict:** at 100M B13 costs 60–100 s of distance-file I/O and its +0.015 recall cannot buy back a round or a smaller pool → not adopted. A cheaper variant would keep only the distances of the out-of-window candidates or pass them from bucket2 to the prune without the full file.
+
+### #58 — B12: chunked prune keeps a GPU bucket pool across chunks (2026-10-26) — KEPT (judge REJECT on sift1M_large bucket2 noise + msTuring100M bucket2 RSS spread; bench set re-baselined)
+- **Implementation (`prune_windowed_gpu.cu`, `run_chunked`):** instead of reusing only the previous chunk's rows, one device pool of 64-row slots holds whole buckets; the full chunk plan is computed first, each bucket's next use is known, and eviction is Belady (furthest next use; the current chunk's buckets are pinned before eviction). A per-chunk slot table maps (bucket, row) to pool rows (`row_of` in `prune_kernel`); fresh bucket runs are pread into the existing pinned host buffer and scattered into their slots by a kernel reading pinned memory through UVA — no new host buffer (what sank #32). Pool size = max(2 × chunk capacity, free GPU memory × 0.9 − other buffers − 512 MB). `BUCKET2_PRUNE_POOL=0` restores the old path. Class: implementation (output byte-identical).
+- **Simulation on the real SIFT100M chunk plan (95 chunks, cap 11.18M rows):** reload factor 8.38 × N today → Belady pool 2 × cap 4.88, 3 × cap 3.65, 4 × cap 2.83.
+- **Standalone on a kept SIFT100M intermediate:** old 95.85 s, 9.17 × N rows loaded; pool 2 × cap 74.69 s, 5.48 × N; pool from free GPU memory (526 557 slots) **64.69 s, 4.13 × N**; output byte-identical in every case; peak RSS 4.64 → 4.69 GB.
+- **Bench set (×3, `runs/tagore61`):** **sift100M 575.87 → 557.30 s (+3.2%), prune 96.0 → 64.6 s**; sift1M_auto −1.0%, **sift1M_large −3.5%** (8.02 vs 7.75 s; bucket2 5.87 → 6.24 s, prune 0.73 = 0.73), sift10M −0.5%, msTuring1M −2.8%, msTuring10M −1.7%; quality passes, 0 defects, paths unchanged. **msTuring100M ×3:** 1559.90 s (−0.6% vs 1551.3), **prune 239.8 → 152.1 s**, bucket2 1225.5 → 1314.4 s; DiskANN L 32…512 recall@10 0.6053 / 0.7111 / 0.7969 / 0.8637 / 0.9121; bucket2 peak RSS 88.8 GB vs best 63.65 GB → judge memory fail.
+- **Why kept:** B12 changes only the `prune_windowed` binary. sift1M_large A/B (×3 each, same binaries, `runs/tagore61/ab_*`): pool off 7.83 s (bucket2 6.06, prune 0.73) vs on 8.02 s (bucket2 6.21, prune 0.73) → the gap is bucket2 run-to-run noise. The msTuring100M bucket2 RSS is bimodal with unchanged code (tagore50 93 / 93 / 56 GB, tagore51 57 / 57 / 67, tagore61 93 / 93 / 93) → backlog B14; prune RSS is unchanged (4.7 GB). Re-baselined the six bench configs (`judge.py --update --rebaseline`); the msTuring100M best entry stays at `runs/tagore51`.
 

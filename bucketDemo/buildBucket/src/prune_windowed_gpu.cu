@@ -17,6 +17,8 @@
 // cuVS 26.12 reference: detail/cagra/graph_core.cuh::kern_fused_prune (warp
 // per node, detours counted against the node's sorted row in shared memory).
 
+#include <climits>
+#include <numeric>
 #include <functional>
 #include <cstdlib>
 #include <iostream>
@@ -130,6 +132,28 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) a7_refine_kernel(
     }
 }
 
+// B12: 分块 prune 的 GPU 桶池 —— 行按 kSlotRows 行一槽存放 (桶占若干个不必连续的槽，没有碎片)，
+// 跨块按 Belady (下一次被用到的块最远的先淘汰) 保留，代替只从上一块复用 (SIFT100M 重读 8.4 × N 行 → 模拟 4.9 × N)
+constexpr int kSlotRows = 64;
+struct SlotJob { int64_t host_row; int32_t n; int32_t tab0; };   // 新装的桶: pinned 里的起始行、行数、槽表起点
+// 新读的行从 pinned (UVA 直接可读) 拷进各自的槽: 一个 block 一个桶
+__global__ void scatter_slots_kernel(const SlotJob* __restrict__ jobs, const int32_t* __restrict__ slot_tab,
+                                     const int32_t* __restrict__ h_cand, const uint8_t* __restrict__ h_vec,
+                                     int32_t* __restrict__ cand, uint8_t* __restrict__ vec, int M, int vec_row_bytes)
+{
+    const SlotJob j = jobs[blockIdx.x];
+    for (int64_t i = threadIdx.x; i < static_cast<int64_t>(j.n) * M; i += blockDim.x) {
+        const int64_t r = i / M, c = i - r * M;
+        const int64_t dst = static_cast<int64_t>(slot_tab[j.tab0 + r / kSlotRows]) * kSlotRows + r % kSlotRows;
+        cand[dst * M + c] = h_cand[(j.host_row + r) * M + c];
+    }
+    for (int64_t i = threadIdx.x; i < static_cast<int64_t>(j.n) * vec_row_bytes; i += blockDim.x) {
+        const int64_t r = i / vec_row_bytes, c = i - r * vec_row_bytes;
+        const int64_t dst = static_cast<int64_t>(slot_tab[j.tab0 + r / kSlotRows]) * kSlotRows + r % kSlotRows;
+        vec[dst * vec_row_bytes + c] = h_vec[(j.host_row + r) * vec_row_bytes + c];
+    }
+}
+
 // 保留下来的边里，候选不在窗口里 (距离未知 = +inf、没做 detour 检查) 的条数 (A4 统计)
 __device__ unsigned long long g_unverified_kept = 0;
 
@@ -147,7 +171,8 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     int* __restrict__ err,
     bool unwin = false,                    // A7: 整份数据在显存时不按窗口限制 (所有候选都有真实距离 / detour 检查)
     const int32_t* __restrict__ own = nullptr,   // A7: 中心点自己的精修候选行 (按 a - row0)
-    const float* __restrict__ cdist = nullptr)   // B13: 中心点候选的 Step 6 距离 (按 a - row0，行宽 M)
+    const float* __restrict__ cdist = nullptr,   // B13: 中心点候选的 Step 6 距离 (按 a - row0，行宽 M)
+    const int32_t* __restrict__ slot_tab = nullptr)   // B12: 桶 q 的第 j 个 kSlotRows 行槽 = slot_tab[cbase[q] + j]
 {
     __shared__ float   s_dist[kWarpsPerBlock][kMaxM];
     __shared__ int32_t s_id  [kWarpsPerBlock][kMaxM];
@@ -165,7 +190,11 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     const int32_t* wp = win + static_cast<int64_t>(p) * W;
     const int wl = win_len[p];
     // 点 id → cand/vec 里的行 (整份数据: cbase = offsets → 行 = id；分块: 只装了窗口并集)
-    auto row_of = [&](int q, uint32_t id) { return cbase[q] + (static_cast<int64_t>(id) - offsets[q]); };
+    auto row_of = [&](int q, uint32_t id) -> int64_t {
+        const int64_t r = static_cast<int64_t>(id) - offsets[q];
+        if (!slot_tab) return cbase[q] + r;
+        return static_cast<int64_t>(slot_tab[cbase[q] + r / kSlotRows]) * kSlotRows + r % kSlotRows;
+    };
     const int64_t arow = row_of(p, static_cast<uint32_t>(a));
     if (cbase[p] < 0) { if (lane == 0) atomicExch(err, 2); return; }   // bounds check: center not loaded
     const T* va = vec + arow * D;
@@ -506,8 +535,33 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
         cudaFree(d_runs); cudaFree(d_off); cudaFree(d_win);
         cudaFree(d_wl); cudaFree(d_out); cudaFree(d_err); cudaFree(d_cbase);
     };
+    // B12: GPU 桶池 (默认开; BUCKET2_PRUNE_POOL=0 回到两套缓冲 + 只从上一块复用)
+    const bool pool_mode = !(std::getenv("BUCKET2_PRUNE_POOL") && std::getenv("BUCKET2_PRUNE_POOL")[0] == '0');
+    // 池按空闲显存定 (扣掉输出 / 窗口 / 槽表等，留 10% + 512 MB 余量)，至少两套缓冲那么大
+    int64_t pool_slots = 2 * cap_rows / kSlotRows;
+    if (pool_mode) {
+        size_t free_b = 0, total_b = 0;
+        PWG_CHECK(cudaMemGetInfo(&free_b, &total_b));
+        const double other = static_cast<double>(cap_rows) * out_deg * sizeof(uint32_t)
+                           + static_cast<double>(h_win.size() + h_win_len.size()) * sizeof(int32_t)
+                           + static_cast<double>(n_buckets) * (sizeof(int64_t) + sizeof(SlotJob) + 2 * sizeof(int32_t) + sizeof(uint32_t))
+                           + static_cast<double>(cap_rows) / kSlotRows * sizeof(int32_t)
+                           + (g_center_dists ? static_cast<double>(cap_rows) * M * sizeof(float) : 0.0)
+                           + (512.0 * (1 << 20));
+        const double room = 0.9 * static_cast<double>(free_b) - other;
+        const int64_t fit = room > 0 ? static_cast<int64_t>(room / (static_cast<double>(row_bytes) * kSlotRows)) : 0;
+        pool_slots = std::max(pool_slots, fit);
+    }
+    int32_t* d_candP = nullptr; T* d_vecP = nullptr; int32_t* d_tab = nullptr; SlotJob* d_jobs = nullptr;
+    auto cleanup_pool = [&] { cudaFree(d_candP); cudaFree(d_vecP); cudaFree(d_tab); cudaFree(d_jobs); };
     try {
         Staging stg;
+        if (pool_mode) {
+            PWG_CHECK(cudaMalloc(&d_candP, static_cast<size_t>(pool_slots) * kSlotRows * M * sizeof(int32_t)));
+            PWG_CHECK(cudaMalloc(&d_vecP,  static_cast<size_t>(pool_slots) * kSlotRows * vec_row));
+            PWG_CHECK(cudaMalloc(&d_tab,   (static_cast<size_t>(cap_rows) / kSlotRows + n_buckets) * sizeof(int32_t)));
+            PWG_CHECK(cudaMalloc(&d_jobs,  static_cast<size_t>(n_buckets) * sizeof(SlotJob)));
+        } else
         for (int b = 0; b < 2; ++b) {
             PWG_CHECK(cudaMalloc(&d_candB[b], static_cast<size_t>(cap_rows) * M * sizeof(int32_t)));
             PWG_CHECK(cudaMalloc(&d_vecB[b],  static_cast<size_t>(cap_rows) * vec_row));
@@ -549,6 +603,135 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             PWG_CHECK(cudaMalloc(&d_cdist, static_cast<size_t>(cap_rows) * M * sizeof(float)));
             std::cout << "  B13: centers ranked by Step 6 distances (vector_dists)\n";
         }
+        if (pool_mode) {
+            // ---- 先把所有块规划出来 (跟下面原来的规划完全一样)，记下每个桶被哪些块用到 ----
+            struct Plan { int p0, p1; std::vector<int32_t> U; };
+            std::vector<Plan> plans;
+            for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
+                Plan pl; pl.p0 = p0;
+                int64_t rows = 0; int p1 = p0;
+                while (p1 < n_buckets) {
+                    const int32_t* wp = h_win.data() + static_cast<size_t>(p1) * W;
+                    const int wl = h_win_len[static_cast<size_t>(p1)];
+                    int64_t add = 0;
+                    for (int i = 0; i < wl; ++i)
+                        if (stamp[static_cast<size_t>(wp[i])] != chunk_id) add += h_offsets[wp[i] + 1] - h_offsets[wp[i]];
+                    if (p1 > p0 && rows + add > cap_rows) break;
+                    for (int i = 0; i < wl; ++i) {
+                        const int q = wp[i];
+                        if (q < 0 || q >= n_buckets) throw std::runtime_error("prune_windowed_gpu: window position out of range");
+                        if (stamp[static_cast<size_t>(q)] != chunk_id) { stamp[static_cast<size_t>(q)] = chunk_id; pl.U.push_back(q); }
+                    }
+                    rows += add; ++p1;
+                }
+                pl.p1 = p1; plans.push_back(std::move(pl)); p0 = p1;
+            }
+            std::vector<std::vector<int32_t>> uses(static_cast<size_t>(n_buckets));
+            for (int32_t c = 0; c < static_cast<int32_t>(plans.size()); ++c)
+                for (int q : plans[static_cast<size_t>(c)].U) uses[static_cast<size_t>(q)].push_back(c);
+            std::vector<int32_t> use_ptr(static_cast<size_t>(n_buckets), 0);
+            std::vector<std::vector<int32_t>> slots_of(static_cast<size_t>(n_buckets));
+            std::vector<char> resident(static_cast<size_t>(n_buckets), 0);
+            std::vector<int32_t> free_slots(static_cast<size_t>(pool_slots));
+            std::iota(free_slots.begin(), free_slots.end(), 0);
+            std::vector<int32_t> resident_list;
+            std::vector<int32_t> h_tab; std::vector<SlotJob> h_jobs;
+            std::vector<int32_t> prevU;
+            auto nslots = [&](int q) { return static_cast<int32_t>((h_offsets[q + 1] - h_offsets[q] + kSlotRows - 1) / kSlotRows); };
+            for (int32_t c = 0; c < static_cast<int32_t>(plans.size()); ++c) {
+                const Plan& pl = plans[static_cast<size_t>(c)];
+                for (int q : prevU) cbase[static_cast<size_t>(q)] = -1;
+                for (int q : pl.U) { use_ptr[static_cast<size_t>(q)]++; stamp[static_cast<size_t>(q)] = -2 - c; }   // 本块这次用掉 + 标记 "本块要用" (淘汰时跳过)
+                // 未命中的桶 + 需要的槽数
+                std::vector<int32_t> fresh;
+                int64_t need = 0;
+                for (int q : pl.U) if (!resident[static_cast<size_t>(q)]) { fresh.push_back(q); need += nslots(q); }
+                if (need > static_cast<int64_t>(free_slots.size())) {   // Belady: 本块用不到、下次用得最晚的先淘汰
+                    std::vector<std::pair<int32_t, int32_t>> ev;   // (next use, bucket)
+                    for (int q : resident_list) {
+                        if (!resident[static_cast<size_t>(q)] || stamp[static_cast<size_t>(q)] == -2 - c) continue;
+                        const auto& u = uses[static_cast<size_t>(q)];
+                        const int32_t nu = use_ptr[static_cast<size_t>(q)] < static_cast<int32_t>(u.size()) ? u[static_cast<size_t>(use_ptr[static_cast<size_t>(q)])] : INT32_MAX;
+                        ev.push_back({nu, q});
+                    }
+                    std::sort(ev.begin(), ev.end(), [](auto& x, auto& y) { return x.first > y.first; });
+                    for (auto& e : ev) {
+                        if (need <= static_cast<int64_t>(free_slots.size())) break;
+                        const int q = e.second;
+                        for (int32_t s : slots_of[static_cast<size_t>(q)]) free_slots.push_back(s);
+                        slots_of[static_cast<size_t>(q)].clear();
+                        resident[static_cast<size_t>(q)] = 0;
+                    }
+                    if (need > static_cast<int64_t>(free_slots.size()))
+                        throw std::runtime_error("prune_windowed_gpu: B12 pool too small for one chunk");
+                    resident_list.erase(std::remove_if(resident_list.begin(), resident_list.end(),
+                        [&](int q) { return !resident[static_cast<size_t>(q)]; }), resident_list.end());
+                }
+                // 新桶分槽，按 id 排好以便合并连续段读盘
+                std::sort(fresh.begin(), fresh.end());
+                for (int q : fresh) {
+                    auto& sl = slots_of[static_cast<size_t>(q)];
+                    for (int32_t k = 0; k < nslots(q); ++k) { sl.push_back(free_slots.back()); free_slots.pop_back(); }
+                    resident[static_cast<size_t>(q)] = 1; resident_list.push_back(q);
+                }
+                // 槽表 (本块用到的桶) + cbase = 槽表里的起点
+                h_tab.clear();
+                for (int q : pl.U) {
+                    cbase[static_cast<size_t>(q)] = static_cast<int64_t>(h_tab.size());
+                    for (int32_t s : slots_of[static_cast<size_t>(q)]) h_tab.push_back(s);
+                }
+                // 读盘: 新桶连续段并行 pread 进 pinned
+                struct Run { int64_t lo, n, hd; };
+                std::vector<Run> runs; h_jobs.clear();
+                int64_t hd = 0;
+                for (int q : fresh) {
+                    const int64_t lo = h_offsets[q], n = static_cast<int64_t>(h_offsets[q + 1]) - lo;
+                    if (!runs.empty() && runs.back().lo + runs.back().n == lo) runs.back().n += n;
+                    else runs.push_back({lo, n, hd});
+                    h_jobs.push_back({hd, static_cast<int32_t>(n), static_cast<int32_t>(cbase[static_cast<size_t>(q)])});
+                    hd += n;
+                }
+                if (hd > cap_rows) throw std::runtime_error("prune_windowed_gpu: B12 fresh rows exceed the pinned buffer");
+                #pragma omp parallel for schedule(dynamic, 1)
+                for (int64_t i = 0; i < static_cast<int64_t>(runs.size()); ++i) {
+                    const Run& r = runs[static_cast<size_t>(i)];
+                    load_rows(r.lo, r.n, h_cand + static_cast<size_t>(r.hd) * M, h_vec + static_cast<size_t>(r.hd) * D);
+                }
+                stg.h2d(d_tab, h_tab.data(), h_tab.size() * sizeof(int32_t));
+                stg.h2d(d_cbase, cbase.data(), cbase.size() * sizeof(int64_t));
+                if (!h_jobs.empty()) {
+                    stg.h2d(d_jobs, h_jobs.data(), h_jobs.size() * sizeof(SlotJob));
+                    scatter_slots_kernel<<<static_cast<unsigned>(h_jobs.size()), 256, 0, stg.st>>>(
+                        d_jobs, d_tab, h_cand, reinterpret_cast<const uint8_t*>(h_vec), d_candP,
+                        reinterpret_cast<uint8_t*>(d_vecP), M, static_cast<int>(vec_row));
+                    PWG_CHECK(cudaGetLastError());
+                }
+                const int64_t row0 = h_offsets[pl.p0], n_rows = static_cast<int64_t>(h_offsets[pl.p1]) - row0;
+                const int64_t blocks = (n_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
+                if (d_cdist && n_rows > 0) {
+                    if (n_rows > cap_rows) throw std::runtime_error("prune_windowed_gpu: B13 center rows exceed capacity");
+                    h_cdist.resize(static_cast<size_t>(n_rows) * M);
+                    g_center_dists(row0, n_rows, h_cdist.data());
+                    PWG_CHECK(cudaMemcpyAsync(d_cdist, h_cdist.data(), h_cdist.size() * sizeof(float), cudaMemcpyHostToDevice, stg.st));
+                }
+                if (blocks > 0)
+                    prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
+                        d_candP, d_vecP, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_out, d_err,
+                        false, nullptr, d_cdist, d_tab);
+                PWG_CHECK(cudaGetLastError());
+                int h_err = 0;
+                PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
+                PWG_CHECK(cudaStreamSynchronize(stg.st));   // pinned 行 / 槽表下一块会被重写
+                if (h_err)
+                    throw std::runtime_error(h_err == 2 ? "prune_windowed_gpu: center bucket not loaded in chunk"
+                                                        : "prune_windowed_gpu: fewer than output_degree valid candidates "
+                                                          "(check --output-degree <= M_in and padding)");
+                stg.d2h_rows(d_out, n_rows, out_deg, [&](const uint32_t* r, int64_t r0, int64_t n) { sink(r, row0 + r0, n); });
+                if (stats) { stats->chunks++; stats->loaded_rows += hd; }
+                prevU = pl.U;
+            }
+            std::cout << "  B12: GPU bucket pool " << pool_slots << " slots x " << kSlotRows << " rows\n";
+        } else
         for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
             // ---- 并集 U(p0..p1): 加位置直到行数到上限 ----
             for (int q : prevU) prev_cbase[static_cast<size_t>(q)] = -1;
@@ -654,10 +837,10 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
         report_unverified(N, out_deg);
         cudaFree(d_cdist);
     } catch (...) {
-        cleanup();
+        cleanup(); cleanup_pool();
         throw;
     }
-    cleanup();
+    cleanup(); cleanup_pool();
 }
 
 // uint8 / int8 / float32 数据集 (prune_windowed 按扩展名选)
