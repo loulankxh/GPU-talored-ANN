@@ -4,6 +4,7 @@
 #include <string>
 #include <filesystem>
 #include <fstream>
+#include <malloc.h>
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -71,6 +72,21 @@
 
 namespace po = boost::program_options;
 using namespace bucket;
+
+// B14: 每步结束时的 host 内存 (VmRSS / VmHWM)，找 msTuring100M bucket2 峰值 56 vs 93 GB 的来源
+static std::string rss_note() {
+    std::ifstream f("/proc/self/status");
+    std::string line, out;
+    while (std::getline(f, line)) {
+        if (line.rfind("VmRSS:", 0) == 0 || line.rfind("VmHWM:", 0) == 0) {
+            const double gb = std::atof(line.c_str() + 6) / 1048576.0;   // kB → GiB
+            char buf[48];
+            std::snprintf(buf, sizeof(buf), " %s%.1fG", line.rfind("VmRSS:", 0) == 0 ? "rss=" : "hwm=", gb);
+            out += buf;
+        }
+    }
+    return out;
+}
 
 /**
  * cuVS 26.10 CAGRA wants a padded (16B-aligned rows) dataset: zero-copy view when the
@@ -7326,7 +7342,7 @@ int run_pipeline_impl(
         }
 
         elapsed_step1 = std::chrono::duration<double>(Clock::now() - t1).count();
-        std::cout << "  Step 1 done [" << std::fixed << std::setprecision(3) << elapsed_step1 << "s]\n";
+        std::cout << "  Step 1 done [" << std::fixed << std::setprecision(3) << elapsed_step1 << "s]" << rss_note() << "\n";
 
         // input_path 参数是 const&，round 1 分配完之后要把它换成
         // data_reordered.<ext>——从这里往下（包括 Step4 的调用点）一律用这个
@@ -7513,7 +7529,7 @@ int run_pipeline_impl(
                   << "s idx_map=" << t2_idx_map
                   << "s bucket_vec_create=" << t2_bucket_vec_create
                   << "s total=" << iter_step2 << "s\n";
-        std::cout << "  Step 2 done [" << std::fixed << std::setprecision(3) << iter_step2 << "s]\n";
+        std::cout << "  Step 2 done [" << std::fixed << std::setprecision(3) << iter_step2 << "s]" << rss_note() << "\n";
 
         // ================================================================
         // Step 3: Build KNN graph on centroids — results stay on GPU
@@ -7584,7 +7600,7 @@ int run_pipeline_impl(
         }
         double iter_step3 = std::chrono::duration<double>(Clock::now() - t3).count();
         elapsed_step3 += iter_step3;
-        std::cout << "  Step 3 done [" << std::fixed << std::setprecision(3) << iter_step3 << "s]\n";
+        std::cout << "  Step 3 done [" << std::fixed << std::setprecision(3) << iter_step3 << "s]" << rss_note() << "\n";
 
         // Step 3.5 (原来的"整份加载数据集"步骤) 已经不需要了——Step 4/6 都改成
         // 按需从磁盘读了，不再要求整份数据集常驻内存。elapsed_step3p5 保留在
@@ -7713,7 +7729,7 @@ int run_pipeline_impl(
                   << "s bucket_write=" << t4_bucket_write
                   << "s finish_iteration=" << t4_finish_iteration
                   << "s total=" << iter_step4 << "s\n";
-        std::cout << "  Step 4 done [" << std::fixed << std::setprecision(3) << iter_step4 << "s]\n";
+        std::cout << "  Step 4 done [" << std::fixed << std::setprecision(3) << iter_step4 << "s]" << rss_note() << "\n";
 
         // ================================================================
         // Step 4.5 (round 1 only): inline reorder. Used to happen as a
@@ -8044,7 +8060,7 @@ int run_pipeline_impl(
                       << "s artifacts=" << t45_artifacts
                       << "s resample=" << t45_resample
                       << "s total=" << elapsed_step45 << "s\n";
-            std::cout << "  Step 4.5 done [" << std::fixed << std::setprecision(3) << elapsed_step45 << "s]\n";
+            std::cout << "  Step 4.5 done [" << std::fixed << std::setprecision(3) << elapsed_step45 << "s]" << rss_note() << "\n";
         }
 
         // ================================================================
@@ -8073,7 +8089,7 @@ int run_pipeline_impl(
             // (its bucket_process_order.bin would no longer match this file).
 
             elapsed_step5 = std::chrono::duration<double>(Clock::now() - t5).count();
-            std::cout << "  Step 5 done [" << std::fixed << std::setprecision(3) << elapsed_step5 << "s]\n";
+            std::cout << "  Step 5 done [" << std::fixed << std::setprecision(3) << elapsed_step5 << "s]" << rss_note() << "\n";
         }
 
         // ================================================================
@@ -8114,7 +8130,7 @@ int run_pipeline_impl(
                 std::cout << "  [Step6 timing] centroid_topk_expand=" << std::fixed << std::setprecision(3)
                           << t6_topk_expand << "s gpu_resident=" << (iter_step6 - t6_topk_expand)
                           << "s total=" << iter_step6 << "s\n";
-                std::cout << "  Step 6 done [" << iter_step6 << "s]\n";
+                std::cout << "  Step 6 done [" << iter_step6 << "s]" << rss_note() << "\n";
                 continue;
             }
 
@@ -8198,7 +8214,16 @@ int run_pipeline_impl(
                       << "s finish_writes=" << t6_finish_writes
                       << "s merge_wait=" << t6_wait
                       << "s total=" << iter_step6 << "s\n";
-            std::cout << "  Step 6 done [" << std::fixed << std::setprecision(3) << iter_step6 << "s]\n";
+            std::cout << "  Step 6 done [" << std::fixed << std::setprecision(3) << iter_step6 << "s]" << rss_note() << "\n";
+            // B14: Step 6 的 host 桶缓存条目 (~200 KB/桶) 来自各线程的 glibc arena，释放后
+            // 留在进程里 (msTuring100M 31–43 GB，多少看线程时序)，和下一轮整份的桶数据
+            // (38 GB) 叠成 56 / 93 GB 两种峰值。每轮结束把空闲页还给 OS。BUCKET2_MALLOC_TRIM=0 关掉。
+            if (!(std::getenv("BUCKET2_MALLOC_TRIM") && std::getenv("BUCKET2_MALLOC_TRIM")[0] == '0')) {
+                auto tt0 = Clock::now();
+                malloc_trim(0);
+                std::cout << "  [B14] malloc_trim " << std::fixed << std::setprecision(3)
+                          << std::chrono::duration<double>(Clock::now() - tt0).count() << "s" << rss_note() << "\n";
+            }
         }
 
         }   // end of per-iteration loop
@@ -8297,7 +8322,7 @@ int run_pipeline_impl(
         std::cout << "  Step 5   (Write buckets):       " << elapsed_step5 << "s\n";
         if (neighbors_m > 0) {
             std::cout << "  Step 6   (Per-vector KNN, merge included):      " << elapsed_step6 << "s\n";
-            std::cout << "  Wait     (final iteration's background merge):  " << elapsed_final_merge_wait << "s\n";
+            std::cout << "  Wait     (final iteration's background merge):  " << elapsed_final_merge_wait << "s" << rss_note() << "\n";
             std::cout << "  Write    (close + .npy convert):    " << elapsed_write_knn << "s\n";
         }
         std::cout << "  --------------------------------\n";
