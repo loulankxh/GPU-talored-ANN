@@ -1198,7 +1198,9 @@ __device__ __forceinline__ bool step4_less(float da, int ia, float db, int ib)
 __global__ void step4_top2_kernel(const float* __restrict__ dots,   // (n_rows, C) row-major
                                   const float* __restrict__ cnorm,  // (C,)
                                   int64_t n_rows, int C,
-                                  uint32_t* __restrict__ out)       // (n_rows, 2)
+                                  uint32_t* __restrict__ out,       // (n_rows, 2)
+                                  const float* __restrict__ q = nullptr, int D = 0,   // A6a: 真实距离要 ‖q‖²
+                                  float* __restrict__ out_d = nullptr)                // (n_rows, 2) 平方 L2
 {
     const int64_t row = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
     const int lane = threadIdx.x & 31;
@@ -1224,9 +1226,16 @@ __global__ void step4_top2_kernel(const float* __restrict__ dots,   // (n_rows, 
             b2 = ob1; i2 = oi1;
         }
     }
+    float qn = 0.f;
+    if (out_d) {   // ‖q‖² (warp 归约)，距离 = ‖q‖² + ‖c‖² - 2 q·c
+        for (int e = lane; e < D; e += 32) { const float v = q[row * D + e]; qn += v * v; }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) qn += __shfl_xor_sync(0xffffffffu, qn, off);
+    }
     if (lane == 0) {
         out[row * 2]     = static_cast<uint32_t>(i1);
         out[row * 2 + 1] = static_cast<uint32_t>(i2);
+        if (out_d) { out_d[row * 2] = b1 + qn; out_d[row * 2 + 1] = b2 + qn; }
     }
 }
 
@@ -1260,7 +1269,8 @@ __global__ void step4_top4_rerank_kernel(const float* __restrict__ dots,   // (n
                                          const float* __restrict__ cent,   // (C, D) fp32
                                          const float* __restrict__ q,      // (n_rows, D) fp32
                                          int64_t n_rows, int C, int D,
-                                         uint32_t* __restrict__ out)       // (n_rows, 2)
+                                         uint32_t* __restrict__ out,       // (n_rows, 2)
+                                         float* __restrict__ out_d = nullptr)   // A6a: (n_rows, 2) 平方 L2
 {
     const int64_t row = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
     const int lane = threadIdx.x & 31;
@@ -1291,9 +1301,16 @@ __global__ void step4_top4_rerank_kernel(const float* __restrict__ dots,   // (n
         if (step4_less(d, c, e1, j1)) { e2 = e1; j2 = j1; e1 = d; j1 = c; }
         else if (step4_less(d, c, e2, j2)) { e2 = d; j2 = c; }
     }
+    float qn = 0.f;
+    if (out_d) {
+        for (int e = lane; e < D; e += 32) { const float v = qv[e]; qn += v * v; }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) qn += __shfl_xor_sync(0xffffffffu, qn, off);
+    }
     if (lane == 0) {
         out[row * 2]     = static_cast<uint32_t>(j1);
         out[row * 2 + 1] = static_cast<uint32_t>(j2);
+        if (out_d) { out_d[row * 2] = e1 + qn; out_d[row * 2 + 1] = e2 + qn; }
     }
 }
 
@@ -1518,6 +1535,11 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     __half*   d_q_h     = nullptr;
     float*    d_f16_dots = nullptr;
     uint32_t* d_top2_u32 = nullptr;
+    // A6a (user-approved 2026-10-25): DiskJoin 的两选一规则 (add2choice): 第二近的桶更小 且 d2 < 1.2·d1 才去
+    // 第二近的，否则最近的。要 top-2 的真实平方 L2 距离。BUCKET2_ASSIGN_RULE=diskjoin 打开 (默认原规则 s2 < 0.8·s1)
+    const bool rule_dj = std::getenv("BUCKET2_ASSIGN_RULE") && std::string(std::getenv("BUCKET2_ASSIGN_RULE")) == "diskjoin";
+    float* d_top2_d = nullptr;
+    std::vector<float> h_top2_d;
     if (kExactF16 && exact_f16) {
         if (n_centroids < 2) throw std::runtime_error("batch_assign: need >= 2 centroids");
         if (cublasCreate(&f16_cublas) != CUBLAS_STATUS_SUCCESS)
@@ -1529,6 +1551,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         CUDA_CHECK(cudaMalloc(&d_q_h, kF16Tile * D * sizeof(__half)));
         CUDA_CHECK(cudaMalloc(&d_f16_dots, kF16Tile * n_centroids * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_top2_u32, Nv * TOP_K * sizeof(uint32_t)));
+        if (rule_dj && !d_top2_d) CUDA_CHECK(cudaMalloc(&d_top2_d, Nv * TOP_K * sizeof(float)));
         const float* d_cent_f = reinterpret_cast<const float*>(d_centroids);
         step4_f32_to_f16_kernel<<<static_cast<unsigned>((cd + 255) / 256), 256>>>(d_cent_f, d_cent_h, cd);
         step4_row_norms_kernel<<<static_cast<unsigned>((n_centroids + 255) / 256), 256>>>(
@@ -1554,6 +1577,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         CUDA_CHECK(cudaMalloc(&d_cnorm, n_centroids * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_f16_dots, f32_tile * n_centroids * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_top2_u32, Nv * TOP_K * sizeof(uint32_t)));
+        if (rule_dj && !d_top2_d) CUDA_CHECK(cudaMalloc(&d_top2_d, Nv * TOP_K * sizeof(float)));
         step4_row_norms_kernel<<<static_cast<unsigned>((n_centroids + 255) / 256), 256>>>(
             reinterpret_cast<const float*>(d_centroids), d_cnorm, n_centroids, static_cast<int>(D));
         CUDA_CHECK(cudaGetLastError());
@@ -1697,7 +1721,8 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                     throw std::runtime_error("batch_assign: fp16 GEMM failed, status=" + std::to_string(st));
                 const int64_t threads = tn * 32;
                 step4_top2_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
-                    d_f16_dots, d_cnorm, tn, static_cast<int>(n_centroids), d_top2_u32 + t0 * TOP_K);
+                    d_f16_dots, d_cnorm, tn, static_cast<int>(n_centroids), d_top2_u32 + t0 * TOP_K,
+                    d_q_f + t0 * D, static_cast<int>(D), d_top2_d ? d_top2_d + t0 * TOP_K : nullptr);
                 CUDA_CHECK(cudaGetLastError());
             }
             searched_f16 = true;
@@ -1724,7 +1749,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                     const int64_t threads = tn * 32;
                     step4_top4_rerank_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
                         d_f16_dots, d_cnorm, d_c_f, d_q_f + t0 * D, tn, static_cast<int>(n_centroids),
-                        static_cast<int>(D), d_top2_u32 + t0 * TOP_K);
+                        static_cast<int>(D), d_top2_u32 + t0 * TOP_K, d_top2_d ? d_top2_d + t0 * TOP_K : nullptr);
                     CUDA_CHECK(cudaGetLastError());
                     continue;
                 }
@@ -1738,10 +1763,11 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 if (std::getenv("BUCKET2_F32_RERANK_REF"))   // 验证用: SGEMM 分数 + 同一个精确重算
                     step4_top4_rerank_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
                         d_f16_dots, d_cnorm, d_c_f, d_q_f + t0 * D, tn, static_cast<int>(n_centroids),
-                        static_cast<int>(D), d_top2_u32 + t0 * TOP_K);
+                        static_cast<int>(D), d_top2_u32 + t0 * TOP_K, d_top2_d ? d_top2_d + t0 * TOP_K : nullptr);
                 else
                 step4_top2_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
-                    d_f16_dots, d_cnorm, tn, static_cast<int>(n_centroids), d_top2_u32 + t0 * TOP_K);
+                    d_f16_dots, d_cnorm, tn, static_cast<int>(n_centroids), d_top2_u32 + t0 * TOP_K,
+                    d_q_f + t0 * D, static_cast<int>(D), d_top2_d ? d_top2_d + t0 * TOP_K : nullptr);
                 CUDA_CHECK(cudaGetLastError());
             }
             searched_f16 = true;   // 跟 fp16 路径共用下载 + 越界检查
@@ -1799,6 +1825,11 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                                   batch_size * TOP_K * sizeof(uint32_t),
                                   cudaMemcpyDeviceToHost));
         }
+        if (rule_dj) {   // 精确 top-2 路径: kernel 写的真实距离；CAGRA / brute force: distances_view (平方 L2)
+            h_top2_d.resize(static_cast<size_t>(batch_size) * TOP_K);
+            CUDA_CHECK(cudaMemcpy(h_top2_d.data(), searched_f16 ? d_top2_d : d_distances,
+                                  batch_size * TOP_K * sizeof(float), cudaMemcpyDeviceToHost));
+        }
         auto tb4 = Clock::now();
         t_download += std::chrono::duration<double>(tb4 - tb3).count();
 
@@ -1816,7 +1847,10 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             int64_t s2 = cluster_sizes[local_idx2].load(std::memory_order_relaxed);
 
             uint32_t chosen;
-            if (static_cast<double>(s2) < 0.8 * static_cast<double>(s1)) {
+            if (rule_dj) {
+                const float d1 = h_top2_d[static_cast<size_t>(i) * TOP_K], d2 = h_top2_d[static_cast<size_t>(i) * TOP_K + 1];
+                chosen = (s2 < s1 && d2 < 1.2f * d1) ? local_idx2 : local_idx1;   // DiskJoin add2choice
+            } else if (static_cast<double>(s2) < 0.8 * static_cast<double>(s1)) {
                 chosen = local_idx2;  // 聚类 2 太小，分配到聚类 2
             } else {
                 chosen = local_idx1;  // 分配到最近的聚类 1
@@ -1839,6 +1873,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     if (d_queries)    CUDA_CHECK(cudaFree(d_queries));
     if (d_top2)       CUDA_CHECK(cudaFree(d_top2));
     if (d_distances)  CUDA_CHECK(cudaFree(d_distances));
+    if (d_top2_d)     CUDA_CHECK(cudaFree(d_top2_d));
     if (d_top2_i64)   CUDA_CHECK(cudaFree(d_top2_i64));
     if (d_cent_h)     CUDA_CHECK(cudaFree(d_cent_h));
     if (d_cnorm)      CUDA_CHECK(cudaFree(d_cnorm));
