@@ -10,18 +10,26 @@
   "bench": [
    "auto",
    "large"
-  ]
+  ],
+  "params": {
+   "A7_UNWIN": "1"
+  },
+  "params_note": "#56 (A7): unwindowed batched prune (large path only; resident path unaffected)"
  },
  "sift10M": {
   "dir": "/home/lanlu/microBenchmark/dataset/sift10M",
   "base": "base.10M.u8bin",
   "reps": 3,
-  "iterations": null,
+  "iterations": 2,
   "search": "cagra",
   "ref": "tagore",
   "bench": [
    "auto"
-  ]
+  ],
+  "params": {
+   "A7_UNWIN": "1"
+  },
+  "params_note": "#56 (A7): 2 rounds (was 3) + unwindowed batched prune; quality = the 3-round windowed build"
  },
  "sift100M": {
   "dir": "/home/lanlu/microBenchmark/dataset/sift100M",

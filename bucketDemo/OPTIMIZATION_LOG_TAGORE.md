@@ -30,40 +30,40 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#55 (A7: msTuring10M unwindowed batched prune, 4 rounds × NPROBE 64)**, 2026-10-26 (`runs/tagore56`), re-baselined (only the sift100M speed rule failed; A/B shows noise). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
+After **#56 (A7 on SIFT: SIFT10M 2 rounds + unwindowed prune, SIFT1M unwindowed prune)**, 2026-10-26 (`runs/tagore58`). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
 
 **Build time (s, median of reps; sum of all stages)**
 
 | config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | resident | 3 | 4.84 | +1.0% | +22.7% | 0.53x | 0.42x | bucket2 4.84 | 5002 | 1.60 |
-| sift1M_large | large | 3 | 7.82 | -2.9% | +19.3% | 0.85x | 0.68x | bucket2 6.09, prune 0.71, optimize_chunked 0.70, translate 0.35 | 1252 | 1.94 |
-| sift10M_auto | large | 3 | 58.64 | +0.7% | +28.9% | 0.27x | 0.48x | bucket2 49.43, prune 3.82, optimize_chunked 2.87, translate 2.53 | 8996 | 11.69 |
-| msTuring1M_auto | resident | 3 | 16.22 | +1.5% | +1.2% | 1.73x | 1.41x | bucket2 16.22 | 5154 | 1.67 |
-| msTuring10M_auto | large | 3 | 128.54 | +37.3% | +46.6% | 0.56x | 1.08x | bucket2 117.94, prune 5.01, optimize_chunked 2.95, translate 2.63 | 8996 | 20.23 |
-| sift100M_auto | large | 3 | 596.01 | -3.7% | +81.5% | 0.28x | 0.81x | bucket2 404.81, prune 96.09, optimize_chunked 71.59, translate 22.50 | 14588 | 47.27 |
+| sift1M_auto | resident | 3 | 4.84 | +0.0% | +22.7% | 0.53x | 0.42x | bucket2 4.84 | 5000 | 1.59 |
+| sift1M_large | large | 3 | 7.75 | +0.9% | +20.0% | 0.84x | 0.67x | bucket2 5.87, prune 0.73, optimize_chunked 0.71, translate 0.39 | 1252 | 1.90 |
+| sift10M_auto | large | 3 | 46.64 | +20.5% | +43.4% | 0.22x | 0.38x | bucket2 37.04, prune 4.20, optimize_chunked 2.87, translate 2.56 | 8996 | 10.80 |
+| msTuring1M_auto | resident | 3 | 15.98 | +1.5% | +2.7% | 1.71x | 1.39x | bucket2 15.98 | 5154 | 1.67 |
+| msTuring10M_auto | large | 3 | 129.06 | -0.4% | +46.4% | 0.56x | 1.08x | bucket2 118.56, prune 4.96, optimize_chunked 2.97, translate 2.62 | 8996 | 20.46 |
+| sift100M_auto | large | 3 | 575.87 | +3.4% | +82.1% | 0.27x | 0.78x | bucket2 388.55, prune 96.02, optimize_chunked 70.26, translate 22.10 | 14588 | 44.88 |
 
 **bucket2 step breakdown (s)**
 
 | config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | 0.64 | 0.15 | 0.06 | 0.00 | 0.39 | 0.20 | 0.01 | 1.89 | 0.00 | 0.96 |
-| sift1M_large | 0.15 | 0.36 | 0.15 | 0.00 | 1.14 | 0.17 | 0.03 | 2.91 | 0.62 | 0.00 |
-| sift10M_auto | 1.13 | 2.53 | 0.24 | 0.00 | 16.55 | 1.67 | 0.16 | 21.97 | 4.65 | 0.00 |
-| msTuring1M_auto | 0.89 | 0.39 | 0.03 | 0.00 | 0.78 | 0.48 | 0.02 | 11.48 | 0.00 | 0.95 |
-| msTuring10M_auto | 7.81 | 5.84 | 0.25 | 0.00 | 29.92 | 4.13 | 0.20 | 63.76 | 4.49 | 0.00 |
-| sift100M_auto | 11.71 | 5.32 | 2.81 | 0.00 | 138.03 | 27.33 | 2.94 | 171.44 | 38.55 | 0.00 |
+| sift1M_auto | 0.65 | 0.16 | 0.06 | 0.00 | 0.38 | 0.21 | 0.01 | 1.89 | 0.00 | 0.95 |
+| sift1M_large | 0.16 | 0.31 | 0.16 | 0.00 | 1.04 | 0.17 | 0.02 | 2.86 | 0.61 | 0.00 |
+| sift10M_auto | 1.14 | 1.79 | 0.21 | 0.00 | 10.63 | 1.66 | 0.18 | 15.28 | 4.62 | 0.00 |
+| msTuring1M_auto | 0.90 | 0.39 | 0.04 | 0.00 | 0.81 | 0.48 | 0.01 | 11.30 | 0.00 | 0.96 |
+| msTuring10M_auto | 9.10 | 5.98 | 0.23 | 0.00 | 28.72 | 4.29 | 0.20 | 63.86 | 4.51 | 0.00 |
+| sift100M_auto | 11.79 | 5.34 | 2.74 | 0.00 | 137.37 | 27.52 | 3.31 | 168.22 | 27.30 | 0.00 |
 
 **(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
 
 | config | recall@1 | recall@10 | recall@32 | recall@64 |
 |---|---|---|---|---|
-| sift1M_auto | 0.9431 | 0.9255 | 0.9123 | 0.9028 |
-| sift1M_large | 0.9409 | 0.9239 | 0.9111 | 0.9013 |
-| sift10M_auto | 0.8527 | 0.8217 | 0.8008 | 0.7855 |
-| msTuring1M_auto | 0.9884 | 0.9786 | 0.9649 | 0.9512 |
-| msTuring10M_auto | 0.8116 | 0.7645 | 0.7352 | 0.7135 |
-| sift100M_auto | 0.6554 | 0.6151 | 0.5904 | 0.5733 |
+| sift1M_auto | 0.9364 | 0.9222 | 0.9112 | 0.9019 |
+| sift1M_large | 0.9427 | 0.9245 | 0.9119 | 0.9023 |
+| sift10M_auto | 0.7694 | 0.7242 | 0.7004 | 0.6841 |
+| msTuring1M_auto | 0.9878 | 0.9781 | 0.9646 | 0.9508 |
+| msTuring10M_auto | 0.8053 | 0.7624 | 0.7324 | 0.7110 |
+| sift100M_auto | 0.6520 | 0.6169 | 0.5909 | 0.5735 |
 
 **(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
 
@@ -79,12 +79,12 @@ After **#55 (A7: msTuring10M unwindowed batched prune, 4 rounds × NPROBE 64)**,
 | CAGRA CAGRA NN-Descent 64->32, msTuring10M | 0.6621 / 1418K | 0.7995 / 740K | 0.8922 / 370K | 0.9451 / 150K | 0.9741 / 47K |
 | TAGORE largeIndex Vamana, sift100M | 0.7691 / 61K | 0.8615 / 55K | 0.9238 / 34K | 0.9616 / 20K | 0.9820 / 11K |
 | CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
-| ours sift1M_auto | 0.9248 / 2217K | 0.9750 / 1190K | 0.9938 / 562K | 0.9986 / 189K | 0.9997 / 68K |
-| ours sift1M_large | 0.9118 / 1943K | 0.9693 / 1033K | 0.9917 / 505K | 0.9980 / 182K | 0.9996 / 68K |
-| ours sift10M_auto | 0.8286 / 1962K | 0.9204 / 1064K | 0.9698 / 554K | 0.9905 / 174K | 0.9973 / 68K |
-| ours msTuring1M_auto | 0.6580 / 1452K | 0.7883 / 737K | 0.8848 / 365K | 0.9444 / 147K | 0.9764 / 47K |
-| ours msTuring10M_auto | 0.6284 / 1423K | 0.7682 / 737K | 0.8656 / 370K | 0.9263 / 150K | 0.9613 / 47K |
-| ours sift100M_auto | 0.7268 / 57K | 0.8330 / 56K | 0.9112 / 31K | 0.9591 / 18K | 0.9838 / 10K |
+| ours sift1M_auto | 0.9248 / 2216K | 0.9756 / 1190K | 0.9932 / 562K | 0.9985 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9251 / 1947K | 0.9754 / 1035K | 0.9936 / 520K | 0.9983 / 174K | 0.9997 / 68K |
+| ours sift10M_auto | 0.8307 / 1962K | 0.9218 / 1064K | 0.9701 / 528K | 0.9901 / 187K | 0.9970 / 66K |
+| ours msTuring1M_auto | 0.6574 / 1493K | 0.7877 / 800K | 0.8841 / 372K | 0.9445 / 147K | 0.9770 / 47K |
+| ours msTuring10M_auto | 0.6292 / 1424K | 0.7674 / 744K | 0.8655 / 370K | 0.9254 / 150K | 0.9603 / 47K |
+| ours sift100M_auto | 0.7256 / 57K | 0.8337 / 53K | 0.9117 / 33K | 0.9598 / 19K | 0.9843 / 11K |
 
 ## Baseline verification
 
@@ -1465,4 +1465,9 @@ B 512 / NPROBE 40 / 2 rounds (size rules, #33), exact fp32 Step 4 (A5 rejected, 
 - **msTuring10M at the old setting (7 × 64, 1 rep, `runs/tagore55`):** windowed 210.08 s, itopk 32 / 64 / 128 = 0.6211 / 0.7648 / 0.8641, **20.69 unverified kept edges / row**; unwindowed 201.44 s, prune 4.32 → 5.08 s, **0.6515 / 0.7862 / 0.8830**, 0 unverified; unwindowed + local join (S 16, 3.2 new / point, 5.1 s) 208.21 s, 0.6500 / 0.7891 / 0.8836 → the window restriction itself was the quality loss; the local join adds little and is not used.
 - **Grid with unwindowed prune (1 rep):** 3 × 64 104.96 s (0.6016 ✗); **4 × 64 126.95 s (0.6263 ✓)**; 3 × 128 143.08 s (0.6300); 5 × 64 156.98 s (0.6381); 4 × 96 155.45 s (0.6354). Quality-margin spread for 4 × 64 (4 timed runs): itopk 32 0.6290 / 0.6288 / 0.6249 / 0.6281, 128.4 / 127.0 / 129.5 / 127.7 s → min margin +0.0128 → `datasets.json` msTuring10M: iterations 4, NPROBE 64, A7_UNWIN 1.
 - **Result (×3, `runs/tagore56`):** **msTuring10M 205 → 128.54 s (+37.3%; 0.56× TAGORE, 1.08× CAGRA)**, Step 6 63.8 s, Step 4 29.9 s; recall@10 0.6284 / 1423K | 0.7682 / 737K | 0.8656 / 370K | 0.9263 / 150K | 0.9613 / 47K. Others within ±3% except **sift100M −3.7%** (596.01 vs 574.61 s; sift100M does not use the unwindowed prune) → judge REJECT. **A/B** (interleaved, `#50` binaries built in a scratch worktree vs current): bucket2 388.3 / 411.1 s (old) vs 397.9 / 395.4 s (new) — same; the 574.61 s best sat at the fast end of its own runs (615.7 / 574.6 / 562.3 s). Kept and re-baselined. SIFT10M / chunked 100M with unwin: next.
+
+### #56 — A7 on SIFT: SIFT10M 3 → 2 rounds + unwindowed batched prune; SIFT1M unwindowed prune (2026-10-26) — ACCEPT
+- **Exploration (1 rep, `runs/tagore57`):** SIFT10M NPROBE 40: 3 rounds windowed 58.73 s, itopk 32 / 64 / 128 = 0.8291 / 0.9208 / 0.9698, 13.17 unverified kept edges / row; 3 rounds unwindowed 59.29 s, **0.8491 / 0.9340 / 0.9773**, 0 unverified; **2 rounds unwindowed 47.66 s, 0.8308 / 0.9212 / 0.9695** (= the 3-round windowed quality, chosen — no quality ratchet); 2 × 64 51.69 s 0.8435; 3 × 24 55.68 s 0.8401. SIFT1M large: 3 rounds windowed 7.99 s 0.9130 / 0.9695; unwindowed 7.85 s **0.9248 / 0.9757**; 2 rounds unwindowed 6.75 s 0.9172 — not taken because `iterations` is per dataset and would also cut the resident sift1M_auto build.
+- **Change:** `datasets.json` sift10M `iterations` 2, `params.A7_UNWIN` 1; sift1M `params.A7_UNWIN` 1 (large path only).
+- **Result (×3):** **sift10M 58.7 → 46.64 s (+20.5%; 0.22× TAGORE, 0.38× CAGRA)**, recall@10 0.8307 / 1962K | 0.9218 / 1064K | 0.9701 / 528K | 0.9901 / 187K | 0.9970 / 66K; sift1M_large 7.75 s (+0.9%), recall@10 0.9251 / 1947K | 0.9754 / 1035K | 0.9936 / 520K | 0.9983 / 174K | 0.9997 / 68K (better than before at itopk 32 / 64); others within ±3.4% (sift100M +3.4%). 0 defects, paths unchanged.
 
