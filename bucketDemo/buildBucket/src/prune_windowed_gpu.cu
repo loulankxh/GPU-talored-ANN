@@ -17,6 +17,7 @@
 // cuVS 26.12 reference: detail/cagra/graph_core.cuh::kern_fused_prune (warp
 // per node, detours counted against the node's sorted row in shared memory).
 
+#include <functional>
 #include <cstdlib>
 #include <iostream>
 #include <cstdint>
@@ -145,7 +146,8 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
     uint32_t* __restrict__ out,            // (n_rows, out_deg)
     int* __restrict__ err,
     bool unwin = false,                    // A7: 整份数据在显存时不按窗口限制 (所有候选都有真实距离 / detour 检查)
-    const int32_t* __restrict__ own = nullptr)   // A7: 中心点自己的精修候选行 (按 a - row0)
+    const int32_t* __restrict__ own = nullptr,   // A7: 中心点自己的精修候选行 (按 a - row0)
+    const float* __restrict__ cdist = nullptr)   // B13: 中心点候选的 Step 6 距离 (按 a - row0，行宽 M)
 {
     __shared__ float   s_dist[kWarpsPerBlock][kMaxM];
     __shared__ int32_t s_id  [kWarpsPerBlock][kMaxM];
@@ -175,7 +177,10 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
         bool valid = false;
         if (k < M) {
             id = own ? own[(a - row0) * M + k] : cand[arow * M + k];
-            if (id >= 0) {
+            if (id >= 0 && cdist) {   // B13: Step 6 算过的距离 (窗口外的候选也有真实距离)
+                valid = true;
+                dist = cdist[(a - row0) * M + k];
+            } else if (id >= 0) {
                 valid = true;
                 const int q = (static_cast<uint32_t>(id) < total) ? find_pos(offsets, n_buckets, static_cast<uint32_t>(id)) : -1;
                 if (q >= 0 && (unwin || in_window(wp, wl, q)) && cbase[q] >= 0) {
@@ -277,6 +282,9 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
 }  // namespace
 
 namespace prune_windowed_gpu {
+
+static std::function<void(int64_t, int64_t, float*)> g_center_dists;
+void set_center_dists(std::function<void(int64_t lo, int64_t n, float* out)> f) { g_center_dists = std::move(f); }
 
 static void reset_unverified() { unsigned long long z = 0; cudaMemcpyToSymbol(g_unverified_kept, &z, sizeof(z)); }
 static void report_unverified(int64_t n_points, int out_deg)
@@ -535,6 +543,12 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
         int cur = 0;
         int32_t chunk_id = 0;
         reset_unverified();
+        float* d_cdist = nullptr;              // B13
+        std::vector<float> h_cdist;
+        if (g_center_dists) {
+            PWG_CHECK(cudaMalloc(&d_cdist, static_cast<size_t>(cap_rows) * M * sizeof(float)));
+            std::cout << "  B13: centers ranked by Step 6 distances (vector_dists)\n";
+        }
         for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
             // ---- 并集 U(p0..p1): 加位置直到行数到上限 ----
             for (int q : prevU) prev_cbase[static_cast<size_t>(q)] = -1;
@@ -614,9 +628,17 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             cur = nb;
             const int64_t row0 = h_offsets[p0], n_rows = static_cast<int64_t>(h_offsets[p1]) - row0;
             const int64_t blocks = (n_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
+            if (d_cdist && n_rows > 0) {
+                if (n_rows > cap_rows) throw std::runtime_error("prune_windowed_gpu: B13 center rows exceed capacity");
+                h_cdist.resize(static_cast<size_t>(n_rows) * M);
+                g_center_dists(row0, n_rows, h_cdist.data());
+                PWG_CHECK(cudaMemcpyAsync(d_cdist, h_cdist.data(), h_cdist.size() * sizeof(float), cudaMemcpyHostToDevice, stg.st));
+                PWG_CHECK(cudaStreamSynchronize(stg.st));   // h_cdist 下一块会被重写
+            }
             if (blocks > 0)
                 prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
-                    d_cand, d_vec, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_out, d_err);
+                    d_cand, d_vec, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_out, d_err,
+                    false, nullptr, d_cdist);
             PWG_CHECK(cudaGetLastError());
             int h_err = 0;
             PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
@@ -630,6 +652,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             p0 = p1;
         }
         report_unverified(N, out_deg);
+        cudaFree(d_cdist);
     } catch (...) {
         cleanup();
         throw;

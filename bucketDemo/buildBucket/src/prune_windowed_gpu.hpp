@@ -21,6 +21,10 @@ void run(const int32_t* cand, const T* vec, int64_t N, int M, int D,
          // 依次递增、覆盖 [0, N)；回调返回后暂存区会被复用
          const std::function<void(const uint32_t* rows, int64_t row0, int64_t n)>& sink);
 struct ChunkStats { int64_t chunks = 0, loaded_rows = 0; };
+// B13: optional reader for the centers' own candidate distances (vector_dists.bin rows, M floats per
+// row, same order as the candidate rows). When set, run_chunked ranks each center's candidates by
+// these distances (out-of-window candidates get their Step 6 distance instead of +inf).
+void set_center_dists(std::function<void(int64_t lo, int64_t n, float* out)> f);
 // Same prune, out-of-core: positions are processed in chunks whose window union (rows of the
 // buckets in the windows of those positions) fits budget_bytes (cand + vec rows); load_rows(lo, n,
 // cand, vec) must fill n consecutive rows (new ids lo..lo+n) of candidates (int32, M per row) and

@@ -39,6 +39,7 @@ ENV_OUT=$("$PY" -I "$SKILL/scripts/dataset_env.py" "$DS") || { echo "$ENV_OUT"; 
 eval "$ENV_OUT"
 DSDIR=$DS_DIR
 : "${REPS:=$DEF_REPS}"
+[[ ${B13_DISTS:-0} == 1 ]] && BUCKET2_EXTRA="${BUCKET2_EXTRA/--skip-dists/}"   # B13: prune reads vector_dists.bin
 BUCKET2_EXTRA="$BUCKET2_EXTRA --kmeans-train-fraction $KMEANS_TRAIN_FRACTION --cache-mb $CACHE_MB --bucket-mem-mb $BUCKET_MEM_MB --gpu-bucket-cache-mb $GPU_BUCKET_CACHE_MB"
 CHUNKED_EXTRA="$CHUNKED_EXTRA --host-budget-mb $CHUNKED_HOST_BUDGET_MB"
 export BUCKET2_A1_PASSES=$A1_PASSES   # A1-R local join passes (resident path, #40)
@@ -113,6 +114,7 @@ for ((R = 0; R < REPS; R++)); do
       -c "$O/centroid_knn.bin" -o "$O/forward_graph_reordered.bin" \
       --output-degree "$OUTPUT_DEGREE" --cache-mb "$PRUNE_CACHE_MB" $PRUNE_EXTRA \
       $( [[ ${A4_POOL:-0} == 1 ]] && echo --pool-graph "$O/centroid_pool.bin" ) \
+      $( [[ ${B13_DISTS:-0} == 1 ]] && echo --dists "$O/vector_dists.bin" ) \
       || { echo "prune FAILED"; kill $SMI; exit 3; }
     # shellcheck disable=SC2086
     timed optimize_chunked "$BIN/optimize_chunked" -g "$O/forward_graph_reordered.bin" \

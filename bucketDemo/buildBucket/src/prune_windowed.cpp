@@ -154,6 +154,9 @@ int main(int argc, char** argv)
             ("pool-graph", po::value<std::string>()->default_value(""),
                 "A4: centroid_pool.bin (bucket2 Step 6 pool table, n_buckets x NPROBE); when given, each bucket's "
                 "window = itself + its Step 6 pool buckets instead of the centroid KNN graph (order unchanged)")
+            ("dists", po::value<std::string>()->default_value(""),
+                "B13: vector_dists.bin (Step 6 distances of the candidate rows); chunked GPU prune ranks each "
+                "point's candidates by them, so out-of-window candidates are ordered by their real distance")
             ("save-npy", po::bool_switch()->default_value(false),
                 "Also write a .npy alongside the .bin");
 
@@ -197,6 +200,24 @@ int main(int argc, char** argv)
                                      ") != n_buckets (" + std::to_string(n_buckets) + ")");
         // A4 (user-approved): 窗口 = Step 6 的 pool (center + NPROBE 个近邻桶)，候选都在窗口里有真实距离
         const std::string pool_path = vm["pool-graph"].as<std::string>();
+        const std::string dists_path = vm["dists"].as<std::string>();
+        int fd_dists = -1;
+        if (!dists_path.empty()) {
+            fd_dists = ::open(dists_path.c_str(), O_RDONLY);
+            if (fd_dists < 0) throw std::runtime_error("cannot open --dists " + dists_path);
+            prune_windowed_gpu::set_center_dists([fd_dists, M = 0](int64_t lo, int64_t n, float* out) mutable {
+                int32_t Mf = 0;
+                if (M == 0) { if (::pread(fd_dists, &Mf, sizeof(Mf), sizeof(int64_t)) != sizeof(Mf)) throw std::runtime_error("short read (dists header)"); M = Mf; }
+                size_t want = static_cast<size_t>(n) * M * sizeof(float);
+                off_t off = static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) + static_cast<off_t>(lo) * M * sizeof(float);
+                char* p = reinterpret_cast<char*>(out);
+                while (want > 0) {
+                    ssize_t r = ::pread(fd_dists, p, want, off);
+                    if (r <= 0) throw std::runtime_error("short read (dists)");
+                    p += r; want -= static_cast<size_t>(r); off += r;
+                }
+            });
+        }
         int32_t win_k = static_cast<int32_t>(ck.K);   // 窗口里除中心外最多几个桶
         auto adj = [&] {
             if (pool_path.empty()) return bucket_order::adjacency_from_flat_graph(ck.graph.data(), ck.n_centroids, ck.K);

@@ -11,7 +11,7 @@ SEED=42
 : "${KNN_K:=32}"
 : "${ITERATIONS:=3}"   # default (exported value wins, for sweeps); datasets.json "iterations" overrides (SIFT100M / msTuring100M: 2)
 
-PRUNE_CACHE_MB=16000
+: "${PRUNE_CACHE_MB:=16000}"
 CHUNKED_GPU_BUDGET_MB=16000
 CHUNKED_EDGE_BUFFER_MB=16000
 
