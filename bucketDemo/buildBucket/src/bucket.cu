@@ -2415,6 +2415,31 @@ std::vector<int64_t> select_centroids_on_gpu_kmeans_parallel(
         std::cout << "  N_work=" << working_N << ", D=" << D
                   << ", n_centroids=" << n_centroids << "\n";
 
+        // A6b (user-approved to test, 2026-10-25): DiskJoin one_level_kmeans 式随机 centroid —— 从训练样本里
+        // 均匀随机取 n_centroids 个点 (固定种子)，不做 KMeans|| 过采样。BUCKET2_CENTROIDS=random 打开
+        if (!mem_est.need_pq && std::getenv("BUCKET2_CENTROIDS") &&
+            std::string(std::getenv("BUCKET2_CENTROIDS")) == "random") {
+            const int64_t k = std::min<int64_t>(n_centroids, working_N);
+            std::vector<int64_t> perm(static_cast<size_t>(working_N));
+            std::iota(perm.begin(), perm.end(), 0LL);
+            std::mt19937 gen(config.seed + 42);
+            for (int64_t i = 0; i < k; ++i) {
+                std::uniform_int_distribution<int64_t> d(i, working_N - 1);
+                std::swap(perm[static_cast<size_t>(i)], perm[static_cast<size_t>(d(gen))]);
+            }
+            std::vector<float> h_c(static_cast<size_t>(k) * D);
+            for (int64_t i = 0; i < k; ++i)
+                std::memcpy(h_c.data() + static_cast<size_t>(i) * D,
+                            upload_data + static_cast<size_t>(perm[static_cast<size_t>(i)]) * D, static_cast<size_t>(D) * sizeof(float));
+            CUDA_CHECK(cudaMalloc(d_centroids_f32, h_c.size() * sizeof(float)));
+            allocated_centroids = *d_centroids_f32;
+            CUDA_CHECK(cudaMemcpy(*d_centroids_f32, h_c.data(), h_c.size() * sizeof(float), cudaMemcpyHostToDevice));
+            std::cout << "  [A6b] " << k << " random centroids (uniform sample, no KMeans||)\n";
+            std::cout << "  [Step2 timing] upload+norms=0.000s kmeans_parallel=0.000s select_final="
+                      << std::fixed << std::setprecision(3) << step2_elapsed() << "s total=" << step2_elapsed() << "s\n";
+            return std::vector<int64_t>(perm.begin(), perm.begin() + k);
+        }
+
         // Stage 3: Upload working data to GPU & precompute L2 norms
         //          CPU 侧只有一个指针 upload_data，无额外副本
         raft::resources res;
