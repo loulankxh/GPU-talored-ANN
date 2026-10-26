@@ -1434,6 +1434,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                            + TOP_K * (sizeof(uint32_t) + sizeof(float));
     if (!is_pq && !gpu_query_loader && std::is_same<CentroidT, float>::value)
         per_point_bytes += static_cast<size_t>(D) * sizeof(T) + sizeof(int32_t);
+    // 文件读路径: 下一批的读盘 + H2D 在后台线程 (非阻塞 stream) 里和本批的搜索重叠，
+    // 要第二个原始 T 区间 buffer。BUCKET2_STEP4_PREFETCH=0 关掉 (原来的串行读 → 传 → 搜)。
+    const bool prefetch_io = !is_pq && !gpu_query_loader && !host_raw &&
+        std::is_same<CentroidT, float>::value &&
+        !(std::getenv("BUCKET2_STEP4_PREFETCH") && std::getenv("BUCKET2_STEP4_PREFETCH")[0] == '0');
+    if (prefetch_io) per_point_bytes += static_cast<size_t>(D) * sizeof(T);
 
     int64_t Nv = static_cast<int64_t>(remaining / per_point_bytes);
     Nv = std::max(static_cast<int64_t>(1), std::min(Nv, N_nc));
@@ -1600,6 +1606,36 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     t_setup = std::chrono::duration<double>(Clock::now() - t_setup0).count();
 
     std::vector<T> raw_batch;   // 跨 batch 复用 (每批重新分配会单线程清零一遍)
+    T* d_raw_pf[2] = {nullptr, nullptr};   // prefetch_io: 两个原始区间 buffer 轮流用
+    cudaStream_t copy_stream = nullptr;
+    int pf_slot = 0;
+    std::future<void> io_next;   // 在 raw_batch 之后声明: 先析构 (等后台读 / 传结束)
+    auto start_io = [&](int64_t bs, int slot) {
+        const int64_t be = std::min(bs + Nv, N_nc);
+        const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
+        T* dst = d_raw_pf[slot];
+        io_next = std::async(std::launch::async, [&raw_batch, &input_path, copy_stream, dst, lo, hi, D] {
+            int32_t n_tmp, d_tmp;
+            load::read_bigann_raw_range<T>(input_path, lo, hi - lo + 1, raw_batch, n_tmp, d_tmp);
+            CUDA_CHECK(cudaMemcpyAsync(dst, raw_batch.data(),
+                static_cast<size_t>(hi - lo + 1) * D * sizeof(T), cudaMemcpyHostToDevice, copy_stream));
+            CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+        });
+    };
+    if (prefetch_io) {
+        size_t max_raw = 0;   // 所有批里最长的 [lo, hi] 区间 (元素)
+        for (int64_t bs = 0; bs < N_nc; bs += Nv) {
+            const int64_t be = std::min(bs + Nv, N_nc);
+            const int64_t lo = non_centroid_indices[bs], hi = non_centroid_indices[be - 1];
+            if (lo < 0 || hi >= N || lo > hi)   // bounds check
+                throw std::runtime_error("batch_assign: prefetch range out of bounds");
+            max_raw = std::max(max_raw, static_cast<size_t>(hi - lo + 1) * D);
+        }
+        for (auto& b : d_raw_pf) CUDA_CHECK(cudaMalloc(&b, max_raw * sizeof(T)));
+        d_raw_cap = max_raw;
+        CUDA_CHECK(cudaMalloc(&d_local_rows, Nv * sizeof(int32_t)));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
+    }
     for (int64_t batch_start = 0; batch_start < N_nc; batch_start += Nv) {
         int64_t batch_end = std::min(batch_start + Nv, N_nc);
         int64_t batch_size = batch_end - batch_start;
@@ -1618,6 +1654,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             if (batch_lo < 0 || batch_hi >= N || batch_lo > batch_hi)   // bounds check
                 throw std::runtime_error("batch_assign: host_raw range out of bounds");
             raw_ptr = host_raw + static_cast<size_t>(batch_lo) * D;
+        } else if (prefetch_io) {
+            if (!io_next.valid()) start_io(batch_start, pf_slot);   // 第一批
+            io_next.get();   // 本批已在 d_raw_pf[pf_slot] (读 + H2D 的等待时间算在 read 里)
+            d_raw_range = d_raw_pf[pf_slot];
+            pf_slot ^= 1;    // 另一个 buffer 上一批的 gather 已同步完成
+            if (batch_end < N_nc) start_io(batch_end, pf_slot);
         } else {
             int32_t N_tmp, D_tmp;
             load::read_bigann_raw_range<T>(input_path, batch_lo, batch_hi - batch_lo + 1,
@@ -1648,7 +1690,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             // 非 PQ 模式：原始 T 区间整段上传，GPU 上按非 centroid 行 gather + 转 float
             const int64_t n_raw = batch_hi - batch_lo + 1;
             const size_t raw_elems = static_cast<size_t>(n_raw) * D;
-            if (raw_elems > d_raw_cap) {
+            if (raw_elems > d_raw_cap && !prefetch_io) {
                 if (d_raw_range) CUDA_CHECK(cudaFree(d_raw_range));
                 CUDA_CHECK(cudaMalloc(&d_raw_range, raw_elems * sizeof(T)));
                 d_raw_cap = raw_elems;
@@ -1663,8 +1705,9 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 h_local_rows[static_cast<size_t>(i)] = static_cast<int32_t>(local);
             }
             if (n_bad > 0) throw std::runtime_error("batch_assign: row offset out of read range");
-            CUDA_CHECK(cudaMemcpy(d_raw_range, raw_ptr, raw_elems * sizeof(T),
-                                  cudaMemcpyHostToDevice));
+            if (!prefetch_io)
+                CUDA_CHECK(cudaMemcpy(d_raw_range, raw_ptr, raw_elems * sizeof(T),
+                                      cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(d_local_rows, h_local_rows.data(), batch_size * sizeof(int32_t),
                                   cudaMemcpyHostToDevice));
             const int threads = 256;
@@ -1672,7 +1715,9 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
             gather_rows_int32<T><<<static_cast<unsigned>((total + threads - 1) / threads), threads>>>(
                 d_raw_range, d_local_rows, reinterpret_cast<float*>(d_queries), batch_size, D);
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            // 只等默认 stream (gather 写完 d_queries、读完 d_raw_range)；cudaDeviceSynchronize
+            // 会连后台 copy_stream 上下一批的 H2D 一起等
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamLegacy));
         } else if (!gpu_query_loader) {
             // 非 PQ 模式：读取原始 T 数据 -> 转为 CentroidT -> 上传
             std::vector<CentroidT> batch_data(batch_size * D);
@@ -1881,6 +1926,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     if (d_f16_dots)   CUDA_CHECK(cudaFree(d_f16_dots));
     if (d_top2_u32)   CUDA_CHECK(cudaFree(d_top2_u32));
     if (f16_cublas)   cublasDestroy(f16_cublas);
+    if (prefetch_io) {
+        if (io_next.valid()) io_next.get();
+        d_raw_range = nullptr;   // 指向 d_raw_pf 之一
+        for (auto& b : d_raw_pf) if (b) CUDA_CHECK(cudaFree(b));
+        CUDA_CHECK(cudaStreamDestroy(copy_stream));
+    }
     if (d_raw_range)  CUDA_CHECK(cudaFree(d_raw_range));
     if (d_local_rows) CUDA_CHECK(cudaFree(d_local_rows));
     // NOTE: d_centroids 和 d_graph 由 caller 管理，本函数不释放
