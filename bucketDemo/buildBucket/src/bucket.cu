@@ -7428,6 +7428,19 @@ int run_pipeline_impl(
                             K * sizeof(uint32_t));
             CUDA_CHECK(cudaMalloc(&d_graph, g.size() * sizeof(uint32_t)));
             CUDA_CHECK(cudaMemcpy(d_graph, g.data(), g.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            if (iter == 0 && nprobe > 0) {
+                // A4 (user-approved): round 1 的 Step 6 pool 表 (每桶前 nprobe 个近邻桶，跟 Step 6 用的是同一张
+                // 精确自 KNN 的前 nprobe 列)，给 prune_windowed --pool-graph 当窗口；格式同 centroid_knn.bin
+                const std::string p = output_dir + "/centroid_pool.bin";
+                std::ofstream out(p, std::ios::binary);
+                const int64_t nc = n_centroids; const int32_t Pw = static_cast<int32_t>(nprobe);
+                out.write(reinterpret_cast<const char*>(&nc), sizeof(int64_t));
+                out.write(reinterpret_cast<const char*>(&Pw), sizeof(int32_t));
+                for (int64_t c = 0; c < n_centroids; ++c)
+                    out.write(reinterpret_cast<const char*>(centroid_exact_knn.data() + static_cast<size_t>(c) * exact_knn_k),
+                              static_cast<std::streamsize>(nprobe * sizeof(uint32_t)));
+                if (!out.good()) throw std::runtime_error("write failed: " + p);
+            }
         } else {
             build_centroid_knn_on_gpu(
                 d_centroids_f32, n_centroids, D, K, &d_graph);

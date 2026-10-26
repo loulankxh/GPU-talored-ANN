@@ -17,6 +17,7 @@
 // cuVS 26.12 reference: detail/cagra/graph_core.cuh::kern_fused_prune (warp
 // per node, detours counted against the node's sorted row in shared memory).
 
+#include <iostream>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -57,6 +58,9 @@ __device__ __forceinline__ bool in_window(const int32_t* __restrict__ win, int w
     }
     return lo < wlen && win[lo] == q;
 }
+
+// 保留下来的边里，候选不在窗口里 (距离未知 = +inf、没做 detour 检查) 的条数 (A4 统计)
+__device__ unsigned long long g_unverified_kept = 0;
 
 template <typename T>
 __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
@@ -191,13 +195,25 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) prune_kernel(
             const int cq = s_cnt[w][q];
             pos += (cq < cr) || (cq == cr && q < r);
         }
-        if (pos < out_deg) out[(a - row0) * out_deg + pos] = static_cast<uint32_t>(s_id[w][r]);
+        if (pos < out_deg) {
+            out[(a - row0) * out_deg + pos] = static_cast<uint32_t>(s_id[w][r]);
+            if (!(s_dist[w][r] < INFINITY)) atomicAdd(&g_unverified_kept, 1ull);
+        }
     }
 }
 
 }  // namespace
 
 namespace prune_windowed_gpu {
+
+static void reset_unverified() { unsigned long long z = 0; cudaMemcpyToSymbol(g_unverified_kept, &z, sizeof(z)); }
+static void report_unverified(int64_t n_points, int out_deg)
+{
+    unsigned long long h = 0;
+    cudaMemcpyFromSymbol(&h, g_unverified_kept, sizeof(h));
+    std::cout << "  [Prune] unverified kept edges (candidate outside the window): " << h << " = "
+              << static_cast<double>(h) / std::max<int64_t>(n_points, 1) << " per row of " << out_deg << "\n";
+}
 
 bool available(int64_t N, int M, int D, int n_buckets, int W, int out_deg, int elem_bytes)
 {
@@ -305,6 +321,7 @@ void run(const int32_t* h_cand, const T* h_vec, int64_t N, int M, int D,
         PWG_CHECK(cudaMalloc(&d_cbase, cbase.size() * sizeof(int64_t)));
         stg.h2d(d_cbase, cbase.data(), cbase.size() * sizeof(int64_t));
         PWG_CHECK(cudaMemsetAsync(d_err, 0, sizeof(int), stg.st));
+        reset_unverified();
         const int64_t blocks = (N + kWarpsPerBlock - 1) / kWarpsPerBlock;
         prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
             d_cand, d_vec, d_off, d_win, d_wl, d_cbase, 0, N, M, D, n_buckets, W, out_deg, d_out, d_err);
@@ -316,6 +333,7 @@ void run(const int32_t* h_cand, const T* h_vec, int64_t N, int M, int D,
             throw std::runtime_error("prune_windowed_gpu: fewer than output_degree valid candidates "
                                      "(check --output-degree <= M_in and padding)");
         stg.d2h_rows(d_out, N, out_deg, sink);
+        report_unverified(N, out_deg);
     } catch (...) {
         cleanup();
         throw;
@@ -415,6 +433,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
         std::vector<RowRun> h_runs;
         int cur = 0;
         int32_t chunk_id = 0;
+        reset_unverified();
         for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
             // ---- 并集 U(p0..p1): 加位置直到行数到上限 ----
             for (int q : prevU) prev_cbase[static_cast<size_t>(q)] = -1;
@@ -509,6 +528,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             if (stats) { stats->chunks++; stats->loaded_rows += fresh_rows; }
             p0 = p1;
         }
+        report_unverified(N, out_deg);
     } catch (...) {
         cleanup();
         throw;

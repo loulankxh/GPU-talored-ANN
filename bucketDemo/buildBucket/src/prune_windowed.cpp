@@ -151,6 +151,9 @@ int main(int argc, char** argv)
                 "or leave both at their auto default)")
             ("cache-mb", po::value<size_t>()->default_value(4000),
                 "Host memory budget (MB) for the Belady bucket cache (candidate rows + vectors)")
+            ("pool-graph", po::value<std::string>()->default_value(""),
+                "A4: centroid_pool.bin (bucket2 Step 6 pool table, n_buckets x NPROBE); when given, each bucket's "
+                "window = itself + its Step 6 pool buckets instead of the centroid KNN graph (order unchanged)")
             ("save-npy", po::bool_switch()->default_value(false),
                 "Also write a .npy alongside the .bin");
 
@@ -192,7 +195,18 @@ int main(int argc, char** argv)
         if (ck.n_centroids != n_buckets)
             throw std::runtime_error("centroid_knn n_centroids (" + std::to_string(ck.n_centroids) +
                                      ") != n_buckets (" + std::to_string(n_buckets) + ")");
-        auto adj = bucket_order::adjacency_from_flat_graph(ck.graph.data(), ck.n_centroids, ck.K);
+        // A4 (user-approved): 窗口 = Step 6 的 pool (center + NPROBE 个近邻桶)，候选都在窗口里有真实距离
+        const std::string pool_path = vm["pool-graph"].as<std::string>();
+        int32_t win_k = static_cast<int32_t>(ck.K);   // 窗口里除中心外最多几个桶
+        auto adj = [&] {
+            if (pool_path.empty()) return bucket_order::adjacency_from_flat_graph(ck.graph.data(), ck.n_centroids, ck.K);
+            auto pg = graph_io::read_centroid_knn(pool_path);
+            if (pg.n_centroids != n_buckets)
+                throw std::runtime_error("pool graph n (" + std::to_string(pg.n_centroids) + ") != n_buckets");
+            std::cout << "  A4: window = Step 6 pool (" << pg.K << " neighbor buckets) from " << pool_path << "\n";
+            win_k = static_cast<int32_t>(pg.K);
+            return bucket_order::adjacency_from_flat_graph(pg.graph.data(), pg.n_centroids, pg.K);
+        }();
 
         int32_t order_window = (order_window_arg > 0) ? order_window_arg : std::max<int32_t>(4 * ck.K, 16);
         auto future = bucket_order::compute_future_access_lists(order, adj);
@@ -260,7 +274,7 @@ int main(int argc, char** argv)
         // fetch in the *same* position.
         std::vector<const BucketWindowBlock*> position_scratch;
         std::vector<BucketWindowBlock> position_scratch_owned;
-        position_scratch_owned.reserve(static_cast<size_t>(ck.K) + 1);
+        position_scratch_owned.reserve(static_cast<size_t>(win_k) + 1);
 
         // Per-phase wall-clock breakdown of Step 3, since "Prune = 69.95s"
         // alone doesn't say whether the time went into cache fetch (disk +
@@ -309,7 +323,7 @@ int main(int argc, char** argv)
             const bool f32_data = dataset_ext == ".fbin";   // GPU kernel 直接用 float 向量 (P2.2)
             // GPU 路径只读原始 u8 字节: 先判定，走 GPU 时不再分配 / 转换整份 float 向量
             // (SIFT10M: 5.1 GB 内存 + 一遍转换，GPU kernel 根本不用)
-            const int32_t Wmax = static_cast<int32_t>(ck.K) + 1;
+            const int32_t Wmax = win_k + 1;
             // BUCKET2_PRUNE_GPU=0: 强制 CPU kernel (对照 / 调试)
             const bool gpu_off = std::getenv("BUCKET2_PRUNE_GPU") && std::getenv("BUCKET2_PRUNE_GPU")[0] == '0';
             const bool use_gpu = (u8_data || f32_data) && !gpu_off &&
@@ -484,10 +498,10 @@ int main(int argc, char** argv)
         // float32 (.fbin) 同样走 GPU (P2.2: kernel 按元素类型模板化, fp32 距离)
         if (!batched && (dataset_ext == ".u8bin" || dataset_ext == ".i8bin" || dataset_ext == ".fbin") &&
             !(std::getenv("BUCKET2_PRUNE_CHUNKED") && std::getenv("BUCKET2_PRUNE_CHUNKED")[0] == '0') &&
-            prune_windowed_gpu::available(1, M_in, dataset_D_peek, n_buckets, static_cast<int32_t>(ck.K) + 1, output_degree, pw_elem)) {
+            prune_windowed_gpu::available(1, M_in, dataset_D_peek, n_buckets, win_k + 1, output_degree, pw_elem)) {
             auto tg0 = Clock::now();
             const int32_t D_all = dataset_D_peek;
-            const int32_t Wmax = static_cast<int32_t>(ck.K) + 1;
+            const int32_t Wmax = win_k + 1;
             std::vector<int32_t> win(static_cast<size_t>(n_buckets) * Wmax, std::numeric_limits<int32_t>::max());
             std::vector<int32_t> win_len(static_cast<size_t>(n_buckets), 0);
             for (int32_t pos = 0; pos < n_buckets; ++pos) {

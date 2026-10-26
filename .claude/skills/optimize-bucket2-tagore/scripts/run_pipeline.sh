@@ -111,6 +111,7 @@ for ((R = 0; R < REPS; R++)); do
       --bucket-offsets "$O/bucket_offsets.bin" --bucket-process-order "$O/bucket_process_order.bin" \
       -c "$O/centroid_knn.bin" -o "$O/forward_graph_reordered.bin" \
       --output-degree "$OUTPUT_DEGREE" --cache-mb "$PRUNE_CACHE_MB" $PRUNE_EXTRA \
+      $( [[ ${A4_POOL:-0} == 1 ]] && echo --pool-graph "$O/centroid_pool.bin" ) \
       || { echo "prune FAILED"; kill $SMI; exit 3; }
     # shellcheck disable=SC2086
     timed optimize_chunked "$BIN/optimize_chunked" -g "$O/forward_graph_reordered.bin" \
