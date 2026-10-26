@@ -160,3 +160,8 @@ target_link_libraries(translate_ids
 set_target_properties(translate_ids PROPERTIES
     BUILD_RPATH "${CONDA_LIB};${TOOL_LIB}"
 )
+
+# a8_refine: A8 experiment (local join over forward + reverse neighbors of a finished graph)
+add_executable(a8_refine ${BUILD_SRC_PATH}/a8_refine.cu)
+target_link_libraries(a8_refine PRIVATE CUDA::cudart Boost::program_options)
+set_target_properties(a8_refine PROPERTIES BUILD_RPATH "${CONDA_LIB};${TOOL_LIB}")
