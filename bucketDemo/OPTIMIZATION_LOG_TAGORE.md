@@ -192,7 +192,7 @@ SIFT100M Step 6 = 1687 s of 3215 s, and ~1000 s of it is the producer waiting on
 | B12 | **done #58** — Prune: GPU Belady bucket cache across chunks (like Step 6 #1/#2) so a bucket loaded once stays on the GPU while its future windows need it — cut the 9.98 × N reload factor (each reload = pread + H2D, ~95 ns / row); pinned memory within the RSS guard | `largeIndex` reorder + buffer reuse | prune SIFT100M 102 s, msTuring100M 235 s | −40…−60 s |
 | B13 | **tried #57: quality +0.015 at 100M but +60–100 s I/O, no round saved — off by default** — Chunked prune ranks out-of-window candidates by Step 6's exact distances: bucket2 keeps `vector_dists` (today `--skip-dists`), the prune uses them for the candidates whose vectors are not in the chunk instead of +inf (sorting correct; detour checks for those still missing). Half of A7's effect without loading extra rows — test first on SIFT10M with the chunked prune forced vs windowed vs unwindowed (#55 / #56) | — | prune quality on 100M (12.9 / 20.7 unverified edges per row) | quality → fewer rounds / smaller NPROBE at 100M | dists file I/O (N × 64 × 4 B: 25.6 GB at 100M) |
 | B14 | bucket2 peak RSS on msTuring100M is bimodal with unchanged code: 56–67 GB or 90–93 GB (tagore50 93 / 93 / 56, tagore51 57 / 57 / 67, tagore61 93 / 93 / 93); same plans, record sizes and cache budgets in the logs, no mmap. The ~37 GB gap ≈ one round's records (38 GiB) or the 47 GB VectorKNN host cache budget → find the buffer that is sometimes resident twice (per-step RSS probes), then bound it; also makes the 1.2× RSS guard meaningful for msTuring100M | — | bucket2 host memory | memory guard; 1B scalability |
-| B15 | msTuring100M has no reliable quality margin at DiskANN L 128: 0.7985 / 0.7994 / 0.7969 / 0.7948 (tagore50 / 51 / 61 / 63, same assignment rule) vs floor 0.7956 (CAGRA − 0.05) → retune under the quality-margin rule (e.g. NPROBE 40 → 48, or a third round), multi-run spread table required | — | msTuring100M quality | gate robustness |
+| B15 | **done #61 (NPROBE 48)** — msTuring100M has no reliable quality margin at DiskANN L 128: 0.7985 / 0.7994 / 0.7969 / 0.7948 (tagore50 / 51 / 61 / 63, same assignment rule) vs floor 0.7956 (CAGRA − 0.05) → retune under the quality-margin rule (e.g. NPROBE 40 → 48, or a third round), multi-run spread table required | — | msTuring100M quality | gate robustness |
 ## Awaiting approval
 
 | id | idea | TAGORE source | target stage | expected gain | what changes semantically | status |
@@ -1498,4 +1498,18 @@ User rule: "only if 10M shows a net gain, test the chunked 100M path" — 10M ga
 - **Bench set (×3, `runs/tagore63`):** sift100M 557.30 → **542.52 s (+2.65%)** (rep0 984 s: overlapped with my own SIFT100M smoke run's disk I/O — Step 6 279 vs 89 s, Wait 190 s; reps 1 / 2 542.5 / 537.8 s, median unaffected; lesson: no 100M smoke runs while timed runs are going); others within ±1.5%. Quality passes, 0 defects, paths unchanged.
 - **msTuring100M ×3:** 1551.3 → **1454.06 s (+6.3%)**, bucket2 1205 s; DiskANN L 32…512 recall@10 0.6038 / 0.7094 / **0.7948** / 0.8631 / 0.9107 — L 128 is 0.0008 under the floor 0.7956; same code family gave 0.7985 / 0.7994 / 0.7969 before → Step 4 nondeterminism, the config has no margin (B15). bucket2 RSS 89 GB (B14).
 - **Why kept:** result-neutral implementation with measured gains on both 100M configs; the two failures are pre-existing (B14, B15). best.json not updated (msTuring100M entry stays `runs/tagore51`; bench set unchanged within ±3%).
+
+### #61 — B15: msTuring100M NPROBE 40 → 48 for a reliable quality margin (2026-10-26) — adopted by the quality-margin rule
+- **Why:** with NPROBE 40 the DiskANN L 128 recall@10 of the same code family was 0.7985 / 0.7994 / 0.7969 / 0.7948 (tagore50 / 51 / 61 / 63) against the floor 0.7956 (CAGRA − 0.05) — the gate fails by chance (#60). Class: A2 parameter retune (NPROBE), under the quality-margin rule.
+- **Spread, NPROBE 48 (3 separately searched builds, `runs/tagore64/np48_*`):**
+
+| run | build s | bucket2 s | L 32 | L 64 | L 128 (floor 0.7956) | L 256 (floor 0.8600) | L 512 (floor 0.9011) | bucket2 RSS GB |
+|---|---|---|---|---|---|---|---|---|
+| np48_0 | 1523.05 | 1273.44 | 0.6067 | 0.7137 | 0.8017 | 0.8662 | 0.9157 | 89.7 |
+| np48_1 | 1484.59 | 1231.17 | 0.6070 | 0.7162 | 0.8024 | 0.8653 | 0.9148 | 81.5 |
+| np48_2 | 1444.67 | 1194.71 | 0.6097 | 0.7171 | 0.8005 | 0.8669 | 0.9143 | 85.6 |
+| NPROBE 40 (#60, ×3 median) | 1454.06 | 1205.33 | 0.6038 | 0.7094 | 0.7948 | 0.8631 | 0.9107 | 89.0 |
+
+  Min margin +0.0049 at L 128 (NPROBE 40: −0.0008…+0.0038), +0.0053 at L 256. Median build 1484.6 s (+2.1% vs NPROBE 40, still +4.3% vs the 1551.3 s best).
+- **Change:** `datasets.json` msTuring100M `params.NPROBE` 48. best.json not updated: msTuring100M is outside the bench set and every msTuring100M run now fails the bucket2 RSS guard against the 63.65 GB low-mode best (B14, next).
 

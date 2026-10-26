@@ -84,6 +84,9 @@
   "iterations": 2,
   "search": "diskann",
   "ref": "cagra",
-  "bench": []
+  "bench": [],
+  "params": {
+   "NPROBE": 48
+  }
  }
 }
