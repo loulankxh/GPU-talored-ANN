@@ -60,6 +60,7 @@ adaptive = {
     "GPU_BUCKET_CACHE_MB": str(GPU_MB // 2),
     "CHUNKED_HOST_BUDGET_MB": str(HOST_BUDGET_MB),
     "A1_PASSES": "0",   # A1-R local join passes (resident path; #40, user-approved A1)
+    "A7_UNWIN": "0",    # A7: batched GPU prune without the window restriction (#55, user-approved for 10M)
 }
 if d.get("iterations"):
     adaptive["ITERATIONS"] = str(d["iterations"])

@@ -56,7 +56,7 @@
   "dir": "/home/lanlu/microBenchmark/dataset/msTuring10M",
   "base": "base.10M.fbin",
   "reps": 3,
-  "iterations": 7,
+  "iterations": 4,
   "search": "cagra",
   "ref": "cagra",
   "bench": [
@@ -64,9 +64,10 @@
   ],
   "params": {
    "CENTROID_RATIO": "0.001953125",
-   "NPROBE": "64"
+   "NPROBE": "64",
+   "A7_UNWIN": "1"
   },
-  "params_note": "#46 (margin fix of #42): avg bucket 512, 7 rounds x NPROBE 64; itopk 32 min 0.6208 over 3 runs vs CAGRA gate 0.6121 (6 x 64 failed 1 of 4)"
+  "params_note": "#55 (A7, user-approved for 10M): avg bucket 512, 4 rounds x NPROBE 64, prune without window restriction; itopk 32 min 0.6249 over 5 timed runs vs CAGRA gate 0.6121"
  },
  "msTuring100M": {
   "dir": "/home/lanlu/microBenchmark/dataset/msTuring100M",
