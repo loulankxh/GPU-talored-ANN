@@ -1,0 +1,187 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 51730c1..dc9be18 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -1201,6 +1201,93 @@ struct VecBucket {
+     std::vector<DataT> vecs;
+ };
+ 
++// ---- Step 6 host-cache readahead (#73) ----
++// round 1 的 host 缓存 miss 以前在 producer 线程上一桶一桶读 data_reordered
++// (分配 + 清零 + 拷贝，单线程 ~1 GB/s: msTuring100M 一轮 44 s)。这里按桶的
++// 首次访问顺序 (bucket_order_seq + 近邻表) 用几个线程提前 pread 进一个有界窗口，
++// loader 第一次要某桶时直接拿走；之后的重复读 (被淘汰后) 仍走同步读。结果不变。
++template <typename DataT, typename Reader>
++class BucketReadahead {
++public:
++    BucketReadahead(const Reader& r, std::vector<int32_t> seq, int32_t n_buckets, int threads, int window)
++        : r_(r), seq_(std::move(seq)), idx_of_(static_cast<size_t>(n_buckets), -1),
++          consumed_(seq_.size(), 0), slots_(static_cast<size_t>(window)), W_(window) {
++        for (size_t i = 0; i < seq_.size(); ++i) idx_of_[static_cast<size_t>(seq_[i])] = static_cast<int64_t>(i);
++        for (int t = 0; t < threads; ++t) th_.emplace_back([this] { work(); });
++    }
++    ~BucketReadahead() {
++        { std::lock_guard<std::mutex> lk(mu_); stop_ = true; }
++        cv_work_.notify_all();
++        for (auto& t : th_) t.join();
++    }
++    // bid 的首次读已在窗口里 → 取走 (必要时等它读完) 返回 true；否则 false (调用方同步读)
++    bool take(int32_t bid, VecBucket<DataT>& vb) {
++        const int64_t i = idx_of_[static_cast<size_t>(bid)];
++        std::unique_lock<std::mutex> lk(mu_);
++        if (i < 0 || consumed_[static_cast<size_t>(i)]) return false;
++        if (i >= low_ + W_) { mark_consumed(i); return false; }   // 远超窗口 (不该发生): 同步读
++        Slot& s = slots_[static_cast<size_t>(i % W_)];
++        cv_ready_.wait(lk, [&] { return err_ || (s.idx == i && s.ready); });
++        if (err_) std::rethrow_exception(err_);
++        vb.ids = std::move(s.ids);
++        vb.vecs = std::move(s.vecs);
++        s.ready = false; s.idx = -1;
++        mark_consumed(i);
++        return true;
++    }
++
++private:
++    struct Slot { int64_t idx = -1; bool ready = false; std::vector<int64_t> ids; std::vector<DataT> vecs; };
++    void mark_consumed(int64_t i) {
++        consumed_[static_cast<size_t>(i)] = 1;
++        bool moved = false;
++        while (low_ < static_cast<int64_t>(seq_.size()) && consumed_[static_cast<size_t>(low_)]) { ++low_; moved = true; }
++        if (moved) cv_work_.notify_all();
++    }
++    void work() {
++        std::vector<int64_t> ids;
++        std::vector<DataT> vecs;
++        for (;;) {
++            int64_t i;
++            {
++                std::unique_lock<std::mutex> lk(mu_);
++                cv_work_.wait(lk, [&] {
++                    return stop_ || (next_ < static_cast<int64_t>(seq_.size()) && next_ < low_ + W_);
++                });
++                if (stop_) return;
++                i = next_++;
++                if (consumed_[static_cast<size_t>(i)]) continue;
++            }
++            try {
++                r_.read_bucket_concurrent(seq_[static_cast<size_t>(i)], ids, vecs);
++            } catch (...) {
++                { std::lock_guard<std::mutex> lk(mu_); if (!err_) err_ = std::current_exception(); }
++                cv_ready_.notify_all();
++                return;
++            }
++            {
++                std::lock_guard<std::mutex> lk(mu_);
++                Slot& s = slots_[static_cast<size_t>(i % W_)];
++                s.idx = i; s.ready = true;
++                s.ids = std::move(ids); s.vecs = std::move(vecs);
++            }
++            ids = {}; vecs = {};
++            cv_ready_.notify_all();
++        }
++    }
++    const Reader& r_;
++    std::vector<int32_t> seq_;
++    std::vector<int64_t> idx_of_;
++    std::vector<uint8_t> consumed_;
++    std::vector<Slot> slots_;
++    int64_t W_, low_ = 0, next_ = 0;
++    bool stop_ = false;
++    std::exception_ptr err_;
++    std::mutex mu_;
++    std::condition_variable cv_work_, cv_ready_;
++    std::vector<std::thread> th_;
++};
++
+ // ---- Step 4 精确 top-2 (8-bit 数据): fp16 Tensor Core GEMM + 一 warp 一行 top-2 ----
+ // uint8/int8 在 fp16 里精确，乘积 ≤ 65025，D=128 求和 ≤ 8.3M < 2^24，fp32 累加
+ // 精确 (跟 GpuResidentKnn 的 fp16 GEMM 同一论证)；d = ‖c‖² − 2 q·c (省掉每行常数
+@@ -6299,8 +6386,35 @@ void build_vector_knn_with_tensorcore(
+     if (use_dev_cache) future_access_dev = future_access;
+     bucket_order::BeladyBucketCache<VecBucket<DataT>> bucket_cache(
+         std::move(future_access), cache_bytes, vec_bucket_bytes);
++    // 文件读的 reader (round 1 的 data_reordered，非 blob) 开 readahead；BUCKET2_READAHEAD=0 关掉
++    using BucketVecsT = std::remove_reference_t<decltype(bucket_vecs)>;
++    std::unique_ptr<BucketReadahead<DataT, BucketVecsT>> readahead;
++    if constexpr (requires(const BucketVecsT& r, std::vector<int64_t>& i, std::vector<DataT>& v) {
++                      r.read_bucket_concurrent(int64_t{0}, i, v); }) {
++        const char* e = std::getenv("BUCKET2_READAHEAD");
++        if (!h_blob && bucket_vecs.concurrent_reads() && !(e && e[0] == '0')) {
++            // 首次访问顺序: 跟 compute_future_access_lists 同样的 (pos, 中心桶, 近邻) 遍历
++            std::vector<int32_t> first_seq;
++            first_seq.reserve(static_cast<size_t>(n_centroids));
++            std::vector<uint8_t> seen(static_cast<size_t>(n_centroids), 0);
++            auto see = [&](int64_t b) {
++                if (b >= 0 && b < n_centroids && !seen[static_cast<size_t>(b)]) {
++                    seen[static_cast<size_t>(b)] = 1; first_seq.push_back(static_cast<int32_t>(b));
++                }
++            };
++            for (int32_t c : bucket_order_seq) {
++                see(c);
++                const uint32_t* row = centroid_knn_graph + static_cast<size_t>(c) * static_cast<size_t>(K);
++                for (int64_t k = 0; k < static_cast<int64_t>(K); ++k) see(static_cast<int64_t>(row[k]));
++            }
++            readahead = std::make_unique<BucketReadahead<DataT, BucketVecsT>>(
++                bucket_vecs, std::move(first_seq), static_cast<int32_t>(n_centroids), 8, 256);
++            std::cout << "  [VectorKNN] host-cache readahead: 8 threads, window 256 buckets\n";
++        }
++    }
+     auto bucket_loader = [&](int32_t bid) {
+         VecBucket<DataT> vb;
++        if (readahead && readahead->take(bid, vb)) return vb;
+         bucket_vecs.read_bucket(bid, vb.ids, vb.vecs);
+         return vb;
+     };
+diff --git a/bucketDemo/buildBucket/src/reordered_dataset_io.hpp b/bucketDemo/buildBucket/src/reordered_dataset_io.hpp
+index fe6303e..78c7b15 100644
+--- a/bucketDemo/buildBucket/src/reordered_dataset_io.hpp
++++ b/bucketDemo/buildBucket/src/reordered_dataset_io.hpp
+@@ -205,7 +205,13 @@ public:
+         if (!in_.is_open())
+             throw std::runtime_error("ReorderedDatasetBucketReader: cannot open " + path);
+         header_bytes_ = 2 * static_cast<std::streamoff>(sizeof(int32_t));
++        fd_ = ::open(path.c_str(), O_RDONLY);
++        if (fd_ < 0)
++            throw std::runtime_error("ReorderedDatasetBucketReader: cannot open " + path);
+     }
++    ~ReorderedDatasetBucketReader() { if (fd_ >= 0) ::close(fd_); }
++    ReorderedDatasetBucketReader(const ReorderedDatasetBucketReader&) = delete;
++    ReorderedDatasetBucketReader& operator=(const ReorderedDatasetBucketReader&) = delete;
+ 
+     int64_t count(int64_t bucket_id) const {
+         int32_t pos = pos_of_[static_cast<size_t>(bucket_id)];
+@@ -258,7 +264,34 @@ public:
+                                      std::to_string(bucket_id));
+     }
+ 
++    // Step 6 readahead (#73): only file reads are worth running ahead; with
++    // set_host_data the buckets come from memory (blob path).
++    bool concurrent_reads() const { return host_ == nullptr; }
++    // Thread-safe variant of read_bucket for the file case: pread on its own
++    // fd, no shared stream position. Called from several readahead workers.
++    void read_bucket_concurrent(int64_t bucket_id, std::vector<int64_t>& ids_out,
++                                std::vector<DataT>& vecs_out) const {
++        int32_t pos = pos_of_[static_cast<size_t>(bucket_id)];
++        int64_t lo = static_cast<int64_t>(offsets_new_[static_cast<size_t>(pos)]);
++        int64_t hi = static_cast<int64_t>(offsets_new_[static_cast<size_t>(pos) + 1]);
++        int64_t n = hi - lo;
++        ids_out.resize(static_cast<size_t>(n));
++        std::iota(ids_out.begin(), ids_out.end(), lo);
++        vecs_out.resize(static_cast<size_t>(n) * static_cast<size_t>(D_));
++        char* p = reinterpret_cast<char*>(vecs_out.data());
++        size_t left = vecs_out.size() * sizeof(DataT);
++        off_t off = static_cast<off_t>(header_bytes_) + static_cast<off_t>(lo) * D_ * static_cast<off_t>(sizeof(DataT));
++        while (left > 0) {
++            ssize_t r = ::pread(fd_, p, left, off);
++            if (r <= 0)
++                throw std::runtime_error("ReorderedDatasetBucketReader: read failed for bucket " +
++                                         std::to_string(bucket_id));
++            p += r; off += r; left -= static_cast<size_t>(r);
++        }
++    }
++
+ private:
++    int fd_ = -1;
+     const DataT* host_ = nullptr;
+     int64_t host_rows_ = 0;
+     std::ifstream in_;
