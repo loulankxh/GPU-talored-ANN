@@ -1344,14 +1344,19 @@ __global__ void step4_top4_rerank_kernel(const float* __restrict__ dots,   // (n
 // #63: fp16 Tensor Core 打分 + 前 4 融合在一个 kernel 里，不再把 (tile, C) 的点积矩阵写回显存再读一遍
 // (195K centroids 时 cuBLAS GEMM + top-4 扫描的瓶颈是这 2 × tile × C × 4 B 的流量)。
 // block = 128 个 query (8 warp × 16 行，query 的 fp16 片段常驻寄存器)，按 64 个 centroid 一块流过
-// shared memory；WMMA 结果落到 shared，再由每个 query 的 2 个线程各扫 32 列，用 step4_ins4 维护前 4
-// (同分数取下标小的，与扫描顺序无关)。最后 2 个线程合并，写 (n, 4) 候选，交给 step4_rerank4_kernel
+// shared memory；每个 16×16 WMMA 结果落到本 warp 的 shared 小块，马上由每个 query 的 2 个 lane 各扫 8 列，
+// 用 step4_ins4 维护前 4 (同分数取下标小的，与扫描顺序无关；#64: 分数块按 warp 局部，shared 26 KB，
+// 每 SM 2 个 block，每块少一次 __syncthreads)。最后 2 个线程合并，写 (n, 4) 候选，交给 step4_rerank4_kernel
 // 用 fp32 精确重算 (与 step4_top4_rerank_kernel 同一段代码)。Dh 为 16 的倍数 (补 0) 且 ≤ kF4MaxDh
 // (shared 48 KB 内)；qh 的行数要补到 kF4Q 的倍数 (补出来的行结果丢弃)。
-constexpr int kF4Q = 128, kF4C = 64, kF4MaxDh = 112;
-constexpr int kF4Ld = kF4C + 4;   // s_acc 行距: 同一列的 16 个 query 落在不同 bank (64 时 16 路冲突)
-constexpr size_t kF4Smem = sizeof(__half) * kF4C * kF4MaxDh + sizeof(float) * (kF4Q * kF4Ld + kF4C);
-__global__ void __launch_bounds__(256) step4_fused_top4_kernel(
+constexpr int kF4Q = 128, kF4C = 64, kF4MaxDh = 128;
+constexpr int kF4Ld = 16 + 4;   // warp 分数块 (16 × 16) 行距: 减少同列不同行的 bank 冲突
+// 动态 shared memory: centroid 块 (64 × Dh fp16) + 8 个 warp 分数块 + 64 个 ‖c‖² (Dh = 112: 24.25 KB, 128: 26.25 KB)
+inline size_t step4_f4_smem(int64_t Dh)
+{
+    return sizeof(__half) * kF4C * static_cast<size_t>(Dh) + sizeof(float) * (kF4Q * kF4Ld + kF4C);
+}
+__global__ void __launch_bounds__(256, 2) step4_fused_top4_kernel(
     const __half* __restrict__ qh,     // (n_rows, Dh)
     const __half* __restrict__ ch,     // (C, Dh)
     const float* __restrict__ cnorm,   // (C,)
@@ -1359,9 +1364,9 @@ __global__ void __launch_bounds__(256) step4_fused_top4_kernel(
     int* __restrict__ idx4)            // (n_rows, 4)
 {
     using namespace nvcuda;
-    extern __shared__ __align__(32) unsigned char f4_smem[];   // kF4Smem (> 48 KB, 动态 opt-in)
+    extern __shared__ __align__(32) unsigned char f4_smem[];   // step4_f4_smem(Dh)
     __half* s_c   = reinterpret_cast<__half*>(f4_smem);
-    float*  s_acc = reinterpret_cast<float*>(f4_smem + sizeof(__half) * kF4C * kF4MaxDh);
+    float*  s_acc = reinterpret_cast<float*>(f4_smem + sizeof(__half) * kF4C * Dh);
     float*  s_cn  = s_acc + kF4Q * kF4Ld;
     const int tid = threadIdx.x, warp = tid >> 5;
     const int64_t q0 = static_cast<int64_t>(blockIdx.x) * kF4Q;
@@ -1372,8 +1377,10 @@ __global__ void __launch_bounds__(256) step4_fused_top4_kernel(
     #pragma unroll
     for (int k = 0; k < kF4MaxDh / 16; ++k)
         if (k < ksteps) wmma::load_matrix_sync(fa[k], qh + (q0 + warp * 16) * Dh + k * 16, Dh);
-    // 线程 tid 负责 query (tid >> 1) 的列 (tid & 1) + 2j
+    // 线程 tid 负责 query (tid >> 1) (= 本 warp 第 lane >> 1 行) 的列 (tid & 1) + 2j
     const int my_q = tid >> 1, my_h = tid & 1;
+    float* w_acc = s_acc + warp * 16 * kF4Ld;
+    const float* ar = w_acc + ((tid & 31) >> 1) * kF4Ld;
     const bool row_ok = q0 + my_q < n_rows;
     float b[4] = {INFINITY, INFINITY, INFINITY, INFINITY};
     int ix[4] = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
@@ -1400,18 +1407,18 @@ __global__ void __launch_bounds__(256) step4_fused_top4_kernel(
                 wmma::load_matrix_sync(fb, s_c + j * 16 * Dh + k * 16, Dh);
                 wmma::mma_sync(acc, fa[k], fb, acc);
             }
-            wmma::store_matrix_sync(s_acc + warp * 16 * kF4Ld + j * 16, acc, kF4Ld, wmma::mem_row_major);
-        }
-        __syncthreads();
-        if (row_ok) {
-            const float* ar = s_acc + my_q * kF4Ld;
-            #pragma unroll 8
-            for (int jj = my_h; jj < kF4C; jj += 2) {
-                if (jj >= cn) break;
-                step4_ins4(s_cn[jj] - 2.0f * ar[jj], c0 + jj, b, ix);
+            wmma::store_matrix_sync(w_acc, acc, kF4Ld, wmma::mem_row_major);
+            __syncwarp();
+            if (row_ok) {
+                #pragma unroll
+                for (int jj = my_h; jj < 16; jj += 2) {
+                    const int cc = j * 16 + jj;
+                    if (cc < cn) step4_ins4(s_cn[cc] - 2.0f * ar[jj], c0 + cc, b, ix);
+                }
             }
+            __syncwarp();
         }
-        __syncthreads();
+        __syncthreads();   // s_c / s_cn 下一块覆盖之前
     }
     // 两个线程 (相邻 lane) 合并
     float ob[4]; int oi[4];
@@ -1671,6 +1678,12 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     const bool rule_dj = std::getenv("BUCKET2_ASSIGN_RULE") && std::string(std::getenv("BUCKET2_ASSIGN_RULE")) == "diskjoin";
     float* d_top2_d = nullptr;
     std::vector<float> h_top2_d;
+    // #64: 8-bit 精确路径也用融合 kernel (step4_fused_top4_kernel + 精确重算)：8-bit 的 fp16 乘积 / fp32 累加
+    // 都是精确整数，前 2 与 cuBLAS + step4_top2_kernel 相同。D 为 16 的倍数且 ≤ 128；BUCKET2_STEP4_FUSED=0 关掉
+    const bool u8_fused = kExactF16 && exact_f16 && D % 16 == 0 && D <= kF4MaxDh &&
+        !(std::getenv("BUCKET2_STEP4_FUSED") && std::getenv("BUCKET2_STEP4_FUSED")[0] == '0');
+    constexpr int64_t kF4Tile = int64_t(1) << 18;   // 融合路径的 query tile (行数，kF4Q 的倍数)
+    int* d_idx4 = nullptr;
     if (kExactF16 && exact_f16) {
         if (n_centroids < 2) throw std::runtime_error("batch_assign: need >= 2 centroids");
         if (cublasCreate(&f16_cublas) != CUBLAS_STATUS_SUCCESS)
@@ -1679,8 +1692,15 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         const int64_t cd = n_centroids * D;
         CUDA_CHECK(cudaMalloc(&d_cent_h, cd * sizeof(__half)));
         CUDA_CHECK(cudaMalloc(&d_cnorm, n_centroids * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_q_h, kF16Tile * D * sizeof(__half)));
-        CUDA_CHECK(cudaMalloc(&d_f16_dots, kF16Tile * n_centroids * sizeof(float)));
+        if (u8_fused) {
+            CUDA_CHECK(cudaMalloc(&d_q_h, kF4Tile * D * sizeof(__half)));
+            CUDA_CHECK(cudaMalloc(&d_idx4, kF4Tile * 4 * sizeof(int)));
+            CUDA_CHECK(cudaFuncSetAttribute(step4_fused_top4_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(step4_f4_smem(D))));
+        } else {
+            CUDA_CHECK(cudaMalloc(&d_q_h, kF16Tile * D * sizeof(__half)));
+            CUDA_CHECK(cudaMalloc(&d_f16_dots, kF16Tile * n_centroids * sizeof(float)));
+        }
         CUDA_CHECK(cudaMalloc(&d_top2_u32, Nv * TOP_K * sizeof(uint32_t)));
         if (rule_dj && !d_top2_d) CUDA_CHECK(cudaMalloc(&d_top2_d, Nv * TOP_K * sizeof(float)));
         const float* d_cent_f = reinterpret_cast<const float*>(d_centroids);
@@ -1698,8 +1718,6 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
     // fp16 行宽补到 8 的倍数 (align8 Tensor Core kernel)；融合 kernel 要 16 的倍数 (WMMA k = 16)
     const int64_t Dh4 = f32_fused ? (static_cast<int64_t>(D) + 15) / 16 * 16
                                   : (static_cast<int64_t>(D) + 7) / 8 * 8;
-    constexpr int64_t kF4Tile = int64_t(1) << 18;   // 融合路径的 query tile (行数，kF4Q 的倍数)
-    int* d_idx4 = nullptr;
     if (exact_f32) {
         if (cublasCreate(&f16_cublas) != CUBLAS_STATUS_SUCCESS)
             throw std::runtime_error("batch_assign: cublasCreate failed");
@@ -1717,7 +1735,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         if (f32_fused) {
             CUDA_CHECK(cudaMalloc(&d_idx4, kF4Tile * 4 * sizeof(int)));
             CUDA_CHECK(cudaFuncSetAttribute(step4_fused_top4_kernel,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kF4Smem)));
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(step4_f4_smem(Dh4))));
         } else {
             CUDA_CHECK(cudaMalloc(&d_f16_dots, f32_tile * n_centroids * sizeof(float)));
         }
@@ -1889,7 +1907,52 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
         if (kExactF16 && exact_f16) {
             const float alpha = 1.0f, beta = 0.0f;
             const float* d_q_f = reinterpret_cast<const float*>(d_queries);
-            for (int64_t t0 = 0; t0 < batch_size; t0 += kF16Tile) {
+            const float* d_c_f = reinterpret_cast<const float*>(d_centroids);
+            for (int64_t t0 = 0; u8_fused && t0 < batch_size; t0 += kF4Tile) {
+                const int64_t tn = std::min(kF4Tile, batch_size - t0);
+                const int64_t qe = tn * D;
+                step4_f32_to_f16_kernel<<<static_cast<unsigned>((qe + 255) / 256), 256>>>(
+                    d_q_f + t0 * D, d_q_h, qe);
+                step4_fused_top4_kernel<<<static_cast<unsigned>((tn + kF4Q - 1) / kF4Q), 256, step4_f4_smem(D)>>>(
+                    d_q_h, d_cent_h, d_cnorm, tn, static_cast<int>(n_centroids), static_cast<int>(D), d_idx4);
+                const int64_t threads = tn * 32;
+                step4_rerank4_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
+                    d_idx4, d_cnorm, d_c_f, d_q_f + t0 * D, tn, static_cast<int>(n_centroids),
+                    static_cast<int>(D), d_top2_u32 + t0 * TOP_K, d_top2_d ? d_top2_d + t0 * TOP_K : nullptr);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            static bool u8_checked = false;
+            if (u8_fused && !u8_checked && std::getenv("BUCKET2_STEP4_FUSED_CHECK")) {
+                // 验证用: 前 65 536 行再走 cuBLAS + step4_top2_kernel，数 top-2 不同的行
+                u8_checked = true;
+                const int64_t tn = std::min<int64_t>(65536, batch_size);
+                float* d_dots = nullptr; uint32_t* d_ref = nullptr;
+                CUDA_CHECK(cudaMalloc(&d_dots, kF16Tile * n_centroids * sizeof(float)));
+                CUDA_CHECK(cudaMalloc(&d_ref, tn * TOP_K * sizeof(uint32_t)));
+                step4_f32_to_f16_kernel<<<static_cast<unsigned>((tn * D + 255) / 256), 256>>>(d_q_f, d_q_h, tn * D);
+                for (int64_t s0 = 0; s0 < tn; s0 += kF16Tile) {
+                    const int64_t sn = std::min(kF16Tile, tn - s0);
+                    cublasStatus_t st = cublasGemmEx(f16_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        static_cast<int>(n_centroids), static_cast<int>(sn), static_cast<int>(D), &alpha,
+                        d_cent_h, CUDA_R_16F, static_cast<int>(D), d_q_h + s0 * D, CUDA_R_16F, static_cast<int>(D), &beta,
+                        d_dots, CUDA_R_32F, static_cast<int>(n_centroids), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                    if (st != CUBLAS_STATUS_SUCCESS) throw std::runtime_error("fused check: GEMM failed");
+                    step4_top2_kernel<<<static_cast<unsigned>((sn * 32 + 255) / 256), 256>>>(
+                        d_dots, d_cnorm, sn, static_cast<int>(n_centroids), d_ref + s0 * TOP_K);
+                }
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::vector<uint32_t> hf(tn * TOP_K), hr(tn * TOP_K);
+                CUDA_CHECK(cudaMemcpy(hf.data(), d_top2_u32, hf.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(hr.data(), d_ref, hr.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+                int64_t d1 = 0, d12 = 0;
+                for (int64_t r = 0; r < tn; ++r) {
+                    d1 += hf[r * 2] != hr[r * 2];
+                    d12 += hf[r * 2] != hr[r * 2] || hf[r * 2 + 1] != hr[r * 2 + 1];
+                }
+                std::cout << "  [Step4 fused check u8] rows=" << tn << " top1_diff=" << d1 << " top2_diff=" << d12 << "\n";
+                CUDA_CHECK(cudaFree(d_dots)); CUDA_CHECK(cudaFree(d_ref));
+            }
+            for (int64_t t0 = 0; !u8_fused && t0 < batch_size; t0 += kF16Tile) {
                 const int64_t tn = std::min(kF16Tile, batch_size - t0);
                 const int64_t qe = tn * D;
                 step4_f32_to_f16_kernel<<<static_cast<unsigned>((qe + 255) / 256), 256>>>(
@@ -1922,7 +1985,7 @@ std::vector<int64_t> batch_assign_with_cagra_anns(
                 step4_to_f16_pad_kernel<float><<<static_cast<unsigned>((qe + 255) / 256), 256>>>(
                     d_q_f + t0 * D, d_q_h, tn, static_cast<int>(D), static_cast<int>(Dh4));
                 // 补到 kF4Q 行的那几行是上一 tile 的旧数据 (或未初始化)，结果不写出
-                step4_fused_top4_kernel<<<static_cast<unsigned>((tn + kF4Q - 1) / kF4Q), 256, kF4Smem>>>(
+                step4_fused_top4_kernel<<<static_cast<unsigned>((tn + kF4Q - 1) / kF4Q), 256, step4_f4_smem(Dh4)>>>(
                     d_q_h, d_cent_h, d_cnorm, tn, static_cast<int>(n_centroids), static_cast<int>(Dh4), d_idx4);
                 const int64_t threads = tn * 32;
                 step4_rerank4_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256>>>(
