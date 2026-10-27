@@ -1589,4 +1589,5 @@ User priority 1 (2026-10-24, "fp16 TC + exact re-rank, Step 6 first"); implement
 - **Probe** msTuring10M (GPU 0, locked): Step 6 bucket loops 16.1/14.2/14.7/14.5 → 15.0/8.7/9.5/7.8 s; Step 6 66.5 → 48.2 s. Candidates/row: 110 (round 1), ~60 (rounds 2–3), 22 (round 4).
 - **Bench `runs/tagore78`**: ACCEPT. sift1M_auto 0.0%, sift1M_large +3.2%, sift10M +0.3%, msTuring1M −1.2% (resident path, untouched), **msTuring10M +15.5%** (Step 6 63.8 → 45.6 s), sift100M −2.5% (uint8, untouched), msTuring100M −2.0% (867.9 s; Step 6 245 → 237 s). Recall unchanged everywhere.
 - **Why msTuring100M gains little**: round 2's loop drops 96.9 → 82.8 s (stream_sync 63 → 21 s), but round 1 is producer-bound (`wait_producer` 39–45 s: bucket reads from disk / host cache), and the final background merge wait grew 42 → 54 s now that the loop finishes sooner. Next targets: the round-1 Step 6 producer and the exposed merge wait.
+- Memory: msTuring100M max RSS 61.8 → 73.1 GB (1.18×, inside the 1.2× gate; the larger merge backlog at the end of round 2) — watch it.
 - Backlog: the kHist scan variant still uses a 64 B stack frame; #71's gather split may help now that the GEMM is gone.
