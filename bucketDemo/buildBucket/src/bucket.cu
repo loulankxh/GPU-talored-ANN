@@ -6413,8 +6413,14 @@ void build_vector_knn_with_tensorcore(
         }
         std::cout << "  [VectorKNN] GPU bucket cache: " << gpu_cache_bytes / 1e6 << " MB\n";
     }
-    double t_dev_upload = 0, t_dev_hostget = 0, t_dev_malloc = 0, t_dev_copy = 0;
+    double t_dev_upload = 0, t_dev_hostget = 0, t_dev_malloc = 0, t_dev_copy = 0, t_dev_stagecopy = 0;
     int64_t n_dev_loads = 0;
+    // 未命中桶拷进 pinned 暂存: loader 里只记下来，position 的桶都解析完后多线程一起拷
+    // (msTuring100M: 每轮 ~210 万次上传 ≈ 430 GB，单线程逐行 memcpy 占了 upload 146 s 的大半)。
+    // 宿主 Belady 缓存同样 pin 住本 position 的桶，记下的源指针在拷完前一直有效。
+    struct StageCopy { char* dst; const VecBucket<DataT>* hb; size_t blob_off; int64_t gid0, count; size_t ids_bytes, vec_bytes; };
+    std::vector<StageCopy> stage_copies;
+    if (use_dev_cache) bucket_cache.set_pin_current_position(true);
     std::exception_ptr prod_exc;
     double t_wait_producer = 0;
 
@@ -6501,25 +6507,7 @@ void build_vector_knn_with_tensorcore(
                         if (db.count > 0) {
                             if (stage_off + real_bytes > dstage_cap)   // bounds check (未命中总量 ≤ pool 上界)
                                 throw std::runtime_error("VectorKNN: miss staging overflow at pos " + std::to_string(pos));
-                            char* hs = h_dstage[slot] + stage_off;
-                            int32_t* hs_ids = reinterpret_cast<int32_t*>(hs);
-                            if (hbp) {
-                                for (int64_t i = 0; i < db.count; ++i) hs_ids[i] = static_cast<int32_t>(hbp->ids[static_cast<size_t>(i)]);
-                                std::memcpy(hs + ids_bytes, hbp->vecs.data(), vec_bytes);
-                            } else if (blob_mode == 1) {   // 交错记录 [int64 gid][D 个 DataT]
-                                const char* src = h_blob + blob_off;
-                                char* dv = hs + ids_bytes;
-                                for (int64_t i = 0; i < db.count; ++i) {
-                                    int64_t g; std::memcpy(&g, src + static_cast<size_t>(i) * blob_row, sizeof(int64_t));
-                                    if (g < 0 || g >= N) throw std::runtime_error("VectorKNN: blob gid out of range");   // bounds check
-                                    hs_ids[i] = static_cast<int32_t>(g);
-                                    std::memcpy(dv + static_cast<size_t>(i) * D * sizeof(DataT),
-                                                src + static_cast<size_t>(i) * blob_row + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
-                                }
-                            } else {                       // 连续行，gid = gid0 + i
-                                for (int64_t i = 0; i < db.count; ++i) hs_ids[i] = static_cast<int32_t>(blob_gid0 + i);
-                                std::memcpy(hs + ids_bytes, h_blob + blob_off, vec_bytes);
-                            }
+                            stage_copies.push_back(StageCopy{h_dstage[slot] + stage_off, hbp, blob_off, blob_gid0, db.count, ids_bytes, vec_bytes});
                             if (n_miss > static_cast<int>(K))   // bounds check (一个 position 最多 K+1 个桶)
                                 throw std::runtime_error("VectorKNN: miss job table overflow at pos " + std::to_string(pos));
                             h_mjobs[slot][n_miss++] = MissJob{base, static_cast<uint64_t>(stage_off), static_cast<uint64_t>(real_bytes)};
@@ -6559,6 +6547,38 @@ void build_vector_knn_with_tensorcore(
                     for (uint32_t k = 0; k < K; ++k) {
                         uint32_t nb_c = centroid_knn_graph[c * K + k];
                         if (nb_c < static_cast<uint32_t>(n_centroids)) add_dev(static_cast<int64_t>(nb_c));
+                    }
+                    if (!stage_copies.empty()) {
+                        auto ts0 = diag_now();
+                        // 线程数封顶 8 (同 pool_copy_threads: 每个 position 只有 ≤ K+1 个桶)
+                        static const int stage_copy_threads = std::min(8, omp_get_max_threads());
+                        std::atomic<int> bad_gid{0};
+                        #pragma omp parallel for schedule(dynamic) num_threads(stage_copy_threads)
+                        for (int64_t j = 0; j < static_cast<int64_t>(stage_copies.size()); ++j) {
+                            const StageCopy& sc = stage_copies[static_cast<size_t>(j)];
+                            int32_t* hs_ids = reinterpret_cast<int32_t*>(sc.dst);
+                            if (sc.hb) {
+                                for (int64_t i = 0; i < sc.count; ++i) hs_ids[i] = static_cast<int32_t>(sc.hb->ids[static_cast<size_t>(i)]);
+                                std::memcpy(sc.dst + sc.ids_bytes, sc.hb->vecs.data(), sc.vec_bytes);
+                            } else if (blob_mode == 1) {   // 交错记录 [int64 gid][D 个 DataT]
+                                const size_t blob_row = static_cast<size_t>(blob_stride);
+                                const char* src = h_blob + sc.blob_off;
+                                char* dv = sc.dst + sc.ids_bytes;
+                                for (int64_t i = 0; i < sc.count; ++i) {
+                                    int64_t g; std::memcpy(&g, src + static_cast<size_t>(i) * blob_row, sizeof(int64_t));
+                                    if (g < 0 || g >= N) { bad_gid.store(1); break; }   // bounds check
+                                    hs_ids[i] = static_cast<int32_t>(g);
+                                    std::memcpy(dv + static_cast<size_t>(i) * D * sizeof(DataT),
+                                                src + static_cast<size_t>(i) * blob_row + sizeof(int64_t), static_cast<size_t>(D) * sizeof(DataT));
+                                }
+                            } else {                       // 连续行，gid = gid0 + i
+                                for (int64_t i = 0; i < sc.count; ++i) hs_ids[i] = static_cast<int32_t>(sc.gid0 + i);
+                                std::memcpy(sc.dst + sc.ids_bytes, h_blob + sc.blob_off, sc.vec_bytes);
+                            }
+                        }
+                        stage_copies.clear();
+                        if (bad_gid.load()) throw std::runtime_error("VectorKNN: blob gid out of range");
+                        t_dev_stagecopy += diag_secs(ts0, diag_now());
                     }
                     if (n_miss > 0) {   // 这个 position 的未命中: 一次 H2D (数据 + job 表) + 一个分发 kernel
                         auto tc0 = diag_now();
@@ -7005,7 +7025,7 @@ void build_vector_knn_with_tensorcore(
     if (use_dev_cache) {
         std::cout << "  [VectorKNN] GPU bucket cache: " << n_dev_loads << " bucket uploads, upload "
                   << std::fixed << std::setprecision(3) << t_dev_upload << "s (host get " << t_dev_hostget
-                  << "s, malloc " << t_dev_malloc << "s, h2d call " << t_dev_copy << "s, deferred free " << t_free_drain << "s, device allocs " << n_arena_fallback << "), evictions "
+                  << "s, malloc " << t_dev_malloc << "s, stage copy (8 threads) " << t_dev_stagecopy << "s, h2d call " << t_dev_copy << "s, deferred free " << t_free_drain << "s, device allocs " << n_arena_fallback << "), evictions "
                   << dev_cache->evictions() << "\n";
         dev_cache.reset();                       // 释放全部 device 桶 (都已提交)
         drain_pending_free(true);

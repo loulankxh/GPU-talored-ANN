@@ -30,43 +30,43 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#65 (fused Step 4 kernel: next centroid tile prefetched into registers + shared-memory row padding when Dh % 64 == 0)**, 2026-10-26 (`runs/tagore71`, full bench set + msTuring100M ×3, all re-recorded by `judge.py --update`). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
+After **#67 (Step 6 GPU-bucket-cache misses: staging copies deferred and run on 8 threads)**, 2026-10-27 (`runs/tagore74`, full bench set + msTuring100M ×3, all re-recorded by `judge.py --update`; includes #66's pipelined prune, kept without a best update). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
 
 **Build time (s, median of reps; sum of all stages)**
 
 | config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | resident | 3 | 4.77 | +2.5% | +23.8% | 0.52x | 0.41x | bucket2 4.77 | 4446 | 1.59 |
-| sift1M_large | large | 3 | 7.63 | +3.5% | +21.3% | 0.83x | 0.66x | bucket2 5.84, prune 0.73, optimize_chunked 0.72, translate 0.36 | 1286 | 1.89 |
-| sift10M_auto | large | 3 | 43.11 | +4.4% | +47.7% | 0.20x | 0.35x | bucket2 33.44, prune 4.24, optimize_chunked 2.86, translate 2.55 | 8996 | 10.58 |
-| msTuring1M_auto | resident | 3 | 15.76 | +1.7% | +4.0% | 1.69x | 1.37x | bucket2 15.76 | 5164 | 1.64 |
-| msTuring10M_auto | large | 3 | 117.73 | +1.8% | +51.1% | 0.51x | 0.99x | bucket2 107.24, prune 4.95, optimize_chunked 2.93, translate 2.61 | 8996 | 20.29 |
-| sift100M_auto | large | 3 | 526.63 | +1.6% | +83.6% | 0.24x | 0.71x | bucket2 378.73, prune 64.56, optimize_chunked 61.20, translate 22.16 | 14588 | 38.07 |
-| msTuring100M_auto | large | 3 | 1048.10 | +4.2% | +73.3% | 0.48x | 0.87x | bucket2 803.95, prune 150.87, optimize_chunked 67.97, translate 23.99 | 14728 | 53.63 |
+| sift1M_auto | resident | 3 | 4.83 | -1.3% | +22.8% | 0.53x | 0.42x | bucket2 4.83 | 4952 | 1.59 |
+| sift1M_large | large | 3 | 7.78 | -2.0% | +19.7% | 0.85x | 0.67x | bucket2 5.92, prune 0.73, optimize_chunked 0.70, translate 0.43 | 1286 | 1.89 |
+| sift10M_auto | large | 3 | 42.38 | +1.7% | +48.6% | 0.20x | 0.35x | bucket2 32.70, prune 4.21, optimize_chunked 2.88, translate 2.57 | 8996 | 10.58 |
+| msTuring1M_auto | resident | 3 | 16.04 | -1.8% | +2.3% | 1.72x | 1.40x | bucket2 16.04 | 5172 | 1.64 |
+| msTuring10M_auto | large | 3 | 118.45 | -0.6% | +50.8% | 0.51x | 0.99x | bucket2 107.97, prune 4.96, optimize_chunked 2.94, translate 2.60 | 8996 | 20.51 |
+| sift100M_auto | large | 3 | 518.84 | +1.5% | +83.9% | 0.24x | 0.70x | bucket2 379.09, prune 40.32, optimize_chunked 72.37, translate 24.70 | 14588 | 38.07 |
+| msTuring100M_auto | large | 3 | 916.00 | +12.6% | +76.6% | 0.42x | 0.76x | bucket2 737.44, prune 86.79, optimize_chunked 69.12, translate 22.21 | 14728 | 53.61 |
 
 **bucket2 step breakdown (s)**
 
 | config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | 0.68 | 0.15 | 0.06 | 0.00 | 0.31 | 0.20 | 0.01 | 1.89 | 0.00 | 0.95 |
-| sift1M_large | 0.15 | 0.28 | 0.10 | 0.00 | 1.02 | 0.17 | 0.02 | 2.85 | 0.49 | 0.00 |
-| sift10M_auto | 1.14 | 1.84 | 0.16 | 0.00 | 6.95 | 1.60 | 0.18 | 15.48 | 4.55 | 0.00 |
-| msTuring1M_auto | 0.95 | 0.39 | 0.03 | 0.00 | 0.54 | 0.53 | 0.01 | 11.08 | 0.00 | 0.95 |
-| msTuring10M_auto | 7.79 | 6.00 | 1.27 | 0.00 | 19.00 | 4.16 | 0.22 | 63.14 | 4.41 | 0.00 |
-| sift100M_auto | 11.69 | 5.80 | 2.81 | 0.00 | 123.48 | 27.53 | 3.05 | 170.38 | 24.99 | 0.00 |
-| msTuring100M_auto | 44.33 | 16.60 | 4.28 | 0.00 | 269.71 | 108.69 | 4.14 | 307.01 | 27.33 | 0.00 |
+| sift1M_auto | 0.68 | 0.16 | 0.06 | 0.00 | 0.31 | 0.20 | 0.01 | 1.88 | 0.00 | 0.95 |
+| sift1M_large | 0.16 | 0.30 | 0.24 | 0.00 | 1.07 | 0.17 | 0.02 | 2.85 | 0.47 | 0.00 |
+| sift10M_auto | 1.17 | 1.84 | 0.21 | 0.00 | 6.61 | 1.60 | 0.17 | 15.38 | 4.24 | 0.00 |
+| msTuring1M_auto | 0.95 | 0.41 | 0.04 | 0.00 | 0.55 | 0.47 | 0.01 | 11.38 | 0.00 | 0.98 |
+| msTuring10M_auto | 7.95 | 6.16 | 0.26 | 0.00 | 19.75 | 4.09 | 0.20 | 63.71 | 4.49 | 0.00 |
+| sift100M_auto | 11.97 | 6.06 | 2.78 | 0.00 | 124.00 | 28.26 | 2.99 | 170.72 | 26.18 | 0.00 |
+| msTuring100M_auto | 50.30 | 17.57 | 4.31 | 0.00 | 269.15 | 107.83 | 4.06 | 243.41 | 27.06 | 0.00 |
 
 **(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
 
 | config | recall@1 | recall@10 | recall@32 | recall@64 |
 |---|---|---|---|---|
-| sift1M_auto | 0.9348 | 0.9231 | 0.9112 | 0.9021 |
-| sift1M_large | 0.9390 | 0.9234 | 0.9113 | 0.9027 |
-| sift10M_auto | 0.7610 | 0.7222 | 0.6997 | 0.6834 |
-| msTuring1M_auto | 0.9899 | 0.9789 | 0.9650 | 0.9510 |
-| msTuring10M_auto | 0.8046 | 0.7640 | 0.7330 | 0.7123 |
-| sift100M_auto | 0.6544 | 0.6148 | 0.5902 | 0.5733 |
-| msTuring100M_auto | 0.7013 | 0.6553 | 0.6293 | 0.6089 |
+| sift1M_auto | 0.9408 | 0.9237 | 0.9118 | 0.9029 |
+| sift1M_large | 0.9364 | 0.9238 | 0.9116 | 0.9024 |
+| sift10M_auto | 0.7554 | 0.7196 | 0.6974 | 0.6815 |
+| msTuring1M_auto | 0.9884 | 0.9781 | 0.9642 | 0.9505 |
+| msTuring10M_auto | 0.8184 | 0.7664 | 0.7360 | 0.7140 |
+| sift100M_auto | 0.6544 | 0.6166 | 0.5908 | 0.5738 |
+| msTuring100M_auto | 0.7055 | 0.6557 | 0.6279 | 0.6082 |
 
 **(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
 
@@ -84,13 +84,13 @@ After **#65 (fused Step 4 kernel: next centroid tile prefetched into registers +
 | CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
 | TAGORE largeIndex Vamana (degree 32), msTuring100M | 0.5919 / 31K | 0.7199 / 20K | 0.8166 / 12K | 0.8862 / 7K | 0.9327 / 4K |
 | CAGRA CAGRA ACE 64->32, msTuring100M | 0.6295 / 39K | 0.7513 / 26K | 0.8456 / 16K | 0.9100 / 9K | 0.9511 / 5K |
-| ours sift1M_auto | 0.9247 / 1947K | 0.9758 / 1029K | 0.9939 / 525K | 0.9987 / 188K | 0.9997 / 68K |
-| ours sift1M_large | 0.9258 / 2223K | 0.9759 / 1190K | 0.9941 / 562K | 0.9986 / 189K | 0.9997 / 68K |
-| ours sift10M_auto | 0.8300 / 1862K | 0.9215 / 1010K | 0.9694 / 503K | 0.9897 / 185K | 0.9973 / 68K |
-| ours msTuring1M_auto | 0.6572 / 1493K | 0.7889 / 799K | 0.8846 / 371K | 0.9440 / 147K | 0.9770 / 47K |
-| ours msTuring10M_auto | 0.6301 / 1419K | 0.7678 / 742K | 0.8663 / 370K | 0.9266 / 150K | 0.9613 / 47K |
-| ours sift100M_auto | 0.7251 / 86K | 0.8344 / 67K | 0.9109 / 39K | 0.9587 / 22K | 0.9838 / 11K |
-| ours msTuring100M_auto | 0.6074 / 5K | 0.7149 / 19K | 0.7997 / 16K | 0.8674 / 10K | 0.9165 / 6K |
+| ours sift1M_auto | 0.9244 / 1941K | 0.9748 / 1031K | 0.9935 / 509K | 0.9985 / 187K | 0.9996 / 67K |
+| ours sift1M_large | 0.9248 / 2222K | 0.9755 / 1190K | 0.9935 / 562K | 0.9985 / 189K | 0.9997 / 66K |
+| ours sift10M_auto | 0.8307 / 1865K | 0.9197 / 1011K | 0.9688 / 520K | 0.9895 / 186K | 0.9971 / 68K |
+| ours msTuring1M_auto | 0.6587 / 1495K | 0.7891 / 798K | 0.8836 / 371K | 0.9445 / 147K | 0.9766 / 47K |
+| ours msTuring10M_auto | 0.6272 / 1420K | 0.7694 / 729K | 0.8678 / 365K | 0.9262 / 150K | 0.9613 / 47K |
+| ours sift100M_auto | 0.7275 / 54K | 0.8342 / 50K | 0.9121 / 31K | 0.9591 / 17K | 0.9836 / 9K |
+| ours msTuring100M_auto | 0.6109 / 4K | 0.7171 / 13K | 0.8030 / 14K | 0.8665 / 12K | 0.9157 / 7K |
 
 ## Baseline verification
 
@@ -1549,3 +1549,8 @@ User rule: "only if 10M shows a net gain, test the chunked 100M path" — 10M ga
 - **Probe (msTuring100M, kept work dir, GPU 2, 80 threads):** prune 151 (bench) → 111 s (ring, 80 load threads) → 90 s (8 load threads); reload 8.45 → 8.81 × N (pool slightly smaller: second output buffer).
 - **Bench (`runs/tagore73`, all ×3):** judge REJECT (no gain ≥ 3%): msTuring100M 1048.10 → 1024.27 s (+2.3%; builds 994.4 / 1038.6 / 1024.3 s; prune 82.3 / 84.1 / 88.0 s vs 150.9; bucket2 804 → 845 s with unchanged code), sift100M 526.63 → 518.29 s (+1.6%; prune 38.6–40.1 s vs 64.6; optimize_chunked 61.2 → 71.4 s unchanged code), sift10M +1.3%, others −1.4…−0.6%. Prune peak RSS 4.83 GB (≤ 1.2 × 4.49). Quality passes (msTuring100M L 128 0.8044), 0 defects, paths unchanged. `runs/tagore72` (two pinned buffers): REJECT on prune RSS 8.6 GB.
 - **Why kept (as #60):** result-identical implementation change, its stage time drops by 67 s (msTuring100M) / 26 s (SIFT100M) in every run, and the totals miss the gate only through variance of stages it does not touch. best.json not updated (stays `runs/tagore71`); next iterations compare against it, so a later total gain partly includes #66's prune gain — read stage times.
+
+### #67 — Step 6 GPU-bucket-cache misses: staging copies deferred and run on 8 threads (2026-10-27) — ACCEPTED (msTuring100M 1048.1 → 916.0 s, +12.6%)
+- **Change (`src/bucket.cu`, Step 6 `dev_loader`):** on the float32 / msTuring100M path the GPU bucket cache (8.59 GB, 400 B rows) misses ≈2.1M buckets per round, and the producer copied every missed bucket into the pinned staging buffer inline, single-threaded (≈430 GB per round) — the GPU waited on it (`wait_producer` 117–126 s / round). Now the loader only records each copy (`StageCopy`: destination, source = host-cache bucket / interleaved blob [int64 gid][D] with gid bounds check / contiguous blob), then runs all of the batch's copies in one `omp parallel for schedule(dynamic)` with min(8, max threads) threads before the H2D upload; cache positions are pinned until the batch is staged (`set_pin_current_position`). Same rows, same order on the GPU → result-identical. New "stage copy (8 threads)" time in the Step 6 print. (TAGORE `largeIndex`: keep the GPU fed by moving host-side gather off the critical path.)
+- **Smoke (GPU 2):** msTuring100M Step 6 187.8 + 135.5 → 133.5 + 99.3 s, bucket2 841 → 742 s; stage copy 27–33 s / round (was ≈95–110 s inline); Step 6 now GPU-bound (stream_sync 64–70 s). msTuring10M (no cache misses) recall L 32…512 0.6247 / 0.7684 / 0.8666 / 0.9247 / 0.9609, 0 bad ids, 0 dup edges.
+- **Bench (`runs/tagore74`, all ×3):** judge ACCEPT. msTuring100M 1048.10 → 916.00 s (+12.6%; builds 916.0 / 962.5 / 910.1 s); Step 6 307.0 → 243.4 s (rounds 142.8+100.6 / 142.2+103.2 / 141.5+101.2 s; stage copy 39–47 s / round on GPU 0's busier host), prune 150.9 → 86.8 s (#66). sift100M +1.5% (518.84 s; uint8, no cache misses), sift10M +1.7%, others −2.0…−0.6% (within ±3%). Quality passes (msTuring100M L 128 0.8030, sift100M 0.9121), 0 defects, paths unchanged, memory within 1.2×.
