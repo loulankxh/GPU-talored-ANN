@@ -1351,10 +1351,14 @@ __global__ void step4_top4_rerank_kernel(const float* __restrict__ dots,   // (n
 // (shared 48 KB 内)；qh 的行数要补到 kF4Q 的倍数 (补出来的行结果丢弃)。
 constexpr int kF4Q = 128, kF4C = 64, kF4MaxDh = 128;
 constexpr int kF4Ld = 16 + 4;   // warp 分数块 (16 × 16) 行距: 减少同列不同行的 bank 冲突
-// 动态 shared memory: centroid 块 (64 × Dh fp16) + 8 个 warp 分数块 + 64 个 ‖c‖² (Dh = 112: 24.25 KB, 128: 26.25 KB)
+// shared centroid 块的行距: Dh 是 64 的倍数时 (行距 128 B 的整数倍) WMMA 读 B 片段的 16 行落在同一 bank，
+// 补 8 个 half (SIFT D 128: Step 4 搜索 2.37 → 1.28 s / 轮)；D 112 补了反而慢 (10.8 → 11.5 s)，不补
+__host__ __device__ inline int step4_f4_pitch(int Dh) { return Dh % 64 == 0 ? Dh + 8 : Dh; }
+// 动态 shared memory: centroid 块 (64 × 行距 fp16) + 8 个 warp 分数块 + 64 个 ‖c‖² (Dh = 112: 24.25 KB, 128: 27.25 KB)
 inline size_t step4_f4_smem(int64_t Dh)
 {
-    return sizeof(__half) * kF4C * static_cast<size_t>(Dh) + sizeof(float) * (kF4Q * kF4Ld + kF4C);
+    return sizeof(__half) * kF4C * static_cast<size_t>(step4_f4_pitch(static_cast<int>(Dh)))
+         + sizeof(float) * (kF4Q * kF4Ld + kF4C);
 }
 __global__ void __launch_bounds__(256, 2) step4_fused_top4_kernel(
     const __half* __restrict__ qh,     // (n_rows, Dh)
@@ -1366,7 +1370,8 @@ __global__ void __launch_bounds__(256, 2) step4_fused_top4_kernel(
     using namespace nvcuda;
     extern __shared__ __align__(32) unsigned char f4_smem[];   // step4_f4_smem(Dh)
     __half* s_c   = reinterpret_cast<__half*>(f4_smem);
-    float*  s_acc = reinterpret_cast<float*>(f4_smem + sizeof(__half) * kF4C * Dh);
+    const int sp = step4_f4_pitch(Dh);   // s_c 行距
+    float*  s_acc = reinterpret_cast<float*>(f4_smem + sizeof(__half) * kF4C * sp);
     float*  s_cn  = s_acc + kF4Q * kF4Ld;
     const int tid = threadIdx.x, warp = tid >> 5;
     const int64_t q0 = static_cast<int64_t>(blockIdx.x) * kF4Q;
@@ -1385,17 +1390,39 @@ __global__ void __launch_bounds__(256, 2) step4_fused_top4_kernel(
     float b[4] = {INFINITY, INFINITY, INFINITY, INFINITY};
     int ix[4] = {0x7fffffff, 0x7fffffff, 0x7fffffff, 0x7fffffff};
 
+    // 下一块 centroid 先读进寄存器 (每线程 ≤ 4 个 int4)，和本块的 MMA + 选择重叠 (sm_70 没有 cp.async)
     const int vec_per_row = Dh / 8;   // int4 = 8 个 half
+    constexpr int kPf = kF4C * kF4MaxDh / 8 / 256;
+    int4 pf[kPf];
+    float pf_cn = INFINITY;
+    auto prefetch = [&](int c0n) {
+        const int cnn = min(kF4C, C - c0n);
+        #pragma unroll
+        for (int u = 0; u < kPf; ++u) {
+            const int v = tid + u * 256;
+            pf[u] = make_int4(0, 0, 0, 0);
+            if (v < kF4C * vec_per_row) {
+                const int r = v / vec_per_row, o = v - r * vec_per_row;
+                if (r < cnn) pf[u] = reinterpret_cast<const int4*>(ch + static_cast<int64_t>(c0n + r) * Dh)[o];
+            }
+        }
+        if (tid < kF4C) pf_cn = tid < cnn ? cnorm[c0n + tid] : INFINITY;
+    };
+    prefetch(0);
     for (int c0 = 0; c0 < C; c0 += kF4C) {
         const int cn = min(kF4C, C - c0);
-        for (int v = tid; v < kF4C * vec_per_row; v += 256) {
-            const int r = v / vec_per_row, o = v - r * vec_per_row;
-            int4 val = make_int4(0, 0, 0, 0);
-            if (r < cn) val = reinterpret_cast<const int4*>(ch + static_cast<int64_t>(c0 + r) * Dh)[o];
-            reinterpret_cast<int4*>(s_c + r * Dh)[o] = val;
+        #pragma unroll
+        for (int u = 0; u < kPf; ++u) {
+            const int v = tid + u * 256;
+            if (v < kF4C * vec_per_row) {
+                if (sp == Dh) { reinterpret_cast<int4*>(s_c)[v] = pf[u]; continue; }
+                const int r = v / vec_per_row, o = v - r * vec_per_row;
+                reinterpret_cast<int4*>(s_c + r * sp)[o] = pf[u];
+            }
         }
-        if (tid < kF4C) s_cn[tid] = tid < cn ? cnorm[c0 + tid] : INFINITY;
+        if (tid < kF4C) s_cn[tid] = pf_cn;
         __syncthreads();
+        if (c0 + kF4C < C) prefetch(c0 + kF4C);
         #pragma unroll
         for (int j = 0; j < kF4C / 16; ++j) {
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
@@ -1404,7 +1431,7 @@ __global__ void __launch_bounds__(256, 2) step4_fused_top4_kernel(
             for (int k = 0; k < kF4MaxDh / 16; ++k) {
                 if (k >= ksteps) break;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
-                wmma::load_matrix_sync(fb, s_c + j * 16 * Dh + k * 16, Dh);
+                wmma::load_matrix_sync(fb, s_c + j * 16 * sp + k * 16, sp);
                 wmma::mma_sync(acc, fa[k], fb, acc);
             }
             wmma::store_matrix_sync(w_acc, acc, kF4Ld, wmma::mem_row_major);
