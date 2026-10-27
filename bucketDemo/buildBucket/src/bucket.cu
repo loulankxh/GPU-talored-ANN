@@ -4202,6 +4202,429 @@ static inline bool launch_block_topM_bucket(
     return true;
 }
 
+// ---------------- #72: float32 Step 6 — fused fp16 Tensor Core scan + exact fp32 re-rank ----------------
+// cuBLAS SGEMM 把 (rows × pool) fp32 点积整块写进显存再由 block top-M 扫一遍 (msTuring10M 一轮 nsys:
+// SGEMM 14.5 s + top-64 16.7 s，round ≥ 2 SGEMM 为主；#38 的 fp16 GEMM + 写 dots 没省下来)。这里:
+//   K1 s6_own_topk_kernel: 每个 query 对自己桶的成员 (pool 前 bucket_size 行) 精确 fp32 算 d' = ‖p‖² − 2 q·p，
+//      取 top-M (插入规则同 block_topK_from_dots_kernel：严格小于当前阈值才进，阈值初值 = 上一轮第 M 个)；
+//      阈值 thr = min(seed', 自己桶第 M 个) 是整行第 M 个精确距离的上界。
+//   K2 s6_scan_kernel: 其余列用 fp16 Tensor Core 算近似点积 (同 step4_fused_top4_kernel 的 WMMA 布局，不落 dots)，
+//      近似 d' ≤ thr + δ(q,p) 的列在每 query 的位图里置位。δ 是 fp16 舍入 + fp32 累加误差的严格上界
+//      (|Δ(q·p)| ≤ (2^-10 + 2^-14)‖q‖‖p‖ + 2^-25 √Dh (‖q‖ + ‖p‖)，× 2 (d' 里是 −2 q·p)，再 × 1.25 余量)，
+//      所以精确距离 < thr 的列一定被置位。
+//   K3 s6_rerank_kernel: 从 K1 的 top-M 出发，按列号升序精确重算置位的列并插入 (同一插入规则)，写出
+//      跟 block top-M 完全相同格式的结果 (ids 段 + dists 段，dist = d' + ‖q‖²，不足 M 个补 -1 / inf)。
+// 精确距离都用 s6 的 fmaf 顺序 (逐维升序)；跟 cuBLAS SGEMM 只差 fp32 求和顺序 (#50 同类)。fp16 溢出
+// (|x| ≥ 65504 / NaN) 时 K3 改为精确扫描全部列 (结果仍正确，只是慢)。
+constexpr int kS6Q = 128, kS6C = 64, kS6MaxDh = 128, kS6Ld = 16 + 4;
+constexpr int kS6OwnQ = 8;    // K1 每 block 的 query 数 (一 warp 一个: 一个桶 ~64 个 block，32 个时只有 16 个 block 占不满 SM)
+__device__ unsigned long long g_s6_cand = 0, g_s6_rows = 0;   // 诊断 (BUCKET2_S6_STATS): 置位列数 / 行数
+
+__host__ __device__ inline int s6_pad16(int D) { return (D + 15) / 16 * 16; }
+
+__global__ void s6_to_f16_kernel(const float* __restrict__ B, const float* __restrict__ norms, int64_t n, int D, int Dh,
+                                 __half* __restrict__ Bh, float* __restrict__ pn, int* __restrict__ bad)
+{
+    const int64_t total = n * Dh;
+    for (int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; t < total;
+         t += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const int64_t r = t / Dh;
+        const int c = static_cast<int>(t - r * Dh);
+        const float x = c < D ? B[r * D + c] : 0.0f;
+        if (!(fabsf(x) < 65504.0f)) *bad = 1;   // fp16 溢出或 NaN
+        Bh[t] = __float2half_rn(x);
+        if (c == 0) pn[r] = sqrtf(norms[r]);
+    }
+}
+
+// 精确 q·p: 逐维升序 fmaf (K1 / K3 共用的算术)
+__device__ __forceinline__ float s6_dot_rows(const float* __restrict__ q, const float* __restrict__ p, int D)
+{
+    float s = 0.0f;
+    if ((D & 3) == 0) {
+        const float4* q4 = reinterpret_cast<const float4*>(q);
+        const float4* p4 = reinterpret_cast<const float4*>(p);
+        for (int d = 0; d < (D >> 2); ++d) {
+            const float4 a = q4[d], b = p4[d];
+            s = fmaf(a.x, b.x, s); s = fmaf(a.y, b.y, s); s = fmaf(a.z, b.z, s); s = fmaf(a.w, b.w, s);
+        }
+    } else {
+        for (int d = 0; d < D; ++d) s = fmaf(q[d], p[d], s);
+    }
+    return s;
+}
+
+template <int K_OUT>
+__global__ void __launch_bounds__(256) s6_own_topk_kernel(
+    const float* __restrict__ B, const float* __restrict__ norms, const int32_t* __restrict__ ids_pool,
+    int bucket_size, int D,
+    const float* __restrict__ seed_gid, int64_t seed_n,
+    int32_t* __restrict__ out_ids, float* __restrict__ out_d, float* __restrict__ thr_out)
+{
+    constexpr int LANES = 32, KPL = K_OUT / LANES, QW = kS6OwnQ / 8;
+    constexpr unsigned ALL = 0xFFFFFFFFu;
+    extern __shared__ __align__(16) float s6o_smem[];
+    const int Dp = (D + 3) / 4 * 4;          // s_q 行距 (float4 对齐)
+    const int Dc = D + 1;                    // s_c 行距 (错开 bank)
+    float* s_q = s6o_smem;                   // kS6OwnQ × Dp
+    float* s_c = s6o_smem + kS6OwnQ * Dp;    // 32 × Dc
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int qb = blockIdx.x * kS6OwnQ;
+    for (int e = tid; e < kS6OwnQ * Dp; e += blockDim.x) {
+        const int r = e / Dp, c = e - r * Dp;
+        s_q[e] = (qb + r < bucket_size && c < D) ? B[static_cast<int64_t>(qb + r) * D + c] : 0.0f;
+    }
+    float rd[QW][KPL]; int32_t ri[QW][KPL]; float th[QW];
+    #pragma unroll
+    for (int k = 0; k < QW; ++k) {
+        #pragma unroll
+        for (int p = 0; p < KPL; ++p) { rd[k][p] = INFINITY; ri[k][p] = -1; }
+        th[k] = INFINITY;
+        const int q = qb + warp * QW + k;
+        if (seed_gid && q < bucket_size) {
+            const int64_t g = ids_pool[q];
+            if (g >= 0 && g < seed_n && seed_gid[g] < INFINITY) th[k] = seed_gid[g] - norms[q];   // bounds check
+        }
+    }
+    __syncthreads();
+    for (int j0 = 0; j0 < bucket_size; j0 += 32) {
+        for (int e = tid; e < 32 * D; e += blockDim.x) {
+            const int r = e / D, c = e - r * D;
+            s_c[r * Dc + c] = (j0 + r < bucket_size) ? B[static_cast<int64_t>(j0 + r) * D + c] : 0.0f;
+        }
+        __syncthreads();
+        const int j = j0 + lane;
+        float acc[QW];
+        #pragma unroll
+        for (int k = 0; k < QW; ++k) acc[k] = 0.0f;
+        const float* cr = s_c + lane * Dc;
+        for (int d = 0; d < D; ++d) {
+            const float x = cr[d];
+            #pragma unroll
+            for (int k = 0; k < QW; ++k) acc[k] = fmaf(s_q[(warp * QW + k) * Dp + d], x, acc[k]);
+        }
+        const float nj = j < bucket_size ? norms[j] : 0.0f;
+        #pragma unroll
+        for (int k = 0; k < QW; ++k) {
+            const int q = qb + warp * QW + k;
+            const float dd = (j < bucket_size && j != q && q < bucket_size) ? nj - 2.0f * acc[k] : INFINITY;
+            unsigned mask = __ballot_sync(ALL, dd < th[k]);
+            while (mask) {
+                const int src = __ffs(mask) - 1;
+                mask &= mask - 1;
+                const float c_dist = __shfl_sync(ALL, dd, src);
+                if (c_dist >= th[k]) continue;
+                warp_topk_insert<KPL>(rd[k], ri[k], c_dist, j0 + src, lane);
+                const float own = __shfl_sync(ALL, rd[k][KPL - 1], LANES - 1);
+                if (own < th[k]) th[k] = own;
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int k = 0; k < QW; ++k) {
+        const int q = qb + warp * QW + k;
+        if (q >= bucket_size) continue;
+        #pragma unroll
+        for (int p = 0; p < KPL; ++p) {
+            out_ids[static_cast<int64_t>(q) * K_OUT + lane * KPL + p] = ri[k][p];
+            out_d  [static_cast<int64_t>(q) * K_OUT + lane * KPL + p] = rd[k][p];
+        }
+        if (lane == 0) thr_out[q] = th[k];
+    }
+}
+
+// shared: 64 列 fp16 块 + 8 个 warp 分数块 + 64 个 ‖p‖² + 64 个 ‖p‖
+inline size_t s6_scan_smem(int Dh)
+{
+    return sizeof(__half) * kS6C * static_cast<size_t>(step4_f4_pitch(Dh))
+         + sizeof(float) * (kS6Q * kS6Ld + 2 * kS6C) + sizeof(unsigned) * kS6Q * 32;
+}
+
+// hist != nullptr: 计数模式 (round 1，没有上一轮阈值时)：扫全部列 (含自己桶、除自己)，把 v = 近似 d' + ‖q‖² + δ
+// (精确距离的上界) 按 base = thr + ‖q‖² (自己桶第 M 个) 往下的 2^(-1/8) 等比分 32 档计数，之后
+// s6_hist_thr_kernel 取累计 ≥ M 的最小档上沿当置位阈值 (上界依旧成立，只是紧得多)。否则置位模式。
+constexpr int kS6Bins = 32;   // 2^(-1/8) 一档 (16 档 2^(-1/4) 时 msTuring10M round 1 每行 361 个候选)
+template <bool kHist>
+__global__ void __launch_bounds__(256, 2) s6_scan_kernel(
+    const __half* __restrict__ Bh, const float* __restrict__ norms, const float* __restrict__ pn,
+    const float* __restrict__ thr, int bucket_size, int pool_size, int Dh, int tiles_per_seg,
+    uint32_t* __restrict__ bitmap, int W, unsigned* __restrict__ hist, int col_lo)
+{
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char s6s_smem[];
+    const int sp = step4_f4_pitch(Dh);
+    __half* s_c  = reinterpret_cast<__half*>(s6s_smem);
+    float*  s_acc = reinterpret_cast<float*>(s6s_smem + sizeof(__half) * kS6C * sp);
+    float*  s_cn = s_acc + kS6Q * kS6Ld;
+    float*  s_pn = s_cn + kS6C;
+    unsigned* s_hist = reinterpret_cast<unsigned*>(s_pn + kS6C);   // kS6Q × kS6Bins (仅计数模式)
+    const int tid = threadIdx.x, warp = tid >> 5;
+    if constexpr (kHist) {
+        for (int e = tid; e < kS6Q * kS6Bins; e += 256) s_hist[e] = 0;
+        __syncthreads();
+    }
+    const int q0 = blockIdx.x * kS6Q;
+    const int ksteps = Dh / 16;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa[kS6MaxDh / 16];
+    #pragma unroll
+    for (int k = 0; k < kS6MaxDh / 16; ++k)
+        if (k < ksteps) wmma::load_matrix_sync(fa[k], Bh + static_cast<int64_t>(q0 + warp * 16) * Dh + k * 16, Dh);
+    const int my_q = tid >> 1, my_h = tid & 1;
+    const int qg = q0 + my_q;
+    const bool row_ok = qg < bucket_size;
+    float* w_acc = s_acc + warp * 16 * kS6Ld;
+    const float* ar = w_acc + ((tid & 31) >> 1) * kS6Ld;
+    const float t_q = row_ok ? thr[qg] : -INFINITY;
+    const float qn = row_ok ? pn[qg] : 0.0f;
+    // δ(q, p) = kd·‖q‖‖p‖ + ka·(‖q‖ + ‖p‖)
+    const float kd = 1.25f * 2.0f * (1.0f / 1024.0f + 1.0f / 16384.0f);
+    const float ka = 1.25f * 2.0f * (1.0f / 33554432.0f) * sqrtf(static_cast<float>(Dh));
+    uint32_t* my_bits = bitmap + static_cast<int64_t>(qg) * W;
+    const float qn2 = row_ok ? norms[qg] : 0.0f;
+    const float base = t_q + qn2;   // 计数模式: 自己桶第 M 个的精确距离 (上界)
+
+    const int c_begin = col_lo + blockIdx.y * tiles_per_seg * kS6C;
+    const int c_end = min(pool_size, c_begin + tiles_per_seg * kS6C);
+    const int vec_per_row = Dh / 8;
+    // 下一块列先读进寄存器 (每线程 ≤ 4 个 int4)，和本块的 MMA + 比较重叠 (同 step4_fused_top4_kernel)
+    constexpr int kPf = kS6C * kS6MaxDh / 8 / 256;
+    int4 pf[kPf];
+    float pf_cn = INFINITY, pf_pn = 0.0f;
+    auto prefetch = [&](int c0n) {
+        const int cnn = min(kS6C, c_end - c0n);
+        #pragma unroll
+        for (int u = 0; u < kPf; ++u) {
+            const int v = tid + u * 256;
+            pf[u] = make_int4(0, 0, 0, 0);
+            if (v < kS6C * vec_per_row) {
+                const int r = v / vec_per_row, o = v - r * vec_per_row;
+                if (r < cnn) pf[u] = reinterpret_cast<const int4*>(Bh + static_cast<int64_t>(c0n + r) * Dh)[o];
+            }
+        }
+        if (tid < kS6C) {
+            pf_cn = tid < cnn ? norms[c0n + tid] : INFINITY;
+            pf_pn = tid < cnn ? pn[c0n + tid] : 0.0f;
+        }
+    };
+    if (c_begin < c_end) prefetch(c_begin);
+    for (int c0 = c_begin; c0 < c_end; c0 += kS6C) {
+        const int cn = min(kS6C, c_end - c0);
+        #pragma unroll
+        for (int u = 0; u < kPf; ++u) {
+            const int v = tid + u * 256;
+            if (v < kS6C * vec_per_row) {
+                const int r = v / vec_per_row, o = v - r * vec_per_row;
+                reinterpret_cast<int4*>(s_c + r * sp)[o] = pf[u];
+            }
+        }
+        if (tid < kS6C) { s_cn[tid] = pf_cn; s_pn[tid] = pf_pn; }
+        __syncthreads();
+        if (c0 + kS6C < c_end) prefetch(c0 + kS6C);
+        #pragma unroll
+        for (int j = 0; j < kS6C / 16; ++j) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            #pragma unroll
+            for (int k = 0; k < kS6MaxDh / 16; ++k) {
+                if (k >= ksteps) break;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fb, s_c + j * 16 * sp + k * 16, sp);
+                wmma::mma_sync(acc, fa[k], fb, acc);
+            }
+            wmma::store_matrix_sync(w_acc, acc, kS6Ld, wmma::mem_row_major);
+            __syncwarp();
+            if (row_ok) {
+                #pragma unroll
+                for (int jj = my_h; jj < 16; jj += 2) {
+                    const int cc = j * 16 + jj;
+                    if (cc < cn) {
+                        const float pnc = s_pn[cc];
+                        const float dl = kd * qn * pnc + ka * (qn + pnc);
+                        const float da = s_cn[cc] - 2.0f * ar[jj];
+                        if constexpr (kHist) {
+                            const float v = da + qn2 + dl;   // ≥ 精确距离
+                            if (c0 + cc != qg && v <= base) {
+                                const int b = v > 0.0f ? min(kS6Bins - 1, static_cast<int>(-8.0f * __log2f(v / base))) : kS6Bins - 1;
+                                atomicAdd(&s_hist[my_q * kS6Bins + max(0, b)], 1u);
+                            }
+                        } else if (da <= t_q + dl) {
+                            const int col = c0 + cc - bucket_size;
+                            atomicOr(my_bits + (col >> 5), 1u << (col & 31));
+                        }
+                    }
+                }
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+    if constexpr (kHist) {
+        for (int e = tid; e < kS6Q * kS6Bins; e += 256) {
+            const int q = q0 + e / kS6Bins;
+            if (q < bucket_size && s_hist[e]) atomicAdd(&hist[static_cast<int64_t>(q) * kS6Bins + e % kS6Bins], s_hist[e]);
+        }
+    }
+}
+
+// 计数模式之后: 每 query 从最近一档往上累计，第一个累计 ≥ M 的档的上沿 base·2^(-b/8) 是第 M 个精确距离的上界
+// (那 M 列的 v ≥ 精确距离且 ≤ 上沿)；只收紧置位阈值 thr_emit，K3 的插入阈值仍是 K1 的 thr。
+__global__ void s6_hist_thr_kernel(const unsigned* __restrict__ hist, const float* __restrict__ thr,
+                                   const float* __restrict__ norms, int bucket_size, int M,
+                                   float* __restrict__ thr_emit)
+{
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= bucket_size) return;
+    float te = thr[q];
+    if (te < INFINITY) {
+        const float base = te + norms[q];
+        unsigned cum = 0;
+        for (int b = kS6Bins - 1; b >= 0; --b) {
+            cum += hist[static_cast<int64_t>(q) * kS6Bins + b];
+            if (cum >= static_cast<unsigned>(M)) {
+                const float u = base * exp2f(-0.125f * b) * 1.000001f + 1e-30f;   // 上沿 (+ 舍入余量)
+                te = fminf(te, u - norms[q]);
+                break;
+            }
+        }
+    }
+    thr_emit[q] = te;
+}
+
+template <int K_OUT>
+__global__ void __launch_bounds__(256) s6_rerank_kernel(
+    const float* __restrict__ B, const float* __restrict__ norms, const int32_t* __restrict__ ids_pool,
+    int bucket_size, int pool_size, int D,
+    const uint32_t* __restrict__ bitmap, int W, const int* __restrict__ bad,
+    const float* __restrict__ thr,
+    int32_t* __restrict__ out_ids, float* __restrict__ out_d)   // 输入: K1 的 top-M (pool 下标, d')；输出: 最终结果
+{
+    constexpr int LANES = 32, KPL = K_OUT / LANES;
+    constexpr unsigned ALL = 0xFFFFFFFFu;
+    extern __shared__ __align__(16) float s6r_smem[];
+    const int Dp = (D + 3) / 4 * 4;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int q = blockIdx.x * 8 + warp;
+    float* s_q = s6r_smem + warp * Dp;
+    int32_t* s_list = reinterpret_cast<int32_t*>(s6r_smem + 8 * Dp) + warp * 1024;
+    if (q >= bucket_size) return;   // 整个 warp 一起退出
+    for (int e = lane; e < Dp; e += 32) s_q[e] = e < D ? B[static_cast<int64_t>(q) * D + e] : 0.0f;
+    float rd[KPL]; int32_t ri[KPL];
+    #pragma unroll
+    for (int p = 0; p < KPL; ++p) {
+        rd[p] = out_d  [static_cast<int64_t>(q) * K_OUT + lane * KPL + p];
+        ri[p] = out_ids[static_cast<int64_t>(q) * K_OUT + lane * KPL + p];
+    }
+    float th = thr[q];
+    __syncwarp();
+    const bool all_cols = *bad != 0;
+    const int ncol = pool_size - bucket_size;
+    const uint32_t* bits = bitmap + static_cast<int64_t>(q) * W;
+    for (int w0 = 0; w0 < W; w0 += 32) {
+        // 本组 32 个字 (1024 列) 的置位列按列号升序压进 s_list
+        const int w = w0 + lane;
+        uint32_t word = 0;
+        if (w < W) {
+            word = all_cols ? 0xFFFFFFFFu : bits[w];
+            const int lo = w * 32;
+            if (lo + 32 > ncol) word &= (ncol - lo >= 32) ? 0xFFFFFFFFu : ((ncol - lo > 0) ? ((1u << (ncol - lo)) - 1u) : 0u);
+        }
+        const int cnt = __popc(word);
+        int off = cnt;
+        #pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(ALL, off, o);
+            if (lane >= o) off += v;
+        }
+        const int total = __shfl_sync(ALL, off, 31);
+        if (lane == 0 && total > 0) atomicAdd(&g_s6_cand, static_cast<unsigned long long>(total));
+        off -= cnt;
+        while (word) {
+            const int b = __ffs(word) - 1;
+            word &= word - 1;
+            s_list[off++] = bucket_size + w * 32 + b;
+        }
+        __syncwarp();
+        for (int t0 = 0; t0 < total; t0 += 32) {
+            const int t = t0 + lane;
+            float dd = INFINITY;
+            int col = -1;
+            if (t < total) {
+                col = s_list[t];
+                dd = norms[col] - 2.0f * s6_dot_rows(s_q, B + static_cast<int64_t>(col) * D, D);
+            }
+            unsigned mask = __ballot_sync(ALL, dd < th);
+            while (mask) {
+                const int src = __ffs(mask) - 1;
+                mask &= mask - 1;
+                const float c_dist = __shfl_sync(ALL, dd, src);
+                const int c_col = __shfl_sync(ALL, col, src);
+                if (c_dist >= th) continue;
+                warp_topk_insert<KPL>(rd, ri, c_dist, c_col, lane);
+                const float own = __shfl_sync(ALL, rd[KPL - 1], LANES - 1);
+                if (own < th) th = own;
+            }
+        }
+        __syncwarp();
+    }
+    if (lane == 0) atomicAdd(&g_s6_rows, 1ull);
+    const float q_norm = norms[q];
+    #pragma unroll
+    for (int p = 0; p < KPL; ++p) {
+        const int32_t local = ri[p];
+        out_ids[static_cast<int64_t>(q) * K_OUT + lane * KPL + p] = local >= 0 ? ids_pool[local] : -1;
+        out_d  [static_cast<int64_t>(q) * K_OUT + lane * KPL + p] = local >= 0 ? rd[p] + q_norm : INFINITY;
+    }
+}
+
+// 整个 fused 序列 (K1 → K2 → K3) 在 stream 上排队；K_OUT 必须等于 actual_M、Dh ≤ kS6MaxDh。
+template <int K_OUT>
+static void s6_launch(cudaStream_t st, const float* B, const float* norms, const int32_t* ids_pool,
+                      int bucket_size, int pool_size, int D,
+                      __half* Bh, float* pn, int* bad, float* thr, uint32_t* bitmap, unsigned* hist,
+                      const float* seed_gid, int64_t seed_n,
+                      int32_t* out_ids, float* out_d, int num_sm)
+{
+    float* thr_emit = thr + bucket_size;   // thr: [0, bucket_size) K1 插入阈值, [bucket_size, 2·bucket_size) 置位阈值
+    const int Dh = s6_pad16(D);
+    const int ncol = pool_size - bucket_size;
+    const int W = (ncol + 31) / 32;
+    CUDA_CHECK(cudaMemsetAsync(bad, 0, sizeof(int), st));
+    s6_to_f16_kernel<<<std::min<int64_t>(4 * num_sm, (static_cast<int64_t>(pool_size) * Dh + 255) / 256), 256, 0, st>>>(
+        B, norms, pool_size, D, Dh, Bh, pn, bad);
+    const int Dp = (D + 3) / 4 * 4;
+    const size_t own_smem = sizeof(float) * (kS6OwnQ * Dp + 32 * (D + 1));
+    s6_own_topk_kernel<K_OUT><<<(bucket_size + kS6OwnQ - 1) / kS6OwnQ, 256, own_smem, st>>>(
+        B, norms, ids_pool, bucket_size, D, seed_gid, seed_n, out_ids, out_d, thr);
+    if (W > 0) {
+        const int qblocks = (bucket_size + kS6Q - 1) / kS6Q;
+        auto scan = [&](unsigned* h, const float* t_in, int col_lo) {
+            const int tiles = (pool_size - col_lo + kS6C - 1) / kS6C;
+            const int segs = std::max(1, std::min(tiles, (2 * num_sm + qblocks - 1) / qblocks));
+            const int tps = (tiles + segs - 1) / segs;
+            if (h)
+                s6_scan_kernel<true><<<dim3(qblocks, (tiles + tps - 1) / tps), 256, s6_scan_smem(Dh), st>>>(
+                    Bh, norms, pn, t_in, bucket_size, pool_size, Dh, tps, bitmap, W, h, col_lo);
+            else
+                s6_scan_kernel<false><<<dim3(qblocks, (tiles + tps - 1) / tps), 256, s6_scan_smem(Dh), st>>>(
+                    Bh, norms, pn, t_in, bucket_size, pool_size, Dh, tps, bitmap, W, h, col_lo);
+        };
+        if (!seed_gid) {   // round 1: 先计数收紧置位阈值
+            CUDA_CHECK(cudaMemsetAsync(hist, 0, static_cast<size_t>(bucket_size) * kS6Bins * sizeof(unsigned), st));
+            scan(hist, thr, 0);
+            s6_hist_thr_kernel<<<(bucket_size + 127) / 128, 128, 0, st>>>(hist, thr, norms, bucket_size, K_OUT, thr_emit);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(thr_emit, thr, static_cast<size_t>(bucket_size) * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, st));
+        }
+        CUDA_CHECK(cudaMemsetAsync(bitmap, 0, static_cast<size_t>(bucket_size) * W * sizeof(uint32_t), st));
+        scan(nullptr, thr_emit, bucket_size);
+    }
+    const size_t rr_smem = sizeof(float) * 8 * Dp + sizeof(int32_t) * 8 * 1024;
+    s6_rerank_kernel<K_OUT><<<(bucket_size + 7) / 8, 256, rr_smem, st>>>(
+        B, norms, ids_pool, bucket_size, pool_size, D, bitmap, W, bad, thr, out_ids, out_d);
+}
+
 // ---------------- A1-R (用户批准的 A1，resident 路径): local join 精修 ----------------
 // GNN-Descent 的 local join 换成 "拉" 的写法：点 a 的候选 = 它前 S 个邻居 u 各自的前 S 个邻居
 // (邻居的邻居)，算精确距离，小于 a 当前第 M 近的才参与合并；新表写到另一份缓冲 (本趟所有点读的
@@ -5970,6 +6393,17 @@ void build_vector_knn_with_tensorcore(
     size_t bytes_global   = bytes_identity_idx;
     size_t bytes_per_slot = bytes_B_raw + bytes_B + bytes_dots + bytes_norms_pool
                           + bytes_ids_bucket + bytes_ids_pool + bytes_out + bytes_out_dists;
+    // #72: float32 fused fp16 扫描 + 精确重排 (BUCKET2_F32_FUSED=0 关掉) 的 per-slot buffer:
+    // fp16 pool (多 kS6Q 行给 WMMA 读越界的 query 片段) + ‖p‖ + 每 query 阈值 + 每 query 列位图
+    const char* s6_env = std::getenv("BUCKET2_F32_FUSED");
+    const bool use_s6 = !kIsInt8Path && D <= kS6MaxDh && !(s6_env && std::string(s6_env) == "0");
+    const int s6_Dh = s6_pad16(static_cast<int>(D));
+    const size_t s6_W = (max_pool_size_ub + 31) / 32;
+    const size_t bytes_s6_Bh = (max_pool_size_ub + kS6Q) * static_cast<size_t>(s6_Dh) * sizeof(__half);
+    const size_t bytes_s6_bits = max_bucket_size * s6_W * sizeof(uint32_t);
+    if (use_s6)
+        bytes_per_slot += bytes_s6_Bh + max_pool_size_ub * sizeof(float) + 2 * max_bucket_size * sizeof(float)
+                        + bytes_s6_bits + max_bucket_size * kS6Bins * sizeof(unsigned) + 256;
 
     // ---- 动态 num_slots ----
     // 目标：让 num_slots × avg_blocks_per_kernel ≈ num_sm × OVERSUB，正好填满 SM 并留点
@@ -6085,7 +6519,22 @@ void build_vector_knn_with_tensorcore(
     size_t bytes_select_idx  = max_bucket_size * static_cast<size_t>(M) * sizeof(int32_t);
     size_t bytes_select_dist = max_bucket_size * static_cast<size_t>(M) * sizeof(float);
 
+    __half*   d_s6_Bh[MAX_SLOTS]   = {nullptr};
+    float*    d_s6_pn[MAX_SLOTS]   = {nullptr};
+    float*    d_s6_thr[MAX_SLOTS]  = {nullptr};
+    uint32_t* d_s6_bits[MAX_SLOTS] = {nullptr};
+    int*      d_s6_bad[MAX_SLOTS]  = {nullptr};
+    unsigned* d_s6_hist[MAX_SLOTS] = {nullptr};
     for (int s = 0; s < num_slots; ++s) {
+        if (use_s6) {
+            CUDA_CHECK(cudaMalloc(&d_s6_Bh[s], bytes_s6_Bh));
+            CUDA_CHECK(cudaMemset(d_s6_Bh[s], 0, bytes_s6_Bh));
+            CUDA_CHECK(cudaMalloc(&d_s6_pn[s], max_pool_size_ub * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_s6_thr[s], 2 * max_bucket_size * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&d_s6_hist[s], max_bucket_size * kS6Bins * sizeof(unsigned)));
+            CUDA_CHECK(cudaMalloc(&d_s6_bits[s], bytes_s6_bits));
+            CUDA_CHECK(cudaMalloc(&d_s6_bad[s], sizeof(int)));
+        }
         CUDA_CHECK(cudaMalloc(&d_B_raw[s],         bytes_B_raw));
         CUDA_CHECK(cudaMalloc(&d_B[s],             bytes_B));
         CUDA_CHECK(cudaMalloc(&d_dots[s],          bytes_dots));
@@ -6869,6 +7318,22 @@ void build_vector_knn_with_tensorcore(
 
         // ---- 3e: cuBLAS GEMM 在 slot stream 上 (event 包夹做纯 GEMM 计时) ----
         // bucket 行按 dots_rows 分块: 每块一个 GEMM (A = pool 的 [r0, r0+rows) 行) + 一个 top-M
+        const bool s6_this = use_s6 && (actual_M == 32 || actual_M == 64 || actual_M == 128);
+        if (s6_this) {
+            // #72: fused fp16 扫描 + 精确重排，不落 dots (见 s6_scan_kernel 上面的说明)
+            int32_t* oi = d_out_neighbors[slot];
+            float* od = reinterpret_cast<float*>(d_out_neighbors[slot] + static_cast<size_t>(bucket_size) * actual_M);
+            const float* Bf = reinterpret_cast<const float*>(d_B[slot]);
+#define S6_LAUNCH(KV) s6_launch<KV>(streams[slot], Bf, d_norms_pool[slot], d_ids_pool[slot], bucket_size, pool_size, \
+                                    static_cast<int>(D), d_s6_Bh[slot], d_s6_pn[slot], d_s6_bad[slot], d_s6_thr[slot], \
+                                    d_s6_bits[slot], d_s6_hist[slot], d_seed_kth, d_seed_kth ? N : 0, oi, od, num_sm)
+            if      (actual_M == 32)  S6_LAUNCH(32);
+            else if (actual_M == 64)  S6_LAUNCH(64);
+            else                      S6_LAUNCH(128);
+#undef S6_LAUNCH
+            CUDA_CHECK(cudaGetLastError());
+            fused_out = true;
+        } else {
         if (bucket_size > static_cast<int>(dots_rows) && actual_M > 256)   // raft 回退不分块
             throw std::runtime_error("VectorKNN: M > 256 needs bucket_size <= dots row tile");
         cublasSetStream(cublas_handle, streams[slot]);
@@ -6963,6 +7428,7 @@ void build_vector_knn_with_tensorcore(
             CUDA_CHECK(cudaGetLastError());
         }
         }   // r0 行分块
+        }   // !s6_this
 
         // ---- 3g: 异步 D2H, 不 sync ----
         // block top-M 路径: ids + dists 在同一块连续 buffer 里，一次拷回
@@ -7016,6 +7482,16 @@ void build_vector_knn_with_tensorcore(
               << processed_buckets << " buckets ("
               << (loop_ms / std::max<int64_t>(1, processed_buckets))
               << " ms/bucket avg, slots=" << num_slots << ")\n";
+    if (use_s6 && std::getenv("BUCKET2_S6_STATS")) {
+        unsigned long long cand = 0, rows = 0, zero = 0;
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpyFromSymbol(&cand, g_s6_cand, sizeof(cand)));
+        CUDA_CHECK(cudaMemcpyFromSymbol(&rows, g_s6_rows, sizeof(rows)));
+        CUDA_CHECK(cudaMemcpyToSymbol(g_s6_cand, &zero, sizeof(zero)));
+        CUDA_CHECK(cudaMemcpyToSymbol(g_s6_rows, &zero, sizeof(zero)));
+        std::cout << "  [VectorKNN] s6 fused: " << rows << " rows, " << (rows ? double(cand) / rows : 0.0)
+                  << " re-ranked candidates / row (outside own bucket)\n";
+    }
     if (gemm_timing)
     std::cout << "  [VectorKNN] pure GEMM: " << gemm_total_ms << " ms total, "
               << (gemm_total_ms / std::max<int64_t>(1, processed_buckets))
@@ -7065,6 +7541,8 @@ void build_vector_knn_with_tensorcore(
         cudaFree(d_ids_bucket[s]);
         cudaFree(d_ids_pool[s]);
         cudaFree(d_out_neighbors[s]);
+        if (d_s6_Bh[s]) { cudaFree(d_s6_Bh[s]); cudaFree(d_s6_pn[s]); cudaFree(d_s6_thr[s]);
+                          cudaFree(d_s6_bits[s]); cudaFree(d_s6_bad[s]); cudaFree(d_s6_hist[s]); }
         cudaFree(d_select_idx[s]);
         cudaFree(d_select_dist[s]);
         if (d_out_dists[s])  cudaFree(d_out_dists[s]);
