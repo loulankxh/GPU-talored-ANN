@@ -122,30 +122,66 @@ inline std::pair<int32_t,int32_t> read_fbin_header(const std::string& path) {
 }
 
 // 按 sorted 索引从 .fbin 文件中只读取指定行，避免读取整个数据集。
-// indices 必须已排序（升序）；输出 out 按 indices 原始顺序排列。
-// 对于 SSD / NVMe，排序后顺序读可以最大化吞吐。
+// indices 必须已排序（升序）；out 第 i 行 = sorted_indices[i]。
+// 跟 read_u8bin_sampled_to_f32 一样按 8 MB 行块并行 pread (OpenMP)，每块从块首读到块内最后一个
+// 采样行再挑行——原来单线程逐行 seekg + read (msTuring100M 10M 行: Step 1 ~50 s，Step 4.5 resample ~43 s)。
 inline void read_fbin_sampled(const std::string& path,
                               const std::vector<int64_t>& sorted_indices,
                               std::vector<float>& out,
                               int32_t& N, int32_t& D) {
-    std::ifstream in(path, std::ios::binary);
-    require(in.is_open(), "Cannot open file: " + path);
-
-    auto [n, d] = read_bigann_header(in);
-    N = n; D = d;
-
-    const int64_t n_samples = static_cast<int64_t>(sorted_indices.size());
-    out.resize(static_cast<size_t>(n_samples) * d);
-    const std::streamsize row_bytes = static_cast<std::streamsize>(d) * sizeof(float);
-    constexpr std::streamoff header_bytes = 2 * sizeof(int32_t);  // 8 bytes
-
-    for (int64_t i = 0; i < n_samples; ++i) {
-        std::streamoff offset = header_bytes +
-            static_cast<std::streamoff>(sorted_indices[i]) * static_cast<std::streamoff>(d) * sizeof(float);
-        in.seekg(offset);
-        in.read(reinterpret_cast<char*>(out.data() + i * d), row_bytes);
-        require(in.good(), "Failed to read sampled row " + std::to_string(sorted_indices[i]));
+    {
+        std::ifstream in(path, std::ios::binary);
+        require(in.is_open(), "Cannot open file: " + path);
+        auto [n, d] = read_bigann_header(in);
+        N = n; D = d;
     }
+    const int64_t n_samples = static_cast<int64_t>(sorted_indices.size());
+    require(std::is_sorted(sorted_indices.begin(), sorted_indices.end()), "read_fbin_sampled: indices not sorted");
+    require(n_samples == 0 || (sorted_indices.front() >= 0 && sorted_indices.back() < N),   // bounds check
+            "read_fbin_sampled: index out of range");
+    out.resize(static_cast<size_t>(n_samples) * D);
+    if (n_samples == 0) return;
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    require(fd >= 0, "Cannot open file: " + path);
+    const int64_t row_bytes = static_cast<int64_t>(D) * sizeof(float);
+    const int64_t chunk_rows = std::max<int64_t>(1, (8 << 20) / row_bytes);
+    const int64_t n_chunks = (static_cast<int64_t>(N) + chunk_rows - 1) / chunk_rows;
+    const off_t header_bytes = 2 * sizeof(int32_t);
+    bool ok = true;
+    #pragma omp parallel
+    {
+        std::vector<char> buf(static_cast<size_t>(chunk_rows * row_bytes));
+        #pragma omp for schedule(dynamic, 1)
+        for (int64_t ch = 0; ch < n_chunks; ++ch) {
+            const int64_t r0 = ch * chunk_rows, r1 = std::min<int64_t>(N, r0 + chunk_rows);
+            const int64_t i0 = std::lower_bound(sorted_indices.begin(), sorted_indices.end(), r0) - sorted_indices.begin();
+            const int64_t i1 = std::lower_bound(sorted_indices.begin(), sorted_indices.end(), r1) - sorted_indices.begin();
+            if (i0 == i1) continue;
+            // 从块内第一个采样行读到最后一个采样行
+            const int64_t first = sorted_indices[static_cast<size_t>(i0)];
+            const int64_t last = sorted_indices[static_cast<size_t>(i1 - 1)];
+            const size_t want = static_cast<size_t>((last - first + 1) * row_bytes);
+            size_t got = 0;
+            while (got < want) {
+                ssize_t r = ::pread(fd, buf.data() + got, want - got,
+                                    header_bytes + static_cast<off_t>(first * row_bytes) + static_cast<off_t>(got));
+                if (r <= 0) break;
+                got += static_cast<size_t>(r);
+            }
+            if (got != want) {
+                #pragma omp atomic write
+                ok = false;
+                continue;
+            }
+            for (int64_t i = i0; i < i1; ++i)
+                std::memcpy(out.data() + static_cast<size_t>(i) * D,
+                            buf.data() + static_cast<size_t>((sorted_indices[static_cast<size_t>(i)] - first) * row_bytes),
+                            static_cast<size_t>(row_bytes));
+        }
+    }
+    ::close(fd);
+    require(ok, "read_fbin_sampled: short read from " + path);
 }
 
 // .u8bin / .i8bin 的采样读取: 只把 sorted_indices 指到的行转成 float (跟 read_u8bin_to_f32 一样的
