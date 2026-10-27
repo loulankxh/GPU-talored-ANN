@@ -1,0 +1,63 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index fcf4afe..043c34f 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -5524,6 +5524,9 @@ __global__ void devcache_scatter_misses_kernel(const char* __restrict__ stage, c
+     for (uint64_t i = n16 * 16 + threadIdx.x; i < j.bytes; i += blockDim.x) j.dst[i] = src[i];
+ }
+ 
++// gather 的 grid.y: 每个 job (pool 里的一个桶) 的行由这么多 block 分 (见 kernel 里的说明)
++constexpr unsigned kGatherSplitY = 8;
++
+ // OutT = __half (8-bit 数据, fp16 Tensor Core GEMM) 或 float (float32 数据, fp32 GEMM; P2.3)。
+ template <typename DataT, typename OutT>
+ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+@@ -5555,8 +5558,11 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+                        static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride))
+                  : static_cast<int32_t>(jb.gid0 + r);
+         };
++        // gridDim.y 个 block 分一个 job 的行块 (原来一个 job 一个 block: pool 只有 nprobe+1 个 job
++        // → 65 个 block 占不满 80 个 SM，串行走 ~5 个行块，msTuring10M 一轮 gather 12.2 s ≈ 42 GB/s)。
++        // 每行的拷贝 / ‖row‖² 计算不变，结果逐位相同。
+         if (TR == 0) {   // D 太大放不下一行: 直接逐线程一行 (慢路径，顺序不变)
+-            for (int r = threadIdx.x; r < n; r += bd) {
++            for (int r = threadIdx.x + blockIdx.y * bd; r < n; r += bd * gridDim.y) {
+                 const float* s = src0 + static_cast<int64_t>(r) * src_ld;
+                 float* d = dst0 + static_cast<int64_t>(r) * D;
+                 float sq = 0.0f;
+@@ -5566,7 +5572,7 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+             }
+             return;
+         }
+-        for (int t0 = 0; t0 < n; t0 += TR) {
++        for (int t0 = blockIdx.y * TR; t0 < n; t0 += gridDim.y * TR) {
+             const int rows = min(TR, n - t0);
+             const int total = rows * D;
+             const float* s = src0 + static_cast<int64_t>(t0) * src_ld;
+@@ -5607,7 +5613,7 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
+         }
+         return;
+     }
+-    for (int r = warp; r < jb.count; r += nwarps) {
++    for (int r = warp + blockIdx.y * nwarps; r < jb.count; r += nwarps * gridDim.y) {
+         const char* rec = static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride;
+         const DataT* src = (jb.mode == 1) ? reinterpret_cast<const DataT*>(rec + sizeof(int64_t))
+                                           : v + static_cast<int64_t>(r) * D;
+@@ -6638,7 +6644,7 @@ void build_vector_knn_with_tensorcore(
+                         if (!jobs_mapped)
+                             CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
+                                                        cudaMemcpyHostToDevice, streams[slot]));
+-                        devcache_gather_pool_kernel<DataT, GemmInT><<<nj, 256, 0, streams[slot]>>>(
++                        devcache_gather_pool_kernel<DataT, GemmInT><<<dim3(nj, kGatherSplitY), 256, 0, streams[slot]>>>(
+                             jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]),
+                             d_ids_pool[slot], d_norms_pool[slot], static_cast<int>(D));
+                         CUDA_CHECK(cudaGetLastError());
+@@ -6793,7 +6799,7 @@ void build_vector_knn_with_tensorcore(
+             if (!jobs_mapped)
+                 CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
+                                            cudaMemcpyHostToDevice, streams[slot]));
+-            devcache_gather_pool_kernel<DataT, GemmInT><<<nj, 256, 0, streams[slot]>>>(
++            devcache_gather_pool_kernel<DataT, GemmInT><<<dim3(nj, kGatherSplitY), 256, 0, streams[slot]>>>(
+                 jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]), d_ids_pool[slot],
+                 d_norms_pool[slot], static_cast<int>(D));
+             CUDA_CHECK(cudaGetLastError());

@@ -8345,6 +8345,9 @@ int run_pipeline_impl(
                 std::cout << "  Re-sampling for rounds 2.." << iterations
                           << " from the reordered dataset...\n";
                 auto tresample0 = Clock::now();
+                // data_reordered 可能还在后台写 (上面的内存重排分支 write_reordered_async)：读之前必须写完，
+                // 否则读到半截文件 (msTuring10M 不带 --kmeans-train-fraction 时 "Failed to read float payload")
+                join_reorder_write();
                 sample_from(working_input_path);
                 t45_resample = std::chrono::duration<double>(Clock::now() - tresample0).count();
             }
