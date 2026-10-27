@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <omp.h>
 
 #include "prune_windowed_gpu.hpp"
 #include <cstring>
@@ -142,6 +143,23 @@ __global__ void scatter_slots_kernel(const SlotJob* __restrict__ jobs, const int
                                      int32_t* __restrict__ cand, uint8_t* __restrict__ vec, int M, int vec_row_bytes)
 {
     const SlotJob j = jobs[blockIdx.x];
+    // 行宽是 16 B 的倍数时按 int4 读 pinned (零拷贝读 PCIe: 逐字节读只有一小部分带宽)
+    if ((M * 4) % 16 == 0 && vec_row_bytes % 16 == 0) {
+        const int cw = M * 4 / 16, vw = vec_row_bytes / 16;
+        const int4* hc = reinterpret_cast<const int4*>(h_cand); const int4* hv = reinterpret_cast<const int4*>(h_vec);
+        int4* dc = reinterpret_cast<int4*>(cand); int4* dv = reinterpret_cast<int4*>(vec);
+        for (int64_t i = threadIdx.x; i < static_cast<int64_t>(j.n) * cw; i += blockDim.x) {
+            const int64_t r = i / cw, c = i - r * cw;
+            const int64_t dst = static_cast<int64_t>(slot_tab[j.tab0 + r / kSlotRows]) * kSlotRows + r % kSlotRows;
+            dc[dst * cw + c] = hc[(j.host_row + r) * cw + c];
+        }
+        for (int64_t i = threadIdx.x; i < static_cast<int64_t>(j.n) * vw; i += blockDim.x) {
+            const int64_t r = i / vw, c = i - r * vw;
+            const int64_t dst = static_cast<int64_t>(slot_tab[j.tab0 + r / kSlotRows]) * kSlotRows + r % kSlotRows;
+            dv[dst * vw + c] = hv[(j.host_row + r) * vw + c];
+        }
+        return;
+    }
     for (int64_t i = threadIdx.x; i < static_cast<int64_t>(j.n) * M; i += blockDim.x) {
         const int64_t r = i / M, c = i - r * M;
         const int64_t dst = static_cast<int64_t>(slot_tab[j.tab0 + r / kSlotRows]) * kSlotRows + r % kSlotRows;
@@ -542,7 +560,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
     if (pool_mode) {
         size_t free_b = 0, total_b = 0;
         PWG_CHECK(cudaMemGetInfo(&free_b, &total_b));
-        const double other = static_cast<double>(cap_rows) * out_deg * sizeof(uint32_t)
+        const double other = 2.0 * static_cast<double>(cap_rows) * out_deg * sizeof(uint32_t)   // 两套输出 (流水线)
                            + static_cast<double>(h_win.size() + h_win_len.size()) * sizeof(int32_t)
                            + static_cast<double>(n_buckets) * (sizeof(int64_t) + sizeof(SlotJob) + 2 * sizeof(int32_t) + sizeof(uint32_t))
                            + static_cast<double>(cap_rows) / kSlotRows * sizeof(int32_t)
@@ -553,7 +571,12 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
         pool_slots = std::max(pool_slots, fit);
     }
     int32_t* d_candP = nullptr; T* d_vecP = nullptr; int32_t* d_tab = nullptr; SlotJob* d_jobs = nullptr;
-    auto cleanup_pool = [&] { cudaFree(d_candP); cudaFree(d_vecP); cudaFree(d_tab); cudaFree(d_jobs); };
+    uint32_t* d_out2 = nullptr; cudaEvent_t ev_done[2] = {nullptr, nullptr}, ev_scat[2] = {nullptr, nullptr};
+    auto cleanup_pool = [&] {
+        cudaFree(d_candP); cudaFree(d_vecP); cudaFree(d_tab); cudaFree(d_jobs); cudaFree(d_out2);
+        for (auto& e : ev_done) if (e) cudaEventDestroy(e);
+        for (auto& e : ev_scat) if (e) cudaEventDestroy(e);
+    };
     try {
         Staging stg;
         if (pool_mode) {
@@ -561,6 +584,9 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             PWG_CHECK(cudaMalloc(&d_vecP,  static_cast<size_t>(pool_slots) * kSlotRows * vec_row));
             PWG_CHECK(cudaMalloc(&d_tab,   (static_cast<size_t>(cap_rows) / kSlotRows + n_buckets) * sizeof(int32_t)));
             PWG_CHECK(cudaMalloc(&d_jobs,  static_cast<size_t>(n_buckets) * sizeof(SlotJob)));
+            PWG_CHECK(cudaMalloc(&d_out2,  static_cast<size_t>(cap_rows) * out_deg * sizeof(uint32_t)));
+            for (auto& e : ev_done) PWG_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            for (auto& e : ev_scat) PWG_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         } else
         for (int b = 0; b < 2; ++b) {
             PWG_CHECK(cudaMalloc(&d_candB[b], static_cast<size_t>(cap_rows) * M * sizeof(int32_t)));
@@ -637,9 +663,43 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
             std::vector<int32_t> resident_list;
             std::vector<int32_t> h_tab; std::vector<SlotJob> h_jobs;
             std::vector<int32_t> prevU;
+            // 流水线 (TAGORE largeIndex 的 GPU 构建 / CPU 归并重叠): 块 c 的槽规划 + 读盘跟 GPU 上的块 c-1 重叠，
+            // 块 c-1 的结果 D2H + 写出跟 GPU 上的块 c 重叠。块 c 的散布 / kernel 跟块 c-1 同一 stream (槽复用按 stream
+            // 顺序安全)，输出缓冲两套。pinned 行缓冲仍是一份 (host 内存不变)，当环用: 块 c 的新行接在块 c-1
+            // 的后面，放不下就绕回开头；跟块 c-1 的区间重叠时先等块 c-1 的散布完成 (平均新行 < 半个缓冲，很少等)。
+            // 每块的剪枝跟串行版本完全一样。
+            Staging stg_out;                                   // 结果 D2H 走自己的 stream
+            uint32_t* d_outB[2] = {d_out, d_out2};
+            int64_t ring_off = 0, prev_off = 0, prev_hd = 0;   // 块 c-1 在环里的区间
+            double t_plan = 0, t_load = 0, t_cdist = 0, t_wait = 0, t_d2h = 0;   // 分段计时 (prune 日志; CPU 侧)
+            // 读盘线程数: 跟 GPU 散布 (零拷贝读 pinned) 并发时线程多反而慢 (msTuring100M: 8 线程 load 43 s，
+            // 16 / 32 / 80 线程 58 / 65 / 57 s)；BUCKET2_PRUNE_LOAD_THREADS 可改
+            const int load_threads = std::max(1, std::min(omp_get_max_threads(),
+                std::getenv("BUCKET2_PRUNE_LOAD_THREADS") ? std::atoi(std::getenv("BUCKET2_PRUNE_LOAD_THREADS")) : 8));
             auto nslots = [&](int q) { return static_cast<int32_t>((h_offsets[q + 1] - h_offsets[q] + kSlotRows - 1) / kSlotRows); };
+            struct Pending { int64_t row0, n_rows; };
+            Pending pend[2] = {};
+            // 块 c 的结果: 等它的 kernel 完成、查错、D2H + sink
+            auto finish = [&](int32_t c) {
+                const int b = c & 1;
+                double t0 = omp_get_wtime();
+                PWG_CHECK(cudaEventSynchronize(ev_done[b]));
+                int h_err = 0;
+                PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg_out.st));
+                PWG_CHECK(cudaStreamSynchronize(stg_out.st));
+                double t1 = omp_get_wtime(); t_wait += t1 - t0; t0 = t1;
+                if (h_err)
+                    throw std::runtime_error(h_err == 2 ? "prune_windowed_gpu: center bucket not loaded in chunk"
+                                                        : "prune_windowed_gpu: fewer than output_degree valid candidates "
+                                                          "(check --output-degree <= M_in and padding)");
+                const int64_t row0 = pend[b].row0;
+                stg_out.d2h_rows(d_outB[b], pend[b].n_rows, out_deg, [&](const uint32_t* r, int64_t r0, int64_t n) { sink(r, row0 + r0, n); });
+                t_d2h += omp_get_wtime() - t0;
+            };
             for (int32_t c = 0; c < static_cast<int32_t>(plans.size()); ++c) {
                 const Plan& pl = plans[static_cast<size_t>(c)];
+                const int b = c & 1;
+                double t0 = omp_get_wtime();
                 for (int q : prevU) cbase[static_cast<size_t>(q)] = -1;
                 for (int q : pl.U) { use_ptr[static_cast<size_t>(q)]++; stamp[static_cast<size_t>(q)] = -2 - c; }   // 本块这次用掉 + 标记 "本块要用" (淘汰时跳过)
                 // 未命中的桶 + 需要的槽数
@@ -680,7 +740,7 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                     cbase[static_cast<size_t>(q)] = static_cast<int64_t>(h_tab.size());
                     for (int32_t s : slots_of[static_cast<size_t>(q)]) h_tab.push_back(s);
                 }
-                // 读盘: 新桶连续段并行 pread 进 pinned
+                // 读盘: 新桶连续段并行 pread 进 pinned 环 (块 c-2 已经 finish，只需避开块 c-1 的区间)
                 struct Run { int64_t lo, n, hd; };
                 std::vector<Run> runs; h_jobs.clear();
                 int64_t hd = 0;
@@ -692,11 +752,27 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                     hd += n;
                 }
                 if (hd > cap_rows) throw std::runtime_error("prune_windowed_gpu: B12 fresh rows exceed the pinned buffer");
-                #pragma omp parallel for schedule(dynamic, 1)
+                if (ring_off + hd > cap_rows) ring_off = 0;
+                if (c > 0 && ring_off < prev_off + prev_hd && prev_off < ring_off + hd)
+                    PWG_CHECK(cudaEventSynchronize(ev_scat[b ^ 1]));   // 块 c-1 的散布读完了这段 pinned
+                for (auto& j : h_jobs) j.host_row += ring_off;
+                double t1 = omp_get_wtime(); t_plan += t1 - t0; t0 = t1;
+                int32_t* hc = h_cand + static_cast<size_t>(ring_off) * M; T* hv = h_vec + static_cast<size_t>(ring_off) * D;
+                #pragma omp parallel for schedule(dynamic, 1) num_threads(load_threads)
                 for (int64_t i = 0; i < static_cast<int64_t>(runs.size()); ++i) {
                     const Run& r = runs[static_cast<size_t>(i)];
-                    load_rows(r.lo, r.n, h_cand + static_cast<size_t>(r.hd) * M, h_vec + static_cast<size_t>(r.hd) * D);
+                    load_rows(r.lo, r.n, hc + static_cast<size_t>(r.hd) * M, hv + static_cast<size_t>(r.hd) * D);
                 }
+                t1 = omp_get_wtime(); t_load += t1 - t0; t0 = t1;
+                const int64_t row0 = h_offsets[pl.p0], n_rows = static_cast<int64_t>(h_offsets[pl.p1]) - row0;
+                const int64_t blocks = (n_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
+                if (d_cdist && n_rows > 0) {
+                    if (n_rows > cap_rows) throw std::runtime_error("prune_windowed_gpu: B13 center rows exceed capacity");
+                    h_cdist.resize(static_cast<size_t>(n_rows) * M);
+                    g_center_dists(row0, n_rows, h_cdist.data());
+                    t1 = omp_get_wtime(); t_cdist += t1 - t0; t0 = t1;
+                }
+                // 以下排在块 c-1 的 kernel 之后 (同一 stream); staging 上传可能等到它完成
                 stg.h2d(d_tab, h_tab.data(), h_tab.size() * sizeof(int32_t));
                 stg.h2d(d_cbase, cbase.data(), cbase.size() * sizeof(int64_t));
                 if (!h_jobs.empty()) {
@@ -706,31 +782,26 @@ void run_chunked(int64_t N, int M, int D, const uint32_t* h_offsets, int n_bucke
                         reinterpret_cast<uint8_t*>(d_vecP), M, static_cast<int>(vec_row));
                     PWG_CHECK(cudaGetLastError());
                 }
-                const int64_t row0 = h_offsets[pl.p0], n_rows = static_cast<int64_t>(h_offsets[pl.p1]) - row0;
-                const int64_t blocks = (n_rows + kWarpsPerBlock - 1) / kWarpsPerBlock;
-                if (d_cdist && n_rows > 0) {
-                    if (n_rows > cap_rows) throw std::runtime_error("prune_windowed_gpu: B13 center rows exceed capacity");
-                    h_cdist.resize(static_cast<size_t>(n_rows) * M);
-                    g_center_dists(row0, n_rows, h_cdist.data());
+                PWG_CHECK(cudaEventRecord(ev_scat[b], stg.st));
+                prev_off = ring_off; prev_hd = hd; ring_off += hd;
+                if (d_cdist && n_rows > 0)
                     PWG_CHECK(cudaMemcpyAsync(d_cdist, h_cdist.data(), h_cdist.size() * sizeof(float), cudaMemcpyHostToDevice, stg.st));
-                }
                 if (blocks > 0)
                     prune_kernel<<<static_cast<unsigned>(blocks), kWarpsPerBlock * 32, 0, stg.st>>>(
-                        d_candP, d_vecP, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_out, d_err,
+                        d_candP, d_vecP, d_off, d_win, d_wl, d_cbase, row0, n_rows, M, D, n_buckets, W, out_deg, d_outB[b], d_err,
                         false, nullptr, d_cdist, d_tab);
                 PWG_CHECK(cudaGetLastError());
-                int h_err = 0;
-                PWG_CHECK(cudaMemcpyAsync(&h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stg.st));
-                PWG_CHECK(cudaStreamSynchronize(stg.st));   // pinned 行 / 槽表下一块会被重写
-                if (h_err)
-                    throw std::runtime_error(h_err == 2 ? "prune_windowed_gpu: center bucket not loaded in chunk"
-                                                        : "prune_windowed_gpu: fewer than output_degree valid candidates "
-                                                          "(check --output-degree <= M_in and padding)");
-                stg.d2h_rows(d_out, n_rows, out_deg, [&](const uint32_t* r, int64_t r0, int64_t n) { sink(r, row0 + r0, n); });
+                PWG_CHECK(cudaEventRecord(ev_done[b], stg.st));
+                pend[b] = {row0, n_rows};
+                t_wait += omp_get_wtime() - t0;
+                if (c > 0) finish(c - 1);   // 块 c-1 的结果写出跟 GPU 上的块 c 重叠
                 if (stats) { stats->chunks++; stats->loaded_rows += hd; }
                 prevU = pl.U;
             }
+            if (!plans.empty()) finish(static_cast<int32_t>(plans.size()) - 1);
             std::cout << "  B12: GPU bucket pool " << pool_slots << " slots x " << kSlotRows << " rows\n";
+            std::cout << "  [Chunked timing] plan=" << t_plan << "s load=" << t_load << "s center_dists=" << t_cdist
+                      << "s gpu_wait=" << t_wait << "s d2h+sink=" << t_d2h << "s (pipelined)\n";
         } else
         for (int p0 = 0; p0 < n_buckets; ++chunk_id) {
             // ---- 并集 U(p0..p1): 加位置直到行数到上限 ----
