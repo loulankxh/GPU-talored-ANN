@@ -1,0 +1,22 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 7f45db5..22a3a47 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -8184,10 +8184,16 @@ int run_pipeline_impl(
+                         throw std::runtime_error("Inline reorder: header write failed");
+                 }
+                 const off_t hdr_bytes = 2 * sizeof(int32_t);
+-                const int64_t win_rows = std::max<int64_t>(1, std::min<int64_t>(N, (int64_t(4) << 30) / row_bytes));
++                // 每窗都要把整份输入并行读一遍 (随机置换下每个 8 MB 块都有行落进每个窗)：窗越大读得越少。
++                // 窗 = max(4 GB, host 记录预算的一半)——Step 4.5 时 bucket 缓存还没建，这份预算空着
++                // (msTuring100M 40 GB: 4 GB 窗 10 遍 ≈ 400 GB pread → 2 遍)
++                const int64_t win_bytes = std::max<int64_t>(int64_t(4) << 30, static_cast<int64_t>(host_raw_budget / 2));
++                const int64_t win_rows = std::max<int64_t>(1, std::min<int64_t>(N, win_bytes / row_bytes));
+                 const int64_t chunk_rows = std::max<int64_t>(1, (int64_t(8) << 20) / row_bytes);
+                 const int64_t n_chunks = (N + chunk_rows - 1) / chunk_rows;
+                 std::unique_ptr<char[]> win(new char[static_cast<size_t>(win_rows * row_bytes)]);
++                std::cout << "  pass3: " << (N + win_rows - 1) / win_rows << " window(s) of "
++                          << win_rows * row_bytes / 1e9 << " GB\n";
+                 bool io_ok = true;
+                 for (int64_t w0 = 0; w0 < N; w0 += win_rows) {
+                     const int64_t w1 = std::min<int64_t>(N, w0 + win_rows);
