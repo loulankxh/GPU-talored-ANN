@@ -904,6 +904,7 @@ struct BucketVectorAccumulator {
     // ~0.8–1.0 s。超预算时走文件，跟原来一样。
     size_t mem_budget = 0;
     bool in_memory = false;
+    std::vector<int64_t> range_cnt;   // add_range_parallel 的 (线程, 桶) 计数表，跨 chunk 复用
     std::unique_ptr<char[]> mem;
     size_t mem_cap = 0;
     void set_in_memory_budget(size_t bytes) { mem_budget = bytes; }
@@ -1061,11 +1062,21 @@ struct BucketVectorAccumulator {
         const size_t rec_bytes = record_bytes(D);
         const int T = std::max(1, std::min<int>(omp_get_max_threads(), static_cast<int>((n + 4095) / 4096)));
         const int64_t per = (n + T - 1) / T;
-        std::vector<int64_t> cnt(static_cast<size_t>(T) * n_centroids, 0);
+        // (线程, 桶) 计数表跨 chunk 复用，各线程并行清零自己那一行——原来每个 chunk 新建一份
+        // T × n_centroids 的表 (单线程清零) 再串行扫 (msTuring100M: 75 个 512 MB chunk × 80 × 195K
+        // = 每 chunk 125 MB 清零 + 1560 万次串行迭代，bucket write 17 s)
+        std::vector<int64_t>& cnt = range_cnt;
+        if (cnt.size() < static_cast<size_t>(T) * n_centroids) {
+            cnt.clear();
+            cnt.shrink_to_fit();
+            cnt.reserve(static_cast<size_t>(T) * n_centroids);
+            cnt.resize(static_cast<size_t>(T) * n_centroids);   // 由下面各线程清零 (resize 本身也清零一次)
+        }
         int64_t n_bad = 0;
         #pragma omp parallel for num_threads(T) schedule(static) reduction(+:n_bad)
         for (int t = 0; t < T; ++t) {
             int64_t* ct = cnt.data() + static_cast<size_t>(t) * n_centroids;
+            std::fill(ct, ct + n_centroids, int64_t(0));
             const int64_t a = lo + t * per, b = std::min(lo + n, a + per);
             for (int64_t gi = a; gi < b; ++gi) {
                 if (is_centroid[static_cast<size_t>(gi)]) continue;
@@ -1076,6 +1087,9 @@ struct BucketVectorAccumulator {
         }
         if (n_bad > 0) throw std::runtime_error("add_range_parallel: invalid bucket id in assignments");
         // 每个 (线程, 桶) 段的起始字节偏移；桶的 write_cursor / added_so_far 一次推进
+        // (各桶互不相干 → 按桶并行)
+        int64_t n_over = 0;
+        #pragma omp parallel for schedule(static) reduction(+:n_over)
         for (int64_t c = 0; c < n_centroids; ++c) {
             auto& bk = bufs[static_cast<size_t>(c)];
             int64_t cur = bk.write_cursor, add = 0;
@@ -1085,11 +1099,12 @@ struct BucketVectorAccumulator {
                 cur += k * static_cast<int64_t>(rec_bytes);
                 add += k;
             }
-            if (bk.added_so_far + add > bk.total_count)
-                throw std::runtime_error("add_range_parallel: exceeded histogram count for bucket " + std::to_string(c));
+            if (bk.added_so_far + add > bk.total_count) { ++n_over; continue; }
             bk.write_cursor = cur;
             bk.added_so_far += add;
         }
+        if (n_over > 0)
+            throw std::runtime_error("add_range_parallel: exceeded histogram count for " + std::to_string(n_over) + " bucket(s)");
         #pragma omp parallel for num_threads(T) schedule(static)
         for (int t = 0; t < T; ++t) {
             int64_t* off = cnt.data() + static_cast<size_t>(t) * n_centroids;
