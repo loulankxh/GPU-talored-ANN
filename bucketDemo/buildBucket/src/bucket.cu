@@ -8838,7 +8838,12 @@ int run_pipeline_impl(
                         throw std::runtime_error("Inline reorder: header write failed");
                 }
                 const off_t hdr_bytes = 2 * sizeof(int32_t);
-                const int64_t win_rows = std::max<int64_t>(1, std::min<int64_t>(N, (int64_t(4) << 30) / row_bytes));
+                // #77: 每一窗都要把整份输入读一遍 (随机置换下每个 8 MB 块都有行落进每一窗)，窗按 host
+                // 预算的一半定 (至少 4 GB): msTuring100M 40 GB 输入 4 GB 窗 = 10 遍 ≈ 400 GB 拷贝 → 23 GB 窗 2 遍
+                const char* win_env = std::getenv("BUCKET2_REORDER_WIN_GB");   // A/B: 窗大小 (GB)，覆盖上面的规则
+                const int64_t win_bytes = win_env ? std::max<int64_t>(1, std::atoll(win_env)) << 30
+                                                  : std::max<int64_t>(int64_t(4) << 30, static_cast<int64_t>(host_raw_budget / 2));
+                const int64_t win_rows = std::max<int64_t>(1, std::min<int64_t>(N, win_bytes / row_bytes));
                 const int64_t chunk_rows = std::max<int64_t>(1, (int64_t(8) << 20) / row_bytes);
                 const int64_t n_chunks = (N + chunk_rows - 1) / chunk_rows;
                 std::unique_ptr<char[]> win(new char[static_cast<size_t>(win_rows * row_bytes)]);

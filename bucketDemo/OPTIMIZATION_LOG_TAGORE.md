@@ -33,6 +33,7 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 After **#72 (float32 Step 6 fused fp16 Tensor Core scan + exact fp32 re-rank)**, 2026-10-27 (`runs/tagore78`; full bench set + msTuring100M ×3, all re-recorded by `judge.py --update`; the vs-best column is against the #70 best). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
 
 **Kept on top, not recorded in best.json:** #75 (compact arrival records, parallel encoders) — `runs/tagore82`: sift100M 504.73 s (+4.1%), msTuring100M 793.25 s (+8.6%), msTuring100M max RSS 52.7 GB (best 73.1); judge REJECT only on msTuring10M machine noise (A/B equal, see #75).
+Also kept on top: #77 (Step 4.5 streaming reorder window = max(4 GB, host budget / 2)) — msTuring100M pass3_write 56–61 → 46–49 s; `runs/tagore84`: sift100M 496.97 s (+5.5%), msTuring100M 850.45 s (prune load noise, see #77).
 
 **Build time (s, median of reps; sum of all stages)**
 
@@ -1623,3 +1624,11 @@ User priority 1 (2026-10-24, "fp16 TC + exact re-rank, Step 6 first"); implement
 - msTuring10M interleaved A/B (`runs/tagore82/ab`, bucket2 only, bench flags, caches dropped): HEAD 91.0 / 103.0 / 96.0 s, #75 95.8 / 96.0 / 101.0 s — **medians equal (96.0 s)**; the best's 90.7 s is not reproducible on tonight's machine with either binary. msTuring10M's round-3 merge (`merge_iteration(iter=1)`, write_running-bound) is the variable part in both.
 - Stage evidence (100M): sift100M round 1 scatter worker 67 → 45 s, Step 6 round 2 82–98 → 74–76 s, tail drain ~0; msTuring100M Step 6 round 1 145–306 → 135–142 s, tail drain 10–166 → 0 s.
 - Decision per #58/#60/#66/#68: kept (result-identical, stage gain real, judge miss is noise shown by A/B); best.json not updated.
+
+### #77 — Step 4.5 streaming reorder: output window sized from the host budget (2026-10-28) — KEPT (judge REJECT: msTuring10M machine noise; msTuring100M pass3_write −12 s)
+
+- Why: when the dataset does not fit the in-memory reorder (2 copies > `--bucket-mem-mb`; msTuring100M 80 GB > 46 GB), Step 4.5 writes `data_reordered` in output windows and **re-reads the whole input for every window** (a random permutation puts rows of every 8 MB input block into every window). With 4 GB windows msTuring100M made 10 passes ≈ 400 GB of page-cache copies for a 40 GB file (`pass3_write` 56–61 s).
+- Change (`src/bucket.cu`): window = max(4 GB, host_raw_budget / 2) (msTuring100M 23 GB → 2 passes); `BUCKET2_REORDER_WIN_GB` overrides it (A/B knob). Same loop, same bytes. sift100M takes the in-memory path (unchanged, pass3 ~15 s).
+- Bench `runs/tagore84`: sift1M_auto −1.0 %, sift1M_large −0.4 %, sift10M −0.5 %, msTuring1M −1.9 %, msTuring10M −4.8 % (path not touched; the 101.2 s best is not reproducible currently, see #75's A/B), sift100M 504.73 (#75) → 496.97 s, msTuring100M 850.45 s: pass3_write 46.0–48.9 s in all reps, but prune load 66–76 s (earlier benches 38–60 s). Recall within margins.
+- Interleaved A/B msTuring100M_auto (`runs/tagore84/ab`, full pipeline, `-q`, `BUCKET2_REORDER_WIN_GB=4` vs default): pass3_write old 58.5 / 62.9 s, new 46.6 / 46.0 s; prune load old 40.9 / 57.8 s, new 46.0 / 39.2 s (no page-cache penalty — tagore84's prune was noise); totals old 802.3 / 827.8 s, new 810.8 / 789.7 s.
+- Decision per #58/#60/#66/#68: kept (byte-identical output, stage gain real, < 3 % of the total); best.json not updated.
