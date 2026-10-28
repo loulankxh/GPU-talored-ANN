@@ -1,0 +1,182 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 8326553..1d32876 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -4223,7 +4223,8 @@ __device__ unsigned long long g_s6_cand = 0, g_s6_rows = 0;   // 诊断 (BUCKET2
+ 
+ __host__ __device__ inline int s6_pad16(int D) { return (D + 15) / 16 * 16; }
+ 
+-__global__ void s6_to_f16_kernel(const float* __restrict__ B, const float* __restrict__ norms, int64_t n, int D, int Dh,
++template <typename InT>
++__global__ void s6_to_f16_kernel(const InT* __restrict__ B, const float* __restrict__ norms, int64_t n, int D, int Dh,
+                                  __half* __restrict__ Bh, float* __restrict__ pn, int* __restrict__ bad)
+ {
+     const int64_t total = n * Dh;
+@@ -4231,7 +4232,7 @@ __global__ void s6_to_f16_kernel(const float* __restrict__ B, const float* __res
+          t += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+         const int64_t r = t / Dh;
+         const int c = static_cast<int>(t - r * Dh);
+-        const float x = c < D ? B[r * D + c] : 0.0f;
++        const float x = c < D ? static_cast<float>(B[r * D + c]) : 0.0f;
+         if (!(fabsf(x) < 65504.0f)) *bad = 1;   // fp16 溢出或 NaN
+         Bh[t] = __float2half_rn(x);
+         if (c == 0) pn[r] = sqrtf(norms[r]);
+@@ -4255,9 +4256,25 @@ __device__ __forceinline__ float s6_dot_rows(const float* __restrict__ q, const
+     return s;
+ }
+ 
+-template <int K_OUT>
++// #81: 8-bit 数据的 pool 是 fp16 (整数，精确)，逐维升序 fmaf 同上
++__device__ __forceinline__ float s6_dot_rows(const float* __restrict__ q, const __half* __restrict__ p, int D)
++{
++    float s = 0.0f;
++    if ((D & 1) == 0) {
++        const __half2* p2 = reinterpret_cast<const __half2*>(p);
++        for (int d = 0; d < (D >> 1); ++d) {
++            const float2 b = __half22float2(p2[d]);
++            s = fmaf(q[2 * d], b.x, s); s = fmaf(q[2 * d + 1], b.y, s);
++        }
++    } else {
++        for (int d = 0; d < D; ++d) s = fmaf(q[d], __half2float(p[d]), s);
++    }
++    return s;
++}
++
++template <int K_OUT, typename InT>
+ __global__ void __launch_bounds__(256) s6_own_topk_kernel(
+-    const float* __restrict__ B, const float* __restrict__ norms, const int32_t* __restrict__ ids_pool,
++    const InT* __restrict__ B, const float* __restrict__ norms, const int32_t* __restrict__ ids_pool,
+     int bucket_size, int D,
+     const float* __restrict__ seed_gid, int64_t seed_n,
+     int32_t* __restrict__ out_ids, float* __restrict__ out_d, float* __restrict__ thr_out)
+@@ -4273,7 +4290,7 @@ __global__ void __launch_bounds__(256) s6_own_topk_kernel(
+     const int qb = blockIdx.x * kS6OwnQ;
+     for (int e = tid; e < kS6OwnQ * Dp; e += blockDim.x) {
+         const int r = e / Dp, c = e - r * Dp;
+-        s_q[e] = (qb + r < bucket_size && c < D) ? B[static_cast<int64_t>(qb + r) * D + c] : 0.0f;
++        s_q[e] = (qb + r < bucket_size && c < D) ? static_cast<float>(B[static_cast<int64_t>(qb + r) * D + c]) : 0.0f;
+     }
+     float rd[QW][KPL]; int32_t ri[QW][KPL]; float th[QW];
+     #pragma unroll
+@@ -4291,7 +4308,7 @@ __global__ void __launch_bounds__(256) s6_own_topk_kernel(
+     for (int j0 = 0; j0 < bucket_size; j0 += 32) {
+         for (int e = tid; e < 32 * D; e += blockDim.x) {
+             const int r = e / D, c = e - r * D;
+-            s_c[r * Dc + c] = (j0 + r < bucket_size) ? B[static_cast<int64_t>(j0 + r) * D + c] : 0.0f;
++            s_c[r * Dc + c] = (j0 + r < bucket_size) ? static_cast<float>(B[static_cast<int64_t>(j0 + r) * D + c]) : 0.0f;
+         }
+         __syncthreads();
+         const int j = j0 + lane;
+@@ -4350,7 +4367,7 @@ template <bool kHist>
+ __global__ void __launch_bounds__(256, 2) s6_scan_kernel(
+     const __half* __restrict__ Bh, const float* __restrict__ norms, const float* __restrict__ pn,
+     const float* __restrict__ thr, int bucket_size, int pool_size, int Dh, int tiles_per_seg,
+-    uint32_t* __restrict__ bitmap, int W, unsigned* __restrict__ hist, int col_lo)
++    uint32_t* __restrict__ bitmap, int W, unsigned* __restrict__ hist, int col_lo, float dscale)
+ {
+     using namespace nvcuda;
+     extern __shared__ __align__(32) unsigned char s6s_smem[];
+@@ -4379,8 +4396,9 @@ __global__ void __launch_bounds__(256, 2) s6_scan_kernel(
+     const float t_q = row_ok ? thr[qg] : -INFINITY;
+     const float qn = row_ok ? pn[qg] : 0.0f;
+     // δ(q, p) = kd·‖q‖‖p‖ + ka·(‖q‖ + ‖p‖)
+-    const float kd = 1.25f * 2.0f * (1.0f / 1024.0f + 1.0f / 16384.0f);
+-    const float ka = 1.25f * 2.0f * (1.0f / 33554432.0f) * sqrtf(static_cast<float>(Dh));
++    // dscale = 0 (#81, 8-bit 数据): fp16 输入是精确整数、fp32 累加的部分和都 < 2^24，近似点积就是精确值
++    const float kd = dscale * 1.25f * 2.0f * (1.0f / 1024.0f + 1.0f / 16384.0f);
++    const float ka = dscale * 1.25f * 2.0f * (1.0f / 33554432.0f) * sqrtf(static_cast<float>(Dh));
+     uint32_t* my_bits = bitmap + static_cast<int64_t>(qg) * W;
+     const float qn2 = row_ok ? norms[qg] : 0.0f;
+     const float base = t_q + qn2;   // 计数模式: 自己桶第 M 个的精确距离 (上界)
+@@ -4492,9 +4510,9 @@ __global__ void s6_hist_thr_kernel(const unsigned* __restrict__ hist, const floa
+     thr_emit[q] = te;
+ }
+ 
+-template <int K_OUT>
++template <int K_OUT, typename InT>
+ __global__ void __launch_bounds__(256) s6_rerank_kernel(
+-    const float* __restrict__ B, const float* __restrict__ norms, const int32_t* __restrict__ ids_pool,
++    const InT* __restrict__ B, const float* __restrict__ norms, const int32_t* __restrict__ ids_pool,
+     int bucket_size, int pool_size, int D,
+     const uint32_t* __restrict__ bitmap, int W, const int* __restrict__ bad,
+     const float* __restrict__ thr,
+@@ -4509,7 +4527,7 @@ __global__ void __launch_bounds__(256) s6_rerank_kernel(
+     float* s_q = s6r_smem + warp * Dp;
+     int32_t* s_list = reinterpret_cast<int32_t*>(s6r_smem + 8 * Dp) + warp * 1024;
+     if (q >= bucket_size) return;   // 整个 warp 一起退出
+-    for (int e = lane; e < Dp; e += 32) s_q[e] = e < D ? B[static_cast<int64_t>(q) * D + e] : 0.0f;
++    for (int e = lane; e < Dp; e += 32) s_q[e] = e < D ? static_cast<float>(B[static_cast<int64_t>(q) * D + e]) : 0.0f;
+     float rd[KPL]; int32_t ri[KPL];
+     #pragma unroll
+     for (int p = 0; p < KPL; ++p) {
+@@ -4579,8 +4597,8 @@ __global__ void __launch_bounds__(256) s6_rerank_kernel(
+ }
+ 
+ // 整个 fused 序列 (K1 → K2 → K3) 在 stream 上排队；K_OUT 必须等于 actual_M、Dh ≤ kS6MaxDh。
+-template <int K_OUT>
+-static void s6_launch(cudaStream_t st, const float* B, const float* norms, const int32_t* ids_pool,
++template <int K_OUT, typename InT>
++static void s6_launch(cudaStream_t st, const InT* B, const float* norms, const int32_t* ids_pool,
+                       int bucket_size, int pool_size, int D,
+                       __half* Bh, float* pn, int* bad, float* thr, uint32_t* bitmap, unsigned* hist,
+                       const float* seed_gid, int64_t seed_n,
+@@ -4590,12 +4608,13 @@ static void s6_launch(cudaStream_t st, const float* B, const float* norms, const
+     const int Dh = s6_pad16(D);
+     const int ncol = pool_size - bucket_size;
+     const int W = (ncol + 31) / 32;
++    const float dscale = std::is_same<InT, float>::value ? 1.0f : 0.0f;   // 8-bit (fp16 pool): 精确
+     CUDA_CHECK(cudaMemsetAsync(bad, 0, sizeof(int), st));
+     s6_to_f16_kernel<<<std::min<int64_t>(4 * num_sm, (static_cast<int64_t>(pool_size) * Dh + 255) / 256), 256, 0, st>>>(
+         B, norms, pool_size, D, Dh, Bh, pn, bad);
+     const int Dp = (D + 3) / 4 * 4;
+     const size_t own_smem = sizeof(float) * (kS6OwnQ * Dp + 32 * (D + 1));
+-    s6_own_topk_kernel<K_OUT><<<(bucket_size + kS6OwnQ - 1) / kS6OwnQ, 256, own_smem, st>>>(
++    s6_own_topk_kernel<K_OUT, InT><<<(bucket_size + kS6OwnQ - 1) / kS6OwnQ, 256, own_smem, st>>>(
+         B, norms, ids_pool, bucket_size, D, seed_gid, seed_n, out_ids, out_d, thr);
+     if (W > 0) {
+         const int qblocks = (bucket_size + kS6Q - 1) / kS6Q;
+@@ -4605,10 +4624,10 @@ static void s6_launch(cudaStream_t st, const float* B, const float* norms, const
+             const int tps = (tiles + segs - 1) / segs;
+             if (h)
+                 s6_scan_kernel<true><<<dim3(qblocks, (tiles + tps - 1) / tps), 256, s6_scan_smem(Dh), st>>>(
+-                    Bh, norms, pn, t_in, bucket_size, pool_size, Dh, tps, bitmap, W, h, col_lo);
++                    Bh, norms, pn, t_in, bucket_size, pool_size, Dh, tps, bitmap, W, h, col_lo, dscale);
+             else
+                 s6_scan_kernel<false><<<dim3(qblocks, (tiles + tps - 1) / tps), 256, s6_scan_smem(Dh), st>>>(
+-                    Bh, norms, pn, t_in, bucket_size, pool_size, Dh, tps, bitmap, W, h, col_lo);
++                    Bh, norms, pn, t_in, bucket_size, pool_size, Dh, tps, bitmap, W, h, col_lo, dscale);
+         };
+         if (!seed_gid) {   // round 1: 先计数收紧置位阈值
+             CUDA_CHECK(cudaMemsetAsync(hist, 0, static_cast<size_t>(bucket_size) * kS6Bins * sizeof(unsigned), st));
+@@ -4622,7 +4641,7 @@ static void s6_launch(cudaStream_t st, const float* B, const float* norms, const
+         scan(nullptr, thr_emit, bucket_size);
+     }
+     const size_t rr_smem = sizeof(float) * 8 * Dp + sizeof(int32_t) * 8 * 1024;
+-    s6_rerank_kernel<K_OUT><<<(bucket_size + 7) / 8, 256, rr_smem, st>>>(
++    s6_rerank_kernel<K_OUT, InT><<<(bucket_size + 7) / 8, 256, rr_smem, st>>>(
+         B, norms, ids_pool, bucket_size, pool_size, D, bitmap, W, bad, thr, out_ids, out_d);
+ }
+ 
+@@ -6487,8 +6506,11 @@ void build_vector_knn_with_tensorcore(
+                           + bytes_ids_bucket + bytes_ids_pool + bytes_out + bytes_out_dists;
+     // #72: float32 fused fp16 扫描 + 精确重排 (BUCKET2_F32_FUSED=0 关掉) 的 per-slot buffer:
+     // fp16 pool (多 kS6Q 行给 WMMA 读越界的 query 片段) + ‖p‖ + 每 query 阈值 + 每 query 列位图
+-    const char* s6_env = std::getenv("BUCKET2_F32_FUSED");
+-    const bool use_s6 = !kIsInt8Path && D <= kS6MaxDh && !(s6_env && std::string(s6_env) == "0");
++    const char* s6_env = std::getenv(kIsInt8Path ? "BUCKET2_U8_FUSED" : "BUCKET2_F32_FUSED");
++    // #81: 8-bit 也走 (BUCKET2_U8_FUSED=0 关掉)：fp16 GEMM 写整块 dots + block top-M 扫一遍占 Step 6 GPU 时间
++    // 的大头 (sift10M nsys: block_topK 11.8 s / GEMM 4.5 s / gather 5.1 s，GPU 98% 忙)。8-bit 数据 D ≤ 128 时
++    // fp16 输入 + fp32 累加是精确的，扫描不需要误差余量，结果跟 GEMM 路径同一组精确距离。
++    const bool use_s6 = D <= kS6MaxDh && !(s6_env && std::string(s6_env) == "0");
+     const int s6_Dh = s6_pad16(static_cast<int>(D));
+     const size_t s6_W = (max_pool_size_ub + 31) / 32;
+     const size_t bytes_s6_Bh = (max_pool_size_ub + kS6Q) * static_cast<size_t>(s6_Dh) * sizeof(__half);
+@@ -7482,7 +7504,7 @@ void build_vector_knn_with_tensorcore(
+             // #72: fused fp16 扫描 + 精确重排，不落 dots (见 s6_scan_kernel 上面的说明)
+             int32_t* oi = d_out_neighbors[slot];
+             float* od = reinterpret_cast<float*>(d_out_neighbors[slot] + static_cast<size_t>(bucket_size) * actual_M);
+-            const float* Bf = reinterpret_cast<const float*>(d_B[slot]);
++            const GemmInT* Bf = reinterpret_cast<const GemmInT*>(d_B[slot]);
+ #define S6_LAUNCH(KV) s6_launch<KV>(streams[slot], Bf, d_norms_pool[slot], d_ids_pool[slot], bucket_size, pool_size, \
+                                     static_cast<int>(D), d_s6_Bh[slot], d_s6_pn[slot], d_s6_bad[slot], d_s6_thr[slot], \
+                                     d_s6_bits[slot], d_s6_hist[slot], d_seed_kth, d_seed_kth ? N : 0, oi, od, num_sm)
