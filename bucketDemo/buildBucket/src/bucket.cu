@@ -6122,7 +6122,9 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
         }
         return;
     }
-    for (int r = warp; r < jb.count; r += nwarps) {
+    // #83: 8-bit 一个桶分给 gridDim.y 个 block (原来一个桶一个 block: 一个 pool ~41 个 block 占不满 80 个 SM，
+    // 每 warp 串行 ~64 行)；每行的算法不变
+    for (int r = warp + blockIdx.y * nwarps; r < jb.count; r += nwarps * gridDim.y) {
         const char* rec = static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride;
         const DataT* src = (jb.mode == 1) ? reinterpret_cast<const DataT*>(rec + sizeof(int64_t))
                                           : v + static_cast<int64_t>(r) * D;
@@ -6283,6 +6285,11 @@ void build_vector_knn_with_tensorcore(
         std::is_same<DataT, int8_t>::value || std::is_same<DataT, uint8_t>::value;
     using GemmInT  = typename std::conditional<kIsInt8Path, __half, float>::type;
     using GemmOutT = float;
+    // #83: 8-bit pool gather 每个桶的 block 数 (fp32 分支按 block 内 shared 行块处理，保持 1)
+    const unsigned kGatherSplit = kIsInt8Path ? [] {
+        const char* e = std::getenv("BUCKET2_GATHER_SPLIT");
+        return static_cast<unsigned>(e ? std::max(1, std::atoi(e)) : 4);   // sift10M A/B: 4 最好 (8 / 1 慢)
+    }() : 1u;
 
     std::cout << "[VectorKNN] Building per-vector KNN with Tensor Core matmul\n"
               << "  N=" << N << ", D=" << D
@@ -7246,7 +7253,7 @@ void build_vector_knn_with_tensorcore(
                         if (!jobs_mapped)
                             CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
                                                        cudaMemcpyHostToDevice, streams[slot]));
-                        devcache_gather_pool_kernel<DataT, GemmInT><<<nj, 256, 0, streams[slot]>>>(
+                        devcache_gather_pool_kernel<DataT, GemmInT><<<dim3(nj, kGatherSplit), 256, 0, streams[slot]>>>(
                             jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]),
                             d_ids_pool[slot], d_norms_pool[slot], static_cast<int>(D));
                         CUDA_CHECK(cudaGetLastError());
@@ -7401,7 +7408,7 @@ void build_vector_knn_with_tensorcore(
             if (!jobs_mapped)
                 CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
                                            cudaMemcpyHostToDevice, streams[slot]));
-            devcache_gather_pool_kernel<DataT, GemmInT><<<nj, 256, 0, streams[slot]>>>(
+            devcache_gather_pool_kernel<DataT, GemmInT><<<dim3(nj, kGatherSplit), 256, 0, streams[slot]>>>(
                 jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]), d_ids_pool[slot],
                 d_norms_pool[slot], static_cast<int>(D));
             CUDA_CHECK(cudaGetLastError());

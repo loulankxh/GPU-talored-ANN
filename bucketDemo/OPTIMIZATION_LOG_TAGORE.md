@@ -34,6 +34,7 @@ After **#72 (float32 Step 6 fused fp16 Tensor Core scan + exact fp32 re-rank)**,
 
 **Kept on top, not recorded in best.json:** #75 (compact arrival records, parallel encoders) — `runs/tagore82`: sift100M 504.73 s (+4.1%), msTuring100M 793.25 s (+8.6%), msTuring100M max RSS 52.7 GB (best 73.1); judge REJECT only on msTuring10M machine noise (A/B equal, see #75).
 Also kept on top: #77 (Step 4.5 streaming reorder window = max(4 GB, host budget / 2)) — msTuring100M pass3_write 56–61 → 46–49 s; `runs/tagore84`: sift100M 496.97 s (+5.5%), msTuring100M 850.45 s (prune load noise, see #77).
+Also kept on top: #83 (8-bit Step 6 pool gather split over 4 blocks per bucket) — `runs/tagore92`: sift100M 506.75 s (+3.7%), msTuring100M 810.82 s (+6.6%), msTuring10M −2.4% (inside ±3% again); judge REJECT only on sift1M_auto (resident path, untouched).
 
 **Build time (s, median of reps; sum of all stages)**
 
@@ -1637,3 +1638,12 @@ User priority 1 (2026-10-24, "fp16 TC + exact re-rank, Step 6 first"); implement
 - Bench `runs/tagore84`: sift1M_auto −1.0 %, sift1M_large −0.4 %, sift10M −0.5 %, msTuring1M −1.9 %, msTuring10M −4.8 % (path not touched; the 101.2 s best is not reproducible currently, see #75's A/B), sift100M 504.73 (#75) → 496.97 s, msTuring100M 850.45 s: pass3_write 46.0–48.9 s in all reps, but prune load 66–76 s (earlier benches 38–60 s). Recall within margins.
 - Interleaved A/B msTuring100M_auto (`runs/tagore84/ab`, full pipeline, `-q`, `BUCKET2_REORDER_WIN_GB=4` vs default): pass3_write old 58.5 / 62.9 s, new 46.6 / 46.0 s; prune load old 40.9 / 57.8 s, new 46.0 / 39.2 s (no page-cache penalty — tagore84's prune was noise); totals old 802.3 / 827.8 s, new 810.8 / 789.7 s.
 - Decision per #58/#60/#66/#68: kept (byte-identical output, stage gain real, < 3 % of the total); best.json not updated.
+
+### #83 — 8-bit Step 6 pool gather: each bucket job split over 4 blocks (2026-10-28) — KEPT (judge REJECT on sift1M_auto noise; sift100M Step 6 −3 s per round)
+
+- Why: sift10M nsys (`runs/tagore88/nsys`, out-of-core Step 6, 1 round): GPU 98 % busy in the bucket loop; `devcache_gather_pool_kernel` 5.1 s for 19.5K pools (≈ 30 GB/s): one block per bucket job → a pool (~41 buckets) launched only ~41 blocks on 80 SMs, each warp copying ~64 rows serially.
+- Change (`src/bucket.cu`): 8-bit branch strides rows over `blockIdx.y` too; both launch sites use `dim3(nj, kGatherSplit)`, `kGatherSplit` = 4 for 8-bit (`BUCKET2_GATHER_SPLIT` overrides), 1 for float32 (its branch tiles rows in shared memory per block). Per-row arithmetic unchanged.
+- Equivalence (`runs/tagore91/eq`, OMP 1, large path, 3 rounds): sift1M and sift10M `vector_knn` / `vector_dists` **identical in every row**.
+- A/B (`runs/tagore91`, sift10M bench params, 2 rounds, interleaved): bucket loop r1 / r2 — split 1: 7.85 / 6.34, 7.83 / 6.26 s; split 8: 7.83 / 6.13, 7.81 / 6.12 s; **split 4: 7.71 / 6.01, 7.65 / 6.01 s**.
+- Bench `runs/tagore92` (load ~4): sift1M_auto −5.8 % (rerun ×3 −3.8 %; resident path, never runs the out-of-core gather; step times equal to the best run, the difference is outside the timed steps), sift1M_large −2.8 %, sift10M +0.9 %, msTuring1M −2.6 %, msTuring10M −2.4 %, sift100M 506.75 s (+3.7 %; Step 6 r1 89.7 → 86.7–88.2 s, r2 74 → 70.6–71.7 s), msTuring100M 810.82 s (+6.6 %, float32 path not touched — #75 / #77). Recall within margins.
+- Decision per #58/#60/#66/#68/#70: kept (byte-identical output, stage gain real); best.json not updated.
