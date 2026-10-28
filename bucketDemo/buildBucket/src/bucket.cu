@@ -19,6 +19,7 @@
 #include <omp.h>
 #include <optional>
 #include <deque>
+#include <map>
 #include <fcntl.h>
 #include <unistd.h>
 #include <exception>
@@ -5246,13 +5247,107 @@ struct ChunkedKnnAccumulator {
     static constexpr size_t record_bytes(int M) {
         return sizeof(int64_t) + static_cast<size_t>(M) * (sizeof(int32_t) + sizeof(float));
     }
-    // arrival 文件里的变长记录: [int64 gid][uint32 cnt][cnt × int32 nbr][cnt × float dist]，
-    // cnt = 最后一个有效 (nbr ≥ 0) 位置 + 1。后面全是 -1/+inf sentinel，merge 读回时补齐成 M 宽，
-    // 合并结果跟定长记录完全一样。round 2..t 的 top-M 用 running 第 M 个距离做阈值，大部分行
-    // 只剩少数有效候选 → 写盘量大减 (SIFT100M round 2 的 scatter 卡在 ~250 MB/s 的盘写上)。
-    static constexpr size_t kVarHdr = sizeof(int64_t) + sizeof(uint32_t);
-    static size_t var_record_bytes(uint32_t cnt) {
-        return kVarHdr + static_cast<size_t>(cnt) * (sizeof(int32_t) + sizeof(float));
+    // arrival 文件里的记录只写到最后一个有效 (nbr ≥ 0) 位置，后面的 -1/+inf sentinel 由 merge 读回时
+    // 补齐成 M 宽，合并结果跟定长记录完全一样。round 2..t 的 top-M 用 running 第 M 个距离做阈值，
+    // 大部分行只剩少数有效候选 → 写盘量大减 (SIFT100M round 2 的 scatter 卡在 ~250 MB/s 的盘写上)。
+    // #74 紧凑 arrival 记录 (无损, merge 读回后逐位相同): 100M 规模整条流水线卡在 ~250 MB/s 的
+    // 盘写上 (msTuring100M 每轮 arrival 40–52 GB)。格式:
+    //   [uint32 gid - chunk 起点][uint16 cnt | 0x8000 = 距离原样存]
+    //   cnt × varint(zigzag(nbr - gid))      重排后近邻的 id 跟 gid 很近
+    //   距离: 升序时第一个 4 B 原样，其余为保序 key 的差 (varint)；不升序就 cnt × 4 B 原样
+    static constexpr size_t kCHdr = sizeof(uint32_t) + sizeof(uint16_t);
+    static constexpr uint16_t kRawDists = 0x8000;
+    static size_t compact_record_max(int M) { return kCHdr + static_cast<size_t>(M) * (5 + 5); }
+    static uint32_t dist_key(float f) {   // 保序映射: a < b ⇔ key(a) < key(b) (非 NaN)
+        uint32_t u; std::memcpy(&u, &f, sizeof(u));
+        return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    }
+    static float dist_from_key(uint32_t k) {
+        uint32_t u = (k & 0x80000000u) ? (k & 0x7fffffffu) : ~k;
+        float f; std::memcpy(&f, &u, sizeof(f));
+        return f;
+    }
+    static char* put_varint(char* p, uint32_t v) {
+        while (v >= 0x80) { *p++ = static_cast<char>(v | 0x80); v >>= 7; }
+        *p++ = static_cast<char>(v);
+        return p;
+    }
+    // end 之前读不完一个 varint 就返回 nullptr
+    static const char* get_varint(const char* p, const char* end, uint32_t& v) {
+        v = 0;
+        for (int sh = 0; sh < 35; sh += 7) {
+            if (p >= end) return nullptr;
+            const uint32_t b = static_cast<uint8_t>(*p++);
+            v |= (b & 0x7f) << sh;
+            if (!(b & 0x80)) return p;
+        }
+        return nullptr;
+    }
+    static char* encode_compact(char* dst, uint32_t rel, int64_t gid, uint32_t cnt,
+                                const int32_t* nbrs, const float* dists) {
+        bool sorted = true;
+        for (uint32_t m = 1; m < cnt && sorted; ++m) sorted = dist_key(dists[m - 1]) <= dist_key(dists[m]);
+        const uint16_t hdr = static_cast<uint16_t>(cnt | (sorted ? 0 : kRawDists));
+        std::memcpy(dst, &rel, sizeof(uint32_t));
+        std::memcpy(dst + sizeof(uint32_t), &hdr, sizeof(uint16_t));
+        char* p = dst + kCHdr;
+        for (uint32_t m = 0; m < cnt; ++m) {
+            const int64_t dlt = static_cast<int64_t>(nbrs[m]) - gid;   // |dlt| < 2^31 (N < 2^31)
+            const uint32_t z = static_cast<uint32_t>((static_cast<uint64_t>(dlt) << 1) ^ static_cast<uint64_t>(dlt >> 63));
+            p = put_varint(p, z);
+        }
+        if (!sorted || cnt == 0) {
+            std::memcpy(p, dists, static_cast<size_t>(cnt) * sizeof(float));
+            return p + static_cast<size_t>(cnt) * sizeof(float);
+        }
+        std::memcpy(p, &dists[0], sizeof(float));
+        p += sizeof(float);
+        uint32_t prev = dist_key(dists[0]);
+        for (uint32_t m = 1; m < cnt; ++m) {
+            const uint32_t k = dist_key(dists[m]);
+            p = put_varint(p, k - prev);
+            prev = k;
+        }
+        return p;
+    }
+    // 解出一条记录 (nbrs/dists 补齐到 M 宽)，返回下一条的位置；格式不对返回 nullptr
+    static const char* decode_compact(const char* p, const char* end, int64_t chunk_start, int M,
+                                      int64_t& gid, int32_t* nbrs, float* dists) {
+        if (end - p < static_cast<std::ptrdiff_t>(kCHdr)) return nullptr;
+        uint32_t rel; uint16_t hdr;
+        std::memcpy(&rel, p, sizeof(uint32_t));
+        std::memcpy(&hdr, p + sizeof(uint32_t), sizeof(uint16_t));
+        p += kCHdr;
+        const uint32_t cnt = hdr & ~kRawDists;
+        if (cnt > static_cast<uint32_t>(M)) return nullptr;
+        gid = chunk_start + static_cast<int64_t>(rel);
+        for (uint32_t m = 0; m < cnt; ++m) {
+            uint32_t z;
+            if (!(p = get_varint(p, end, z))) return nullptr;
+            const int64_t dlt = static_cast<int64_t>(z >> 1) ^ -static_cast<int64_t>(z & 1);
+            nbrs[m] = static_cast<int32_t>(gid + dlt);
+        }
+        if ((hdr & kRawDists) || cnt == 0) {
+            if (end - p < static_cast<std::ptrdiff_t>(cnt * sizeof(float))) return nullptr;
+            std::memcpy(dists, p, static_cast<size_t>(cnt) * sizeof(float));
+            p += static_cast<size_t>(cnt) * sizeof(float);
+        } else {
+            if (end - p < static_cast<std::ptrdiff_t>(sizeof(float))) return nullptr;
+            std::memcpy(&dists[0], p, sizeof(float));
+            p += sizeof(float);
+            uint32_t k = dist_key(dists[0]);
+            for (uint32_t m = 1; m < cnt; ++m) {
+                uint32_t dk;
+                if (!(p = get_varint(p, end, dk))) return nullptr;
+                k += dk;
+                dists[m] = dist_from_key(k);
+            }
+        }
+        for (int m = static_cast<int>(cnt); m < M; ++m) {
+            nbrs[m] = -1;
+            dists[m] = std::numeric_limits<float>::infinity();
+        }
+        return p;
     }
     uint64_t arrival_bytes = 0;   // 本轮写出的 arrival 字节 (统计；只在写 arrival 的线程上累加)
 
@@ -5315,6 +5410,8 @@ struct ChunkedKnnAccumulator {
         acc.dir = dir;
         acc.N = N;
         acc.M = M;
+        if (M <= 0 || M >= static_cast<int>(kRawDists))
+            throw std::runtime_error("ChunkedKnnAccumulator: M out of range for the compact arrival record");
 
         // ---- chunk 数量/大小：由内存预算 + 本机核心数反推，不再写死常量 ----
         //
@@ -5372,7 +5469,7 @@ struct ChunkedKnnAccumulator {
         acc.bufs.resize(static_cast<size_t>(acc.num_chunks));
         for (auto& b : acc.bufs) {
             b.capacity_records = cap_records;
-            b.data.resize(std::max(cap_records * rec_bytes, var_record_bytes(static_cast<uint32_t>(M))));
+            b.data.resize(std::max(cap_records * rec_bytes, compact_record_max(M)));
         }
 
         std::cout << "[ChunkedKNN] N=" << N << " M=" << M
@@ -5404,23 +5501,25 @@ struct ChunkedKnnAccumulator {
         b.count = 0;
     }
 
-    // Step 6 的 scatter_pending 里，每个点调用一次。nbrs/dists 长度均为 M
-    // (已按距离升序排列，不足 M 的部分是 -1/+inf sentinel)。只做内存追加 +
-    // 偶尔的整块顺序 flush，没有 seek。
-    void add(int64_t gid, const int32_t* nbrs, const float* dists) {
-        int64_t c = std::min(gid / chunk_size, num_chunks - 1);
-        auto& b = bufs[static_cast<size_t>(c)];
-        uint32_t cnt = static_cast<uint32_t>(M);
+    // 一条 arrival 记录编码到 dst (≥ compact_record_max(M))，返回字节数。nbrs/dists 是按距离
+    // 升序的 n 个候选 (n ≤ M，之后视为 -1/+inf sentinel)。只读 chunk 划分，不碰 bufs → 可以在
+    // 多个编码线程上并行做 (#75: 单线程编码把 scatter worker 拖慢一倍)；写入由 append_encoded 做。
+    size_t encode_record(char* dst, int64_t gid, const int32_t* nbrs, const float* dists, int n) const {
+        const int64_t c = std::min(gid / chunk_size, num_chunks - 1);
+        uint32_t cnt = static_cast<uint32_t>(std::min(n, M));
         while (cnt > 0 && nbrs[cnt - 1] < 0) --cnt;
-        const size_t need = var_record_bytes(cnt);
-        if (b.count + need > b.data.size()) flush_chunk(c);
-        char* dst = b.data.data() + b.count;
-        std::memcpy(dst, &gid, sizeof(int64_t));
-        std::memcpy(dst + sizeof(int64_t), &cnt, sizeof(uint32_t));
-        std::memcpy(dst + kVarHdr, nbrs, static_cast<size_t>(cnt) * sizeof(int32_t));
-        std::memcpy(dst + kVarHdr + static_cast<size_t>(cnt) * sizeof(int32_t), dists,
-                    static_cast<size_t>(cnt) * sizeof(float));
-        b.count += need;
+        const uint32_t rel = static_cast<uint32_t>(gid - c * chunk_size);
+        return static_cast<size_t>(encode_compact(dst, rel, gid, cnt, nbrs, dists) - dst);
+    }
+
+    // 只在写 arrival 的线程上调用 (Step 6 的 scatter 线程，按入队顺序)：把编码好的记录追加进
+    // gid 所在 chunk 的内存 write buffer，偶尔整块顺序 flush，没有 seek。
+    void append_encoded(int64_t gid, const char* rec, size_t len) {
+        const int64_t c = std::min(gid / chunk_size, num_chunks - 1);
+        auto& b = bufs[static_cast<size_t>(c)];
+        if (b.count + len > b.data.size()) flush_chunk(c);
+        std::memcpy(b.data.data() + b.count, rec, len);
+        b.count += len;
     }
 
     void finish_iteration_writes() {
@@ -5650,22 +5749,15 @@ struct ChunkedKnnAccumulator {
                 tm.read_arrival += secs_between(ta0, ta1);
                 t3 = ta1;
 
-                for (size_t off = 0; off < arrival_buf.size(); ++n_file) {
-                    // 变长记录 (见 var_record_bytes)，读回后补齐成 M 宽 (-1/+inf)
-                    if (off + kVarHdr > arrival_buf.size())   // bounds check
-                        throw std::runtime_error("ChunkedKnnAccumulator: truncated arrival record in chunk " + std::to_string(c));
-                    const char* rp = arrival_buf.data() + off;
-                    int64_t gid; uint32_t cnt;
-                    std::memcpy(&gid, rp, sizeof(int64_t));
-                    std::memcpy(&cnt, rp + sizeof(int64_t), sizeof(uint32_t));
-                    if (cnt > static_cast<uint32_t>(M) || off + var_record_bytes(cnt) > arrival_buf.size())   // bounds check
+                const char* rp = arrival_buf.data();
+                const char* const rend = rp + arrival_buf.size();
+                while (rp < rend) {
+                    ++n_file;
+                    // 紧凑记录 (见 encode_compact)，读回后补齐成 M 宽 (-1/+inf)；解码带边界检查
+                    int64_t gid;
+                    rp = decode_compact(rp, rend, chunk_start, M, gid, new_nbrs.data(), new_dists.data());
+                    if (!rp)
                         throw std::runtime_error("ChunkedKnnAccumulator: bad arrival record in chunk " + std::to_string(c));
-                    std::memcpy(new_nbrs.data(), rp + kVarHdr, static_cast<size_t>(cnt) * sizeof(int32_t));
-                    std::memcpy(new_dists.data(), rp + kVarHdr + static_cast<size_t>(cnt) * sizeof(int32_t),
-                                static_cast<size_t>(cnt) * sizeof(float));
-                    std::fill(new_nbrs.begin() + cnt, new_nbrs.end(), -1);
-                    std::fill(new_dists.begin() + cnt, new_dists.end(), std::numeric_limits<float>::infinity());
-                    off += var_record_bytes(cnt);
                     int64_t pos = gid - chunk_start;
                     if (pos < 0 || pos >= chunk_c_size) continue;  // 不应该发生，保险起见
                     merge_one_record(
@@ -6593,12 +6685,6 @@ void build_vector_knn_with_tensorcore(
         gemm_evt_valid[slot] = false;
     };
 
-    // 每个点的新候选先铺成 M 宽（不足 aM 的部分补 -1/inf），再追加进对应 chunk
-    // 的内存 write buffer —— 复用同一块 scratch buffer，避免每个点都分配一次；
-    // acc.add() 只做内存 memcpy + 偶尔的整块顺序 flush，不读旧值、没有 seek。
-    std::vector<int32_t> scatter_new_n(M);
-    std::vector<float>   scatter_new_d(M);
-
     // pool 拼装 (3b, 生产者线程) 的 resolve/memcpy 两趟之间传递的 job 描述：
     // resolve 趟顺序调 bucket_cache.get()，只记源指针/大小/目标偏移；memcpy
     // 趟再用 OpenMP 并行做实际搬运。
@@ -6614,59 +6700,127 @@ void build_vector_knn_with_tensorcore(
     // 这个 slot 的结果 (gid + bucket_size×actual_M 的邻居/距离, ~50 KB) 拷进一个
     // 复用的 job buffer 再入队，然后就可以覆写 h_ids_bucket/h_out[slot] 提交下一
     // 个 bucket。只有 scatter 线程调用 acc.add，按入队顺序处理 (跟原来的顺序一致)。
+    // #75: 编码 (紧凑 arrival 记录, 每点 ~0.8 µs) 分给 n_enc 个编码线程并行做；scatter_thread
+    // 只按入队顺序 (seq) 把编码好的记录追加进 chunk 写缓冲 + flush，跟单线程时写出的字节完全一样。
     struct ScatterJob {
         int bs = 0, aM = 0;
+        uint64_t seq = 0;
         std::vector<int32_t> gid, nb;
         std::vector<float>   d;
+        std::vector<char>    enc;       // bs 条编码后的记录，首尾相接
+        std::vector<size_t>  enc_end;   // 第 i 条记录在 enc 里的结束位置
     };
     std::deque<std::unique_ptr<ScatterJob>> scatter_queue, scatter_free;
+    std::map<uint64_t, std::unique_ptr<ScatterJob>> scatter_encoded;   // 编码完、等按序写出
+    uint64_t scatter_seq_in = 0, scatter_seq_out = 0;                  // guarded by scatter_mtx
+    int scatter_encoding = 0;                                          // 编码中的 job 数
     std::mutex scatter_mtx;
     std::condition_variable scatter_cv;
     bool scatter_done = false;            // guarded by scatter_mtx
     std::exception_ptr scatter_exc;
     double t_scatter_worker = 0;
+    std::atomic<int64_t> t_scatter_encode_ns{0};
+    const int n_enc = [] {
+        const char* e = std::getenv("BUCKET2_SCATTER_ENCODERS");
+        return e ? std::max(1, std::atoi(e)) : 4;
+    }();
+    // 盘写被卡住时 (上一轮 merge 在回写 running) 队列会一直涨，每个 job 带原始结果 + 编码副本
+    // (~0.6 MB)，free list 又把它们全留着 → RSS 多出好几 GB。在途 job 数封顶 (主线程等写线程)，
+    // free list 只留少量复用。
+    const size_t scatter_max_jobs = [] {
+        const char* e = std::getenv("BUCKET2_SCATTER_MAX_JOBS");
+        return static_cast<size_t>(e ? std::max(4, std::atoi(e)) : 2048);
+    }();
+    constexpr size_t kScatterFreeMax = 64;
+    auto scatter_fail = [&]() {
+        std::lock_guard<std::mutex> lk(scatter_mtx);
+        if (!scatter_exc) scatter_exc = std::current_exception();
+        scatter_queue.clear();
+        scatter_encoded.clear();
+    };
+    std::vector<std::thread> enc_threads;
+    for (int t = 0; t < n_enc; ++t) enc_threads.emplace_back([&]() {
+        try {
+            const size_t rec_max = ChunkedKnnAccumulator::compact_record_max(M);
+            for (;;) {
+                std::unique_ptr<ScatterJob> job;
+                {
+                    std::unique_lock<std::mutex> lk(scatter_mtx);
+                    scatter_cv.wait(lk, [&] { return !scatter_queue.empty() || scatter_done || scatter_exc; });
+                    if (scatter_exc || scatter_queue.empty()) return;   // 出错，或 done 且已排空
+                    job = std::move(scatter_queue.front());
+                    scatter_queue.pop_front();
+                    ++scatter_encoding;
+                }
+                auto te0 = std::chrono::high_resolution_clock::now();
+                job->enc.resize(static_cast<size_t>(job->bs) * rec_max);
+                job->enc_end.resize(static_cast<size_t>(job->bs));
+                size_t pos = 0;
+                for (int i = 0; i < job->bs; ++i) {
+                    const size_t row = static_cast<size_t>(i) * job->aM;
+                    pos += acc.encode_record(job->enc.data() + pos, job->gid[static_cast<size_t>(i)],
+                                             job->nb.data() + row, job->d.data() + row, job->aM);
+                    job->enc_end[static_cast<size_t>(i)] = pos;
+                }
+                t_scatter_encode_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::high_resolution_clock::now() - te0).count();
+                {
+                    std::lock_guard<std::mutex> lk(scatter_mtx);
+                    --scatter_encoding;
+                    if (!scatter_exc) scatter_encoded.emplace(job->seq, std::move(job));
+                }
+                scatter_cv.notify_all();
+            }
+        } catch (...) {
+            scatter_fail();
+            scatter_cv.notify_all();
+        }
+    });
     std::thread scatter_thread([&]() {
         try {
             for (;;) {
                 std::unique_ptr<ScatterJob> job;
                 {
                     std::unique_lock<std::mutex> lk(scatter_mtx);
-                    scatter_cv.wait(lk, [&] { return !scatter_queue.empty() || scatter_done; });
-                    if (scatter_queue.empty()) return;   // done 且已排空
-                    job = std::move(scatter_queue.front());
-                    scatter_queue.pop_front();
+                    scatter_cv.wait(lk, [&] {
+                        return scatter_exc || scatter_encoded.count(scatter_seq_out) ||
+                               (scatter_done && scatter_queue.empty() && scatter_encoding == 0);
+                    });
+                    auto it = scatter_encoded.find(scatter_seq_out);
+                    if (scatter_exc || it == scatter_encoded.end()) return;   // 出错，或 done 且已排空
+                    job = std::move(it->second);
+                    scatter_encoded.erase(it);
+                    ++scatter_seq_out;
                 }
                 auto ts0 = std::chrono::high_resolution_clock::now();
+                size_t beg = 0;
                 for (int i = 0; i < job->bs; ++i) {
-                    std::fill(scatter_new_n.begin(), scatter_new_n.end(), -1);
-                    std::fill(scatter_new_d.begin(), scatter_new_d.end(),
-                              std::numeric_limits<float>::infinity());
-                    for (int m = 0; m < job->aM && m < M; ++m) {
-                        scatter_new_n[m] = job->nb[static_cast<size_t>(i) * job->aM + m];
-                        scatter_new_d[m] = job->d [static_cast<size_t>(i) * job->aM + m];
-                    }
-                    acc.add(job->gid[static_cast<size_t>(i)], scatter_new_n.data(), scatter_new_d.data());
+                    const size_t end = job->enc_end[static_cast<size_t>(i)];
+                    acc.append_encoded(job->gid[static_cast<size_t>(i)], job->enc.data() + beg, end - beg);
+                    beg = end;
                 }
                 t_scatter_worker += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - ts0).count();
                 {
                     std::lock_guard<std::mutex> lk(scatter_mtx);
-                    scatter_free.push_back(std::move(job));
+                    if (scatter_free.size() < kScatterFreeMax) scatter_free.push_back(std::move(job));
                 }
+                job.reset();
+                scatter_cv.notify_all();   // 主线程可能在等在途 job 数降下来
             }
         } catch (...) {
-            std::lock_guard<std::mutex> lk(scatter_mtx);
-            scatter_exc = std::current_exception();
-            scatter_queue.clear();
+            scatter_fail();
+            scatter_cv.notify_all();
         }
     });
     struct ScatterJoin {
-        std::thread& t; std::mutex& m; std::condition_variable& cv; bool& done;
+        std::thread& t; std::vector<std::thread>& enc; std::mutex& m; std::condition_variable& cv; bool& done;
         ~ScatterJoin() {
             { std::lock_guard<std::mutex> lk(m); done = true; }
             cv.notify_all();
+            for (auto& e : enc) if (e.joinable()) e.join();
             if (t.joinable()) t.join();
         }
-    } scatter_join{scatter_thread, scatter_mtx, scatter_cv, scatter_done};
+    } scatter_join{scatter_thread, enc_threads, scatter_mtx, scatter_cv, scatter_done};
 
     auto scatter_pending = [&](int slot) {
         if (pending[slot].c < 0) return;
@@ -6676,7 +6830,11 @@ void build_vector_knn_with_tensorcore(
         const int aM = pending[slot].actual_M;
         std::unique_ptr<ScatterJob> job;
         {
-            std::lock_guard<std::mutex> lk(scatter_mtx);
+            std::unique_lock<std::mutex> lk(scatter_mtx);
+            scatter_cv.wait(lk, [&] {
+                return scatter_exc || scatter_queue.size() + static_cast<size_t>(scatter_encoding) +
+                                      scatter_encoded.size() < scatter_max_jobs;
+            });
             if (scatter_exc) std::rethrow_exception(scatter_exc);
             if (!scatter_free.empty()) { job = std::move(scatter_free.back()); scatter_free.pop_back(); }
         }
@@ -6691,9 +6849,10 @@ void build_vector_knn_with_tensorcore(
         job->d.assign(hd, hd + n_out);
         {
             std::lock_guard<std::mutex> lk(scatter_mtx);
+            job->seq = scatter_seq_in++;
             scatter_queue.push_back(std::move(job));
         }
-        scatter_cv.notify_one();
+        scatter_cv.notify_all();
         pending[slot].c = -1;
     };
 
@@ -7468,10 +7627,12 @@ void build_vector_knn_with_tensorcore(
         auto tj0 = std::chrono::high_resolution_clock::now();
         { std::lock_guard<std::mutex> lk(scatter_mtx); scatter_done = true; }
         scatter_cv.notify_all();
+        for (auto& e : enc_threads) e.join();
         scatter_thread.join();
         if (scatter_exc) std::rethrow_exception(scatter_exc);
         std::cout << "  [VectorKNN] scatter worker: " << std::fixed << std::setprecision(3)
-                  << t_scatter_worker << "s (tail drain "
+                  << t_scatter_worker << "s, encode " << t_scatter_encode_ns.load() / 1e9 << "s on "
+                  << n_enc << " threads (tail drain "
                   << std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - tj0).count()
                   << "s)\n";
     }
