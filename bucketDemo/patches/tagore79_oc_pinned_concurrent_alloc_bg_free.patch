@@ -1,0 +1,58 @@
+diff --git a/bucketDemo/buildBucket/src/optimize_chunked.cu b/bucketDemo/buildBucket/src/optimize_chunked.cu
+index 534b6fb..2786775 100644
+--- a/bucketDemo/buildBucket/src/optimize_chunked.cu
++++ b/bucketDemo/buildBucket/src/optimize_chunked.cu
+@@ -45,6 +45,7 @@
+ #include <unistd.h>
+ #include <memory>
+ #include <cstring>
++#include <thread>
+ 
+ #include <boost/program_options.hpp>
+ 
+@@ -1580,14 +1581,23 @@ static void run_method_E(
+     const bool single_batch = static_cast<int64_t>(batch_rows) >= N;
+     uint32_t* h_fwd_batch = nullptr;
+     std::unique_ptr<uint32_t[]> h_fwd_page;
+-    if (single_batch) h_fwd_page.reset(new uint32_t[static_cast<size_t>(N) * K_out]);
+-    else CUDA_CHECK(cudaMallocHost(&h_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t)));
+     std::vector<uint32_t> h_chunk_count(static_cast<size_t>(num_chunks));
+     edge_chunk::EdgeRecord* h_overflow_buf = nullptr;
+-    CUDA_CHECK(cudaMallocHost(&h_overflow_buf, static_cast<size_t>(overflow_cap) * sizeof(edge_chunk::EdgeRecord)));
+     edge_chunk::EdgeRecord* h_drain_buf = nullptr;
+-    if (!single_drain)
+-        CUDA_CHECK(cudaMallocHost(&h_drain_buf, capacity_per_chunk * sizeof(edge_chunk::EdgeRecord)));
++    {
++        // #79: 几块大 pinned 区 (SIFT100M: fwd 1.9 + overflow 5.6 + drain 5.0 GB) 并发分配——cudaMallocHost
++        // 的时间几乎全在逐页锁定上，各线程锁各自的区间 (串行 7.5 s)
++        cudaError_t e_over = cudaSuccess, e_drain = cudaSuccess;
++        std::thread t_over([&] { e_over = cudaMallocHost(&h_overflow_buf, static_cast<size_t>(overflow_cap) * sizeof(edge_chunk::EdgeRecord)); });
++        std::thread t_drain([&] {
++            if (!single_drain) e_drain = cudaMallocHost(&h_drain_buf, capacity_per_chunk * sizeof(edge_chunk::EdgeRecord));
++        });
++        cudaError_t e_fwd = cudaSuccess;
++        if (single_batch) h_fwd_page.reset(new uint32_t[static_cast<size_t>(N) * K_out]);
++        else e_fwd = cudaMallocHost(&h_fwd_batch, static_cast<size_t>(batch_rows) * K_out * sizeof(uint32_t));
++        t_over.join(); t_drain.join();
++        CUDA_CHECK(e_fwd); CUDA_CHECK(e_over); CUDA_CHECK(e_drain);
++    }
+     double t_alloc_pinned = std::chrono::duration<double>(Clock::now() - t_alloc1).count();
+     std::cout << "  [Timing] Alloc: device=" << std::fixed << std::setprecision(2) << t_alloc_device
+               << "s, pinned-host=" << t_alloc_pinned << "s\n";
+@@ -1818,9 +1828,13 @@ static void run_method_E(
+     cudaFree(d_overflow_buf);
+     cudaFree(d_overflow_count);
+     cudaFree(d_fwd_batch);
+-    cudaFreeHost(h_fwd_batch);
+-    cudaFreeHost(h_overflow_buf);
+-    cudaFreeHost(h_drain_buf);
++    // #79: pinned 区的解锁 + 释放 (3.3 s) 放到后台线程，跟 Phase 2 重叠；函数退出前 join
++    struct JoinOnExit { std::thread t; ~JoinOnExit() { if (t.joinable()) t.join(); } } host_free;
++    host_free.t = std::thread([h_fwd_batch, h_overflow_buf, h_drain_buf] {
++        cudaFreeHost(h_fwd_batch);
++        cudaFreeHost(h_overflow_buf);
++        cudaFreeHost(h_drain_buf);
++    });
+     double t_free = std::chrono::duration<double>(Clock::now() - t_free0).count();
+     std::cout << "  [Timing] acc.finish()=" << std::fixed << std::setprecision(2) << t_acc_finish
+               << "s, free buffers=" << t_free << "s\n";
