@@ -35,6 +35,7 @@ After **#72 (float32 Step 6 fused fp16 Tensor Core scan + exact fp32 re-rank)**,
 **Kept on top, not recorded in best.json:** #75 (compact arrival records, parallel encoders) — `runs/tagore82`: sift100M 504.73 s (+4.1%), msTuring100M 793.25 s (+8.6%), msTuring100M max RSS 52.7 GB (best 73.1); judge REJECT only on msTuring10M machine noise (A/B equal, see #75).
 Also kept on top: #77 (Step 4.5 streaming reorder window = max(4 GB, host budget / 2)) — msTuring100M pass3_write 56–61 → 46–49 s; `runs/tagore84`: sift100M 496.97 s (+5.5%), msTuring100M 850.45 s (prune load noise, see #77).
 Also kept on top: #83 (8-bit Step 6 pool gather split over 4 blocks per bucket) — `runs/tagore92`: sift100M 506.75 s (+3.7%), msTuring100M 810.82 s (+6.6%), msTuring10M −2.4% (inside ±3% again); judge REJECT only on sift1M_auto (resident path, untouched).
+Also kept on top: #84 (float32 dev-cache gather writes the s6 fp16 pool + ‖p‖, no `s6_to_f16` pass) — msTuring10M bucket loop r1 −2.5 % in A/B; `runs/tagore94` judge REJECT on load noise.
 
 **Build time (s, median of reps; sum of all stages)**
 
@@ -1647,3 +1648,12 @@ User priority 1 (2026-10-24, "fp16 TC + exact re-rank, Step 6 first"); implement
 - A/B (`runs/tagore91`, sift10M bench params, 2 rounds, interleaved): bucket loop r1 / r2 — split 1: 7.85 / 6.34, 7.83 / 6.26 s; split 8: 7.83 / 6.13, 7.81 / 6.12 s; **split 4: 7.71 / 6.01, 7.65 / 6.01 s**.
 - Bench `runs/tagore92` (load ~4): sift1M_auto −5.8 % (rerun ×3 −3.8 %; resident path, never runs the out-of-core gather; step times equal to the best run, the difference is outside the timed steps), sift1M_large −2.8 %, sift10M +0.9 %, msTuring1M −2.6 %, msTuring10M −2.4 %, sift100M 506.75 s (+3.7 %; Step 6 r1 89.7 → 86.7–88.2 s, r2 74 → 70.6–71.7 s), msTuring100M 810.82 s (+6.6 %, float32 path not touched — #75 / #77). Recall within margins.
 - Decision per #58/#60/#66/#68/#70: kept (byte-identical output, stage gain real); best.json not updated.
+
+### #84 — float32 Step 6: dev-cache pool gather writes the s6 fp16 copy + ‖p‖ (no separate `s6_to_f16` pass) (2026-10-28) — KEPT (judge REJECT on load noise; msTuring10M bucket loop r1 −2.5 %)
+
+- Why: msTuring10M nsys (`runs/tagore88/nsys/m10`, out-of-core Step 6, 1 round): GPU 91 % busy; s6_scan 19.1 s, s6_rerank 7.4 s, gather 6.3 s, s6_own_topk 5.0 s, **s6_to_f16 2.7 s** — the conversion re-reads the whole fp32 pool the gather has just written.
+- Change (`src/bucket.cu`): `devcache_gather_pool_kernel` takes optional `Bh / pn / bad / Dh`; the fp32 branch writes `__float2half_rn(x)` into the s6 fp16 pool (pad columns stay zero from the allocation memset), `pn = sqrtf(‖p‖²)` and the overflow flag, exactly what `s6_to_f16_kernel` computed; `s6_launch(..., bh_ready)` skips the memset + conversion; `bad` is cleared on the stream before the gather. Only with the dev cache (`s6_gather_fused`); `BUCKET2_S6_GATHER_FUSED=0` turns it off.
+- Equivalence (`runs/tagore93/eq`, OMP 1, large path, 3 rounds): msTuring1M and msTuring10M `vector_knn` / `vector_dists` **identical in every row**.
+- A/B (`runs/tagore93/ab`, msTuring10M bench params, 4 rounds, interleaved): bucket loop r1 14.96 / 14.95 → 14.60 / 14.56 s; r2 8.67 / 9.02 → 8.60 / 8.29 s; r4 7.66 / 8.08 → 7.45 / 7.81 s (r3 overlaps the round-1 merge write: 9.6–16.2 s in both).
+- Bench `runs/tagore94` (load 19–35, another user's jobs): msTuring10M −5.8 % (again; see #75 A/B), sift100M 504.04 s (+4.2 %), msTuring100M 856.07 s (+1.4 %; round-1 Step 6 194 / 213 / 145 s vs ~135 s in quiet runs), others within ±3 %; recall within margins; one sift100M rep's GPU peak 15864 MiB (whole-GPU sampler; the other reps 14588 as before).
+- Decision per #58/#60/#66/#68: kept (byte-identical output, stage gain real); best.json not updated.

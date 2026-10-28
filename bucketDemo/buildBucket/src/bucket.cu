@@ -4584,15 +4584,17 @@ static void s6_launch(cudaStream_t st, const float* B, const float* norms, const
                       int bucket_size, int pool_size, int D,
                       __half* Bh, float* pn, int* bad, float* thr, uint32_t* bitmap, unsigned* hist,
                       const float* seed_gid, int64_t seed_n,
-                      int32_t* out_ids, float* out_d, int num_sm)
+                      int32_t* out_ids, float* out_d, int num_sm, bool bh_ready = false)
 {
     float* thr_emit = thr + bucket_size;   // thr: [0, bucket_size) K1 插入阈值, [bucket_size, 2·bucket_size) 置位阈值
     const int Dh = s6_pad16(D);
     const int ncol = pool_size - bucket_size;
     const int W = (ncol + 31) / 32;
-    CUDA_CHECK(cudaMemsetAsync(bad, 0, sizeof(int), st));
-    s6_to_f16_kernel<<<std::min<int64_t>(4 * num_sm, (static_cast<int64_t>(pool_size) * Dh + 255) / 256), 256, 0, st>>>(
-        B, norms, pool_size, D, Dh, Bh, pn, bad);
+    if (!bh_ready) {   // #84: dev 缓存的 gather 已经写好 Bh / pn / bad
+        CUDA_CHECK(cudaMemsetAsync(bad, 0, sizeof(int), st));
+        s6_to_f16_kernel<<<std::min<int64_t>(4 * num_sm, (static_cast<int64_t>(pool_size) * Dh + 255) / 256), 256, 0, st>>>(
+            B, norms, pool_size, D, Dh, Bh, pn, bad);
+    }
     const int Dp = (D + 3) / 4 * 4;
     const size_t own_smem = sizeof(float) * (kS6OwnQ * Dp + 32 * (D + 1));
     s6_own_topk_kernel<K_OUT><<<(bucket_size + kS6OwnQ - 1) / kS6OwnQ, 256, own_smem, st>>>(
@@ -6043,7 +6045,11 @@ __global__ void devcache_scatter_misses_kernel(const char* __restrict__ stage, c
 template <typename DataT, typename OutT>
 __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
                                             OutT* __restrict__ B, int32_t* __restrict__ ids_pool,
-                                            float* __restrict__ norms_pool, int D)
+                                            float* __restrict__ norms_pool, int D,
+                                            // #84 (fp32 + #72 s6): 顺手写 s6 的 fp16 pool (行宽 Dh，补零列不动) + ‖p‖ + 溢出标志，
+                                            // 省掉 s6_to_f16_kernel 再把整个 pool 读一遍 (同一 __float2half_rn / sqrtf)
+                                            __half* __restrict__ Bh = nullptr, float* __restrict__ pn = nullptr,
+                                            int* __restrict__ bad = nullptr, int Dh = 0)
 {
     const DevPoolJob jb = jobs[blockIdx.x];
     const DataT* v = static_cast<const DataT*>(jb.vecs);
@@ -6075,8 +6081,15 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
                 const float* s = src0 + static_cast<int64_t>(r) * src_ld;
                 float* d = dst0 + static_cast<int64_t>(r) * D;
                 float sq = 0.0f;
-                for (int c = 0; c < D; ++c) { float x = s[c]; d[c] = x; sq += x * x; }
+                for (int c = 0; c < D; ++c) {
+                    float x = s[c]; d[c] = x; sq += x * x;
+                    if (Bh) {
+                        Bh[static_cast<int64_t>(jb.dest + r) * Dh + c] = __float2half_rn(x);
+                        if (!(fabsf(x) < 65504.0f)) *bad = 1;
+                    }
+                }
                 norms_pool[jb.dest + r] = sq;
+                if (pn) pn[jb.dest + r] = sqrtf(sq);
                 ids_pool[jb.dest + r] = id_of(r);
             }
             return;
@@ -6099,6 +6112,10 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
                     const int kk = k + u * bd, r = kk / D, c = kk - r * D;
                     tile[r * P + c] = x[u];
                     d[kk] = x[u];
+                    if (Bh) {
+                        Bh[static_cast<int64_t>(jb.dest + t0 + r) * Dh + c] = __float2half_rn(x[u]);
+                        if (!(fabsf(x[u]) < 65504.0f)) *bad = 1;
+                    }
                 }
             }
             for (; k < total; k += bd) {
@@ -6106,6 +6123,10 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
                 const float x = s[r * src_ld + c];
                 tile[r * P + c] = x;
                 d[k] = x;
+                if (Bh) {
+                    Bh[static_cast<int64_t>(jb.dest + t0 + r) * Dh + c] = __float2half_rn(x);
+                    if (!(fabsf(x) < 65504.0f)) *bad = 1;
+                }
             }
             __syncthreads();
             for (int r = threadIdx.x; r < rows; r += bd) {
@@ -6116,6 +6137,7 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
                     sq += x * x;
                 }
                 norms_pool[jb.dest + t0 + r] = sq;
+                if (pn) pn[jb.dest + t0 + r] = sqrtf(sq);
                 ids_pool[jb.dest + t0 + r] = id_of(t0 + r);
             }
             __syncthreads();
@@ -6497,6 +6519,9 @@ void build_vector_knn_with_tensorcore(
     const char* s6_env = std::getenv("BUCKET2_F32_FUSED");
     const bool use_s6 = !kIsInt8Path && D <= kS6MaxDh && !(s6_env && std::string(s6_env) == "0");
     const int s6_Dh = s6_pad16(static_cast<int>(D));
+    // #84: dev 缓存的 gather 直接写 s6 的 fp16 pool + ‖p‖ (BUCKET2_S6_GATHER_FUSED=0 关掉)
+    const bool s6_gather_fused = use_s6 && use_dev_cache &&
+        !(std::getenv("BUCKET2_S6_GATHER_FUSED") && std::getenv("BUCKET2_S6_GATHER_FUSED")[0] == '0');
     const size_t s6_W = (max_pool_size_ub + 31) / 32;
     const size_t bytes_s6_Bh = (max_pool_size_ub + kS6Q) * static_cast<size_t>(s6_Dh) * sizeof(__half);
     const size_t bytes_s6_bits = max_bucket_size * s6_W * sizeof(uint32_t);
@@ -7253,9 +7278,12 @@ void build_vector_knn_with_tensorcore(
                         if (!jobs_mapped)
                             CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
                                                        cudaMemcpyHostToDevice, streams[slot]));
+                        if (s6_gather_fused) CUDA_CHECK(cudaMemsetAsync(d_s6_bad[slot], 0, sizeof(int), streams[slot]));
                         devcache_gather_pool_kernel<DataT, GemmInT><<<dim3(nj, kGatherSplit), 256, 0, streams[slot]>>>(
                             jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]),
-                            d_ids_pool[slot], d_norms_pool[slot], static_cast<int>(D));
+                            d_ids_pool[slot], d_norms_pool[slot], static_cast<int>(D),
+                            s6_gather_fused ? d_s6_Bh[slot] : nullptr, s6_gather_fused ? d_s6_pn[slot] : nullptr,
+                            s6_gather_fused ? d_s6_bad[slot] : nullptr, s6_Dh);
                         CUDA_CHECK(cudaGetLastError());
                         CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));   // job 表读完 (下次重写前等)
                     }
@@ -7408,9 +7436,12 @@ void build_vector_knn_with_tensorcore(
             if (!jobs_mapped)
                 CUDA_CHECK(cudaMemcpyAsync(d_jobs[slot], h_jobs[slot], static_cast<size_t>(nj) * sizeof(DevPoolJob),
                                            cudaMemcpyHostToDevice, streams[slot]));
+            if (s6_gather_fused) CUDA_CHECK(cudaMemsetAsync(d_s6_bad[slot], 0, sizeof(int), streams[slot]));
             devcache_gather_pool_kernel<DataT, GemmInT><<<dim3(nj, kGatherSplit), 256, 0, streams[slot]>>>(
                 jobs_mapped ? h_jobs[slot] : d_jobs[slot], reinterpret_cast<GemmInT*>(d_B[slot]), d_ids_pool[slot],
-                d_norms_pool[slot], static_cast<int>(D));
+                d_norms_pool[slot], static_cast<int>(D),
+                s6_gather_fused ? d_s6_Bh[slot] : nullptr, s6_gather_fused ? d_s6_pn[slot] : nullptr,
+                s6_gather_fused ? d_s6_bad[slot] : nullptr, s6_Dh);
             CUDA_CHECK(cudaGetLastError());
             // 生产者等 ev_h2d 之后才重写 h_jobs[slot]: 映射模式下 kernel 读完才算完
             CUDA_CHECK(cudaEventRecord(ev_h2d[slot], streams[slot]));
@@ -7492,7 +7523,8 @@ void build_vector_knn_with_tensorcore(
             const float* Bf = reinterpret_cast<const float*>(d_B[slot]);
 #define S6_LAUNCH(KV) s6_launch<KV>(streams[slot], Bf, d_norms_pool[slot], d_ids_pool[slot], bucket_size, pool_size, \
                                     static_cast<int>(D), d_s6_Bh[slot], d_s6_pn[slot], d_s6_bad[slot], d_s6_thr[slot], \
-                                    d_s6_bits[slot], d_s6_hist[slot], d_seed_kth, d_seed_kth ? N : 0, oi, od, num_sm)
+                                    d_s6_bits[slot], d_s6_hist[slot], d_seed_kth, d_seed_kth ? N : 0, oi, od, num_sm, \
+                                    s6_gather_fused)
             if      (actual_M == 32)  S6_LAUNCH(32);
             else if (actual_M == 64)  S6_LAUNCH(64);
             else                      S6_LAUNCH(128);
