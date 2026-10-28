@@ -30,49 +30,43 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#72 (float32 Step 6 fused fp16 Tensor Core scan + exact fp32 re-rank)**, 2026-10-27 (`runs/tagore78`; full bench set + msTuring100M ×3, all re-recorded by `judge.py --update`; the vs-best column is against the #70 best). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
-
-**Kept on top, not recorded in best.json:** #75 (compact arrival records, parallel encoders) — `runs/tagore82`: sift100M 504.73 s (+4.1%), msTuring100M 793.25 s (+8.6%), msTuring100M max RSS 52.7 GB (best 73.1); judge REJECT only on msTuring10M machine noise (A/B equal, see #75).
-Also kept on top: #77 (Step 4.5 streaming reorder window = max(4 GB, host budget / 2)) — msTuring100M pass3_write 56–61 → 46–49 s; `runs/tagore84`: sift100M 496.97 s (+5.5%), msTuring100M 850.45 s (prune load noise, see #77).
-Also kept on top: #83 (8-bit Step 6 pool gather split over 4 blocks per bucket) — `runs/tagore92`: sift100M 506.75 s (+3.7%), msTuring100M 810.82 s (+6.6%), msTuring10M −2.4% (inside ±3% again); judge REJECT only on sift1M_auto (resident path, untouched).
-Also kept on top: #84 (float32 dev-cache gather writes the s6 fp16 pool + ‖p‖, no `s6_to_f16` pass) — msTuring10M bucket loop r1 −2.5 % in A/B; `runs/tagore94` judge REJECT on load noise.
-Also kept on top: #85 (float32 s6 round-1 counting scan over the first half of the pool) — `runs/tagore96`: sift100M 495.93 s (+5.7%), msTuring100M 813.18 s (+6.3%), msTuring10M 100.46 s (+0.8%); judge REJECT only on sift1M_auto / sift1M_large (−3.8 / −3.5 %, paths untouched).
+After **#86 (fp32 Step 6 pool gather split over 4 blocks per bucket)**, 2026-10-28 (`runs/tagore99`; full bench set + msTuring100M ×3, re-recorded by `judge.py --update`; the vs-best column is against the #72 best). This is the first accepted bench since #72, so it also records the kept-on-top changes #75 (compact arrival records, parallel encoders), #77 (Step 4.5 reorder window), #83 (8-bit gather split), #84 (fp32 gather writes the s6 fp16 pool), #85 (s6 round-1 counting scan over half the pool). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
 
 **Build time (s, median of reps; sum of all stages)**
 
 | config | path | reps | total | vs best | vs baseline | vs TAGORE | vs CAGRA | stages | GPU peak MiB | max RSS GB |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | resident | 3 | 4.80 | +0.0% | +23.3% | 0.52x | 0.42x | bucket2 4.80 | 4448 | 1.59 |
-| sift1M_large | large | 3 | 7.74 | +3.2% | +20.1% | 0.84x | 0.67x | bucket2 5.87, prune 0.76, optimize_chunked 0.71, translate 0.34 | 1286 | 1.89 |
-| sift10M_auto | large | 3 | 42.34 | +0.3% | +48.6% | 0.20x | 0.35x | bucket2 32.62, prune 4.25, optimize_chunked 2.90, translate 2.57 | 8996 | 10.59 |
-| msTuring1M_auto | resident | 3 | 15.93 | -1.2% | +3.0% | 1.70x | 1.39x | bucket2 15.93 | 5180 | 1.64 |
-| msTuring10M_auto | large | 3 | 101.23 | +15.5% | +57.9% | 0.44x | 0.85x | bucket2 90.66, prune 5.03, optimize_chunked 2.98, translate 2.59 | 8996 | 21.06 |
-| sift100M_auto | large | 3 | 526.05 | -2.5% | +83.6% | 0.24x | 0.71x | bucket2 389.51, prune 42.83, optimize_chunked 69.53, translate 22.37 | 14588 | 38.07 |
-| msTuring100M_auto | large | 3 | 867.92 | -2.0% | +77.9% | 0.40x | 0.72x | bucket2 680.12, prune 91.72, optimize_chunked 73.10, translate 23.85 | 14728 | 73.14 |
+| sift1M_auto | resident | 3 | 4.82 | -0.4% | +23.0% | 0.53x | 0.42x | bucket2 4.82 | 5028 | 1.60 |
+| sift1M_large | large | 3 | 7.68 | +0.8% | +20.7% | 0.84x | 0.67x | bucket2 5.79, prune 0.74, optimize_chunked 0.72, translate 0.38 | 1286 | 1.71 |
+| sift10M_auto | large | 3 | 41.88 | +1.1% | +49.2% | 0.20x | 0.34x | bucket2 32.16, prune 4.27, optimize_chunked 2.89, translate 2.61 | 8996 | 9.66 |
+| msTuring1M_auto | resident | 3 | 15.75 | +1.1% | +4.1% | 1.68x | 1.37x | bucket2 15.75 | 5172 | 1.64 |
+| msTuring10M_auto | large | 3 | 101.86 | -0.6% | +57.7% | 0.44x | 0.86x | bucket2 91.31, prune 5.06, optimize_chunked 2.95, translate 2.57 | 8996 | 20.73 |
+| sift100M_auto | large | 3 | 495.61 | +5.8% | +84.6% | 0.23x | 0.67x | bucket2 363.50, prune 42.88, optimize_chunked 61.79, translate 21.65 | 14588 | 38.07 |
+| msTuring100M_auto | large | 3 | 806.02 | +7.1% | +79.4% | 0.37x | 0.67x | bucket2 613.92, prune 87.01, optimize_chunked 69.18, translate 23.57 | 14728 | 52.63 |
 
 **bucket2 step breakdown (s)**
 
 | config | Step 1 (Load sampled data) | Step 2 (Select centroids) | Step 3 (Centroid KNN graph) | Step 3.5 (Load full dataset) | Step 4 (Batch assignment) | Step 4.5 (Inline reorder, round 1 only) | Step 5 (Write buckets) | Step 6 (Per-vector KNN, merge included) | Wait (final iteration's background merge) | Write (close + .npy convert) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| sift1M_auto | 0.67 | 0.15 | 0.06 | 0.00 | 0.30 | 0.20 | 0.01 | 1.90 | 0.00 | 0.98 |
-| sift1M_large | 0.15 | 0.38 | 0.11 | 0.00 | 1.00 | 0.17 | 0.03 | 2.76 | 0.49 | 0.00 |
-| sift10M_auto | 1.14 | 1.77 | 0.18 | 0.00 | 6.42 | 1.61 | 0.18 | 15.48 | 4.50 | 0.00 |
-| msTuring1M_auto | 0.95 | 0.40 | 0.03 | 0.00 | 0.60 | 0.50 | 0.02 | 11.30 | 0.00 | 0.99 |
-| msTuring10M_auto | 7.60 | 6.13 | 0.26 | 0.00 | 19.99 | 4.04 | 0.22 | 45.63 | 4.44 | 0.00 |
-| sift100M_auto | 11.52 | 5.90 | 2.82 | 0.00 | 120.33 | 27.73 | 3.22 | 184.20 | 26.89 | 0.00 |
-| msTuring100M_auto | 14.29 | 16.57 | 4.26 | 0.00 | 259.63 | 75.51 | 4.22 | 236.94 | 53.93 | 0.00 |
+| sift1M_auto | 0.67 | 0.16 | 0.06 | 0.00 | 0.33 | 0.21 | 0.01 | 1.89 | 0.00 | 0.95 |
+| sift1M_large | 0.16 | 0.33 | 0.14 | 0.00 | 0.92 | 0.17 | 0.02 | 2.77 | 0.49 | 0.00 |
+| sift10M_auto | 1.15 | 1.83 | 0.14 | 0.00 | 6.48 | 1.58 | 0.18 | 14.70 | 4.44 | 0.00 |
+| msTuring1M_auto | 0.92 | 0.40 | 0.03 | 0.00 | 0.54 | 0.49 | 0.01 | 11.19 | 0.00 | 0.98 |
+| msTuring10M_auto | 7.95 | 7.00 | 0.24 | 0.00 | 19.41 | 4.22 | 0.22 | 46.22 | 4.24 | 0.00 |
+| sift100M_auto | 11.85 | 6.45 | 2.64 | 0.00 | 119.48 | 28.72 | 3.01 | 159.57 | 24.49 | 0.00 |
+| msTuring100M_auto | 11.87 | 17.45 | 4.26 | 0.00 | 258.91 | 61.68 | 4.15 | 199.64 | 41.74 | 0.00 |
 
 **(a) pre-prune index (degree 64) vs exact KNN, 10K sampled points**
 
 | config | recall@1 | recall@10 | recall@32 | recall@64 |
 |---|---|---|---|---|
-| sift1M_auto | 0.9362 | 0.9225 | 0.9102 | 0.9015 |
-| sift1M_large | 0.9365 | 0.9227 | 0.9102 | 0.9010 |
-| sift10M_auto | 0.7609 | 0.7233 | 0.6993 | 0.6832 |
-| msTuring1M_auto | 0.9892 | 0.9793 | 0.9654 | 0.9518 |
-| msTuring10M_auto | 0.8093 | 0.7617 | 0.7328 | 0.7119 |
-| sift100M_auto | 0.6481 | 0.6130 | 0.5889 | 0.5723 |
-| msTuring100M_auto | 0.7123 | 0.6563 | 0.6278 | 0.6080 |
+| sift1M_auto | 0.9408 | 0.9242 | 0.9110 | 0.9021 |
+| sift1M_large | 0.9402 | 0.9233 | 0.9110 | 0.9016 |
+| sift10M_auto | 0.7589 | 0.7215 | 0.6994 | 0.6836 |
+| msTuring1M_auto | 0.9898 | 0.9783 | 0.9648 | 0.9505 |
+| msTuring10M_auto | 0.8159 | 0.7658 | 0.7350 | 0.7130 |
+| sift100M_auto | 0.6483 | 0.6125 | 0.5885 | 0.5716 |
+| msTuring100M_auto | 0.7071 | 0.6554 | 0.6273 | 0.6076 |
 
 **(b) final graph (degree 32, original ids), recall@10 / QPS (10K queries); search per datasets.json (cagra: cuVS CAGRA itopk, diskann: DiskANN CPU L)**
 
@@ -90,13 +84,13 @@ Also kept on top: #85 (float32 s6 round-1 counting scan over the first half of t
 | CAGRA CAGRA ACE 64->32, sift100M | 0.7672 / 63K | 0.8697 / 57K | 0.9374 / 34K | 0.9756 / 20K | 0.9917 / 11K |
 | TAGORE largeIndex Vamana (degree 32), msTuring100M | 0.5919 / 31K | 0.7199 / 20K | 0.8166 / 12K | 0.8862 / 7K | 0.9327 / 4K |
 | CAGRA CAGRA ACE 64->32, msTuring100M | 0.6295 / 39K | 0.7513 / 26K | 0.8456 / 16K | 0.9100 / 9K | 0.9511 / 5K |
-| ours sift1M_auto | 0.9257 / 1943K | 0.9761 / 1034K | 0.9941 / 501K | 0.9987 / 187K | 0.9997 / 68K |
-| ours sift1M_large | 0.9243 / 2220K | 0.9750 / 1191K | 0.9936 / 562K | 0.9985 / 189K | 0.9997 / 68K |
-| ours sift10M_auto | 0.8318 / 1867K | 0.9217 / 966K | 0.9697 / 535K | 0.9900 / 186K | 0.9971 / 68K |
-| ours msTuring1M_auto | 0.6584 / 1492K | 0.7879 / 801K | 0.8841 / 370K | 0.9442 / 147K | 0.9770 / 47K |
-| ours msTuring10M_auto | 0.6274 / 1417K | 0.7696 / 774K | 0.8655 / 375K | 0.9266 / 150K | 0.9613 / 47K |
-| ours sift100M_auto | 0.7271 / 80K | 0.8336 / 55K | 0.9114 / 32K | 0.9590 / 17K | 0.9833 / 9K |
-| ours msTuring100M_auto | 0.6115 / 29K | 0.7169 / 30K | 0.8031 / 18K | 0.8697 / 11K | 0.9147 / 6K |
+| ours sift1M_auto | 0.9242 / 1944K | 0.9750 / 1018K | 0.9936 / 532K | 0.9987 / 189K | 0.9997 / 68K |
+| ours sift1M_large | 0.9243 / 2203K | 0.9754 / 1190K | 0.9938 / 562K | 0.9986 / 189K | 0.9997 / 68K |
+| ours sift10M_auto | 0.8318 / 1871K | 0.9208 / 1010K | 0.9691 / 525K | 0.9898 / 186K | 0.9973 / 68K |
+| ours msTuring1M_auto | 0.6582 / 1493K | 0.7907 / 799K | 0.8847 / 371K | 0.9438 / 147K | 0.9767 / 47K |
+| ours msTuring10M_auto | 0.6249 / 1417K | 0.7678 / 732K | 0.8641 / 367K | 0.9261 / 150K | 0.9612 / 47K |
+| ours sift100M_auto | 0.7270 / 51K | 0.8332 / 48K | 0.9099 / 28K | 0.9597 / 16K | 0.9841 / 9K |
+| ours msTuring100M_auto | 0.6123 / 12K | 0.7178 / 20K | 0.8001 / 13K | 0.8677 / 9K | 0.9164 / 5K |
 
 ## Baseline verification
 
@@ -1667,3 +1661,11 @@ User priority 1 (2026-10-24, "fp16 TC + exact re-rank, Step 6 first"); implement
 - Equivalence (`runs/tagore95/eq`, OMP 1, large path, 3 rounds): msTuring1M and msTuring10M `vector_knn` / `vector_dists` **identical in every row**; Step 6 msTuring10M 15.73 / 15.36 → 13.25 / 13.01 s (rounds 1 / 2 — round 2 also had no completed merge to seed from).
 - Bench `runs/tagore96` (first attempt died with `/` 100 % full from this session's side-run leftovers — cleaned, see memory note; rerun, load up to ~39): sift1M_auto −3.8 %, sift1M_large −3.5 % (8-bit paths, untouched), sift10M +0.3 %, msTuring1M −1.9 %, msTuring10M 100.46 s (+0.8 %; 103.6–107.1 s in the previous four benches), sift100M 495.93 s (+5.7 %), msTuring100M 813.18 s (+6.3 %; round-1 Step 6 119 / 138 / 154 s under load). Recall within margins.
 - Decision per #58/#60/#66/#68: kept (byte-identical output, stage gain real); best.json not updated.
+
+### #86 — float32 Step 6 pool gather: shared-memory row tiles split over 4 blocks per bucket (2026-10-28) — ACCEPTED (sift100M 526.05 → 495.61 s +5.8 %, msTuring100M 867.92 → 806.02 s +7.1 %, cumulative with #75/#77/#83/#84/#85)
+
+- Why: msTuring10M nsys after #84/#85 (`runs/tagore97/nsys`, 2 rounds): round 1 GPU 99.7 % busy (s6_scan 14.1, s6_rerank 8.8, gather 6.8, s6_own_topk 4.4 s); round 2 GPU 99.1 % busy with **gather the largest kernel (7.3 s)** — fp32 branch ran one block per bucket job (~65 blocks per pool), each walking ~5 shared-memory row tiles (121 rows) in series.
+- Change (`src/bucket.cu`): fp32 branch loops `t0 = blockIdx.y * TR; t0 += TR * gridDim.y` (slow path likewise per row); `kGatherSplit` (4, `BUCKET2_GATHER_SPLIT`) now applies to both data types. Per-row arithmetic unchanged.
+- A/B (`runs/tagore98`, msTuring10M bench params, 4 rounds, interleaved): bucket loop r1 — split 1: 12.06 / 12.04 s, 4: 11.88 / 11.82 s, 8: 11.92 / 11.94 s; r2 — 8.32 / 8.59, 7.99 / 7.94, 8.08 / 7.85 s; r4 — 7.26 / 7.61, 7.27 / 7.05, 7.29 / 7.26 s (r3 overlaps the round-1 merge write).
+- Equivalence (`runs/tagore98/eq`, OMP 1, large path, 3 rounds): msTuring1M and msTuring10M `vector_knn` / `vector_dists` identical in every row. Side-run intermediates deleted by the scripts (see the 2026-10-28 disk incident in #85).
+- Bench `runs/tagore99`: **ACCEPT** — sift1M_auto −0.4 %, sift1M_large +0.8 %, sift10M +1.1 %, msTuring1M +1.1 %, msTuring10M −0.6 %, **sift100M 495.61 s (+5.8 %)**, **msTuring100M 806.02 s (+7.1 %)**; recall within margins; max RSS sift100M 38.07 GB, msTuring100M 52.63 GB (best 73.1). best.json updated (`--update`).

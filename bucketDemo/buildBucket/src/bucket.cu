@@ -6083,8 +6083,10 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
                        static_cast<const char*>(jb.vecs) + static_cast<int64_t>(r) * jb.stride))
                  : static_cast<int32_t>(jb.gid0 + r);
         };
+        // #86: 行块也按 blockIdx.y 分给 gridDim.y 个 block (原来一个桶一个 block、~5 个行块串行；msTuring10M
+        // 一个 pool ~65 个 block，round 2 这个 kernel 是 GPU 时间第一)；每行的算法不变
         if (TR == 0) {   // D 太大放不下一行: 直接逐线程一行 (慢路径，顺序不变)
-            for (int r = threadIdx.x; r < n; r += bd) {
+            for (int r = threadIdx.x + blockIdx.y * bd; r < n; r += bd * gridDim.y) {
                 const float* s = src0 + static_cast<int64_t>(r) * src_ld;
                 float* d = dst0 + static_cast<int64_t>(r) * D;
                 float sq = 0.0f;
@@ -6101,7 +6103,7 @@ __global__ void devcache_gather_pool_kernel(const DevPoolJob* __restrict__ jobs,
             }
             return;
         }
-        for (int t0 = 0; t0 < n; t0 += TR) {
+        for (int t0 = blockIdx.y * TR; t0 < n; t0 += TR * gridDim.y) {
             const int rows = min(TR, n - t0);
             const int total = rows * D;
             const float* s = src0 + static_cast<int64_t>(t0) * src_ld;
@@ -6314,11 +6316,11 @@ void build_vector_knn_with_tensorcore(
         std::is_same<DataT, int8_t>::value || std::is_same<DataT, uint8_t>::value;
     using GemmInT  = typename std::conditional<kIsInt8Path, __half, float>::type;
     using GemmOutT = float;
-    // #83: 8-bit pool gather 每个桶的 block 数 (fp32 分支按 block 内 shared 行块处理，保持 1)
-    const unsigned kGatherSplit = kIsInt8Path ? [] {
+    // #83 / #86: pool gather 每个桶的 block 数 (8-bit 按行、fp32 按 shared 行块分)
+    const unsigned kGatherSplit = [] {
         const char* e = std::getenv("BUCKET2_GATHER_SPLIT");
         return static_cast<unsigned>(e ? std::max(1, std::atoi(e)) : 4);   // sift10M A/B: 4 最好 (8 / 1 慢)
-    }() : 1u;
+    }();
 
     std::cout << "[VectorKNN] Building per-vector KNN with Tensor Core matmul\n"
               << "  N=" << N << ", D=" << D
