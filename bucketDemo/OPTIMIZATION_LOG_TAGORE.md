@@ -36,6 +36,7 @@ After **#72 (float32 Step 6 fused fp16 Tensor Core scan + exact fp32 re-rank)**,
 Also kept on top: #77 (Step 4.5 streaming reorder window = max(4 GB, host budget / 2)) — msTuring100M pass3_write 56–61 → 46–49 s; `runs/tagore84`: sift100M 496.97 s (+5.5%), msTuring100M 850.45 s (prune load noise, see #77).
 Also kept on top: #83 (8-bit Step 6 pool gather split over 4 blocks per bucket) — `runs/tagore92`: sift100M 506.75 s (+3.7%), msTuring100M 810.82 s (+6.6%), msTuring10M −2.4% (inside ±3% again); judge REJECT only on sift1M_auto (resident path, untouched).
 Also kept on top: #84 (float32 dev-cache gather writes the s6 fp16 pool + ‖p‖, no `s6_to_f16` pass) — msTuring10M bucket loop r1 −2.5 % in A/B; `runs/tagore94` judge REJECT on load noise.
+Also kept on top: #85 (float32 s6 round-1 counting scan over the first half of the pool) — `runs/tagore96`: sift100M 495.93 s (+5.7%), msTuring100M 813.18 s (+6.3%), msTuring10M 100.46 s (+0.8%); judge REJECT only on sift1M_auto / sift1M_large (−3.8 / −3.5 %, paths untouched).
 
 **Build time (s, median of reps; sum of all stages)**
 
@@ -1656,4 +1657,13 @@ User priority 1 (2026-10-24, "fp16 TC + exact re-rank, Step 6 first"); implement
 - Equivalence (`runs/tagore93/eq`, OMP 1, large path, 3 rounds): msTuring1M and msTuring10M `vector_knn` / `vector_dists` **identical in every row**.
 - A/B (`runs/tagore93/ab`, msTuring10M bench params, 4 rounds, interleaved): bucket loop r1 14.96 / 14.95 → 14.60 / 14.56 s; r2 8.67 / 9.02 → 8.60 / 8.29 s; r4 7.66 / 8.08 → 7.45 / 7.81 s (r3 overlaps the round-1 merge write: 9.6–16.2 s in both).
 - Bench `runs/tagore94` (load 19–35, another user's jobs): msTuring10M −5.8 % (again; see #75 A/B), sift100M 504.04 s (+4.2 %), msTuring100M 856.07 s (+1.4 %; round-1 Step 6 194 / 213 / 145 s vs ~135 s in quiet runs), others within ±3 %; recall within margins; one sift100M rep's GPU peak 15864 MiB (whole-GPU sampler; the other reps 14588 as before).
+- Decision per #58/#60/#66/#68: kept (byte-identical output, stage gain real); best.json not updated.
+
+### #85 — float32 Step 6 (s6) round 1: counting scan limited to the first half of the pool (2026-10-28) — KEPT (judge REJECT on sift1M noise; msTuring10M round-1 bucket loop 16.0 → 13.1 s)
+
+- Why: msTuring10M nsys (`runs/tagore88/nsys/m10`): `s6_scan_kernel` 19.1 s of the round's GPU time — in round 1 (no k-th seed) it runs twice per bucket: a counting pass over all pool columns that only serves to tighten each row's flag threshold (histogram of exact-distance upper bounds, first bin edge with ≥ M counts), then the flagging pass.
+- Change (`src/bucket.cu`, `s6_launch`): the counting pass covers pool columns [0, hist_hi) with hist_hi = max(bucket_size, pool_size / 2) (own bucket + the nearest probed buckets); `BUCKET2_S6_HIST_COLS=N` sets N columns, < 0 scans all. Any column subset with ≥ M counted bounds below an edge still bounds the row's M-th exact distance, so the flag threshold stays valid (only looser → K3 re-ranks more columns); the insertion threshold and rule are unchanged → identical result.
+- Sweep (`runs/tagore95`, msTuring10M, 1 round, ×2): all 16.15 / 15.81 s (110 re-ranked / row); 4096 15.61 / 15.68 s (748); 8192 13.93 / 13.81 s (470); 12288 13.21 / 13.25 s (343); 16384 13.15 / 13.09 / 13.00 / 13.36 s (274); 20480 13.19 / 13.20 s (233); 24576 13.39 / 13.37 s (205) → flat optimum 12K–20K; pool ≈ 33K (msTuring10M), 25K (msTuring100M) → default half the pool.
+- Equivalence (`runs/tagore95/eq`, OMP 1, large path, 3 rounds): msTuring1M and msTuring10M `vector_knn` / `vector_dists` **identical in every row**; Step 6 msTuring10M 15.73 / 15.36 → 13.25 / 13.01 s (rounds 1 / 2 — round 2 also had no completed merge to seed from).
+- Bench `runs/tagore96` (first attempt died with `/` 100 % full from this session's side-run leftovers — cleaned, see memory note; rerun, load up to ~39): sift1M_auto −3.8 %, sift1M_large −3.5 % (8-bit paths, untouched), sift10M +0.3 %, msTuring1M −1.9 %, msTuring10M 100.46 s (+0.8 %; 103.6–107.1 s in the previous four benches), sift100M 495.93 s (+5.7 %), msTuring100M 813.18 s (+6.3 %; round-1 Step 6 119 / 138 / 154 s under load). Recall within margins.
 - Decision per #58/#60/#66/#68: kept (byte-identical output, stage gain real); best.json not updated.

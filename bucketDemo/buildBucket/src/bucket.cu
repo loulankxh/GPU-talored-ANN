@@ -4601,27 +4601,34 @@ static void s6_launch(cudaStream_t st, const float* B, const float* norms, const
         B, norms, ids_pool, bucket_size, D, seed_gid, seed_n, out_ids, out_d, thr);
     if (W > 0) {
         const int qblocks = (bucket_size + kS6Q - 1) / kS6Q;
-        auto scan = [&](unsigned* h, const float* t_in, int col_lo) {
-            const int tiles = (pool_size - col_lo + kS6C - 1) / kS6C;
+        // #85: 计数扫描只看 pool 前 hist_cols 列 (自己桶 + 最近的几个探测桶)：任何列子集里累计 ≥ M 的档上沿
+        // 都是第 M 个精确距离的上界，置位阈值仍然成立 (只是可能松一点，K3 多重排几列)；结果不变
+        // 默认 pool 的一半 (msTuring10M 扫 4K…24K 列: 12K–20K 最快，round 1 bucket loop 16.0 → 13.1 s)；
+        // BUCKET2_S6_HIST_COLS=N 指定列数，< 0 扫全部
+        static const int hist_cols_env = [] { const char* e = std::getenv("BUCKET2_S6_HIST_COLS"); return e ? std::atoi(e) : 0; }();
+        auto scan = [&](unsigned* h, const float* t_in, int col_lo, int col_hi) {
+            const int tiles = (col_hi - col_lo + kS6C - 1) / kS6C;
             const int segs = std::max(1, std::min(tiles, (2 * num_sm + qblocks - 1) / qblocks));
             const int tps = (tiles + segs - 1) / segs;
             if (h)
                 s6_scan_kernel<true><<<dim3(qblocks, (tiles + tps - 1) / tps), 256, s6_scan_smem(Dh), st>>>(
-                    Bh, norms, pn, t_in, bucket_size, pool_size, Dh, tps, bitmap, W, h, col_lo);
+                    Bh, norms, pn, t_in, bucket_size, col_hi, Dh, tps, bitmap, W, h, col_lo);
             else
                 s6_scan_kernel<false><<<dim3(qblocks, (tiles + tps - 1) / tps), 256, s6_scan_smem(Dh), st>>>(
-                    Bh, norms, pn, t_in, bucket_size, pool_size, Dh, tps, bitmap, W, h, col_lo);
+                    Bh, norms, pn, t_in, bucket_size, col_hi, Dh, tps, bitmap, W, h, col_lo);
         };
         if (!seed_gid) {   // round 1: 先计数收紧置位阈值
             CUDA_CHECK(cudaMemsetAsync(hist, 0, static_cast<size_t>(bucket_size) * kS6Bins * sizeof(unsigned), st));
-            scan(hist, thr, 0);
+            const int hist_want = hist_cols_env > 0 ? hist_cols_env : hist_cols_env < 0 ? pool_size : pool_size / 2;
+            const int hist_hi = std::min(pool_size, std::max(hist_want, bucket_size));
+            scan(hist, thr, 0, hist_hi);
             s6_hist_thr_kernel<<<(bucket_size + 127) / 128, 128, 0, st>>>(hist, thr, norms, bucket_size, K_OUT, thr_emit);
         } else {
             CUDA_CHECK(cudaMemcpyAsync(thr_emit, thr, static_cast<size_t>(bucket_size) * sizeof(float),
                                        cudaMemcpyDeviceToDevice, st));
         }
         CUDA_CHECK(cudaMemsetAsync(bitmap, 0, static_cast<size_t>(bucket_size) * W * sizeof(uint32_t), st));
-        scan(nullptr, thr_emit, bucket_size);
+        scan(nullptr, thr_emit, bucket_size, pool_size);
     }
     const size_t rr_smem = sizeof(float) * 8 * Dp + sizeof(int32_t) * 8 * 1024;
     s6_rerank_kernel<K_OUT><<<(bucket_size + 7) / 8, 256, rr_smem, st>>>(
