@@ -1,0 +1,15 @@
+diff --git a/bucketDemo/buildBucket/src/translate_ids.cpp b/bucketDemo/buildBucket/src/translate_ids.cpp
+index 02c0dc6..0913366 100644
+--- a/bucketDemo/buildBucket/src/translate_ids.cpp
++++ b/bucketDemo/buildBucket/src/translate_ids.cpp
+@@ -46,7 +46,9 @@ int main(int argc, char** argv)
+                 "inverse_perm.bin (from bucket2's inline reorder, inverse_perm[new_id]=old_id)")
+             ("output,o", po::value<std::string>()->required(),
+                 "Output graph, same format, rows and neighbor ids translated to original order")
+-            ("out-buffer-mb", po::value<size_t>()->default_value(1024),
++            // #80: 1 GB 窗时每一窗都要把整份输入图扫一遍 (100M: 13 窗 × 12.8 GB ≈ 166 GB 读)；16 GB 让
++            // 100M 级的图一遍完成 (translate 在 bucket2 之后单独跑，不抬高整条流水线的内存峰值)
++            ("out-buffer-mb", po::value<size_t>()->default_value(16384),
+                 "Host memory budget (MB) for the output row window (.bin path); "
+                 "graphs larger than this take several passes over the input");
+ 
