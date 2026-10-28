@@ -1,0 +1,71 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index d47bfe9..70d5ca6 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -4350,7 +4350,7 @@ template <bool kHist>
+ __global__ void __launch_bounds__(256, 2) s6_scan_kernel(
+     const __half* __restrict__ Bh, const float* __restrict__ norms, const float* __restrict__ pn,
+     const float* __restrict__ thr, int bucket_size, int pool_size, int Dh, int tiles_per_seg,
+-    uint32_t* __restrict__ bitmap, int W, unsigned* __restrict__ hist, int col_lo)
++    uint32_t* __restrict__ bitmap, int W, unsigned* __restrict__ hist, int col_lo, float bin_scale)
+ {
+     using namespace nvcuda;
+     extern __shared__ __align__(32) unsigned char s6s_smem[];
+@@ -4446,7 +4446,7 @@ __global__ void __launch_bounds__(256, 2) s6_scan_kernel(
+                         if constexpr (kHist) {
+                             const float v = da + qn2 + dl;   // ≥ 精确距离
+                             if (c0 + cc != qg && v <= base) {
+-                                const int b = v > 0.0f ? min(kS6Bins - 1, static_cast<int>(-8.0f * __log2f(v / base))) : kS6Bins - 1;
++                                const int b = v > 0.0f ? min(kS6Bins - 1, static_cast<int>(-bin_scale * __log2f(v / base))) : kS6Bins - 1;
+                                 atomicAdd(&s_hist[my_q * kS6Bins + max(0, b)], 1u);
+                             }
+                         } else if (da <= t_q + dl) {
+@@ -4472,7 +4472,7 @@ __global__ void __launch_bounds__(256, 2) s6_scan_kernel(
+ // (那 M 列的 v ≥ 精确距离且 ≤ 上沿)；只收紧置位阈值 thr_emit，K3 的插入阈值仍是 K1 的 thr。
+ __global__ void s6_hist_thr_kernel(const unsigned* __restrict__ hist, const float* __restrict__ thr,
+                                    const float* __restrict__ norms, int bucket_size, int M,
+-                                   float* __restrict__ thr_emit)
++                                   float* __restrict__ thr_emit, float bin_scale)
+ {
+     const int q = blockIdx.x * blockDim.x + threadIdx.x;
+     if (q >= bucket_size) return;
+@@ -4483,7 +4483,7 @@ __global__ void s6_hist_thr_kernel(const unsigned* __restrict__ hist, const floa
+         for (int b = kS6Bins - 1; b >= 0; --b) {
+             cum += hist[static_cast<int64_t>(q) * kS6Bins + b];
+             if (cum >= static_cast<unsigned>(M)) {
+-                const float u = base * exp2f(-0.125f * b) * 1.000001f + 1e-30f;   // 上沿 (+ 舍入余量)
++                const float u = base * exp2f(-static_cast<float>(b) / bin_scale) * 1.000001f + 1e-30f;   // 上沿 (+ 舍入余量)
+                 te = fminf(te, u - norms[q]);
+                 break;
+             }
+@@ -4605,6 +4605,9 @@ static void s6_launch(cudaStream_t st, const float* B, const float* norms, const
+         // 都是第 M 个精确距离的上界，置位阈值仍然成立 (只是可能松一点，K3 多重排几列)；结果不变
+         // 默认 pool 的一半 (msTuring10M 扫 4K…24K 列: 12K–20K 最快，round 1 bucket loop 16.0 → 13.1 s)；
+         // BUCKET2_S6_HIST_COLS=N 指定列数，< 0 扫全部
++        // #87: 档宽 2^(-1/bin_scale) (原来 8)；最近一档以下的值都记进最后一档 (上沿仍是它们的上界)。msTuring10M round 1:
++        // 8 / 12 / 16 / 24 → 每行重排 164 / 122 / 106 / 93 列，bucket loop 13.4–13.5 → 12.9–13.3 s
++        static const float bin_scale = [] { const char* e = std::getenv("BUCKET2_S6_BIN_SCALE"); return e ? std::max(1.0f, static_cast<float>(std::atof(e))) : 16.0f; }();
+         static const int hist_cols_env = [] { const char* e = std::getenv("BUCKET2_S6_HIST_COLS"); return e ? std::atoi(e) : 0; }();
+         auto scan = [&](unsigned* h, const float* t_in, int col_lo, int col_hi) {
+             const int tiles = (col_hi - col_lo + kS6C - 1) / kS6C;
+@@ -4612,17 +4615,17 @@ static void s6_launch(cudaStream_t st, const float* B, const float* norms, const
+             const int tps = (tiles + segs - 1) / segs;
+             if (h)
+                 s6_scan_kernel<true><<<dim3(qblocks, (tiles + tps - 1) / tps), 256, s6_scan_smem(Dh), st>>>(
+-                    Bh, norms, pn, t_in, bucket_size, col_hi, Dh, tps, bitmap, W, h, col_lo);
++                    Bh, norms, pn, t_in, bucket_size, col_hi, Dh, tps, bitmap, W, h, col_lo, bin_scale);
+             else
+                 s6_scan_kernel<false><<<dim3(qblocks, (tiles + tps - 1) / tps), 256, s6_scan_smem(Dh), st>>>(
+-                    Bh, norms, pn, t_in, bucket_size, col_hi, Dh, tps, bitmap, W, h, col_lo);
++                    Bh, norms, pn, t_in, bucket_size, col_hi, Dh, tps, bitmap, W, h, col_lo, bin_scale);
+         };
+         if (!seed_gid) {   // round 1: 先计数收紧置位阈值
+             CUDA_CHECK(cudaMemsetAsync(hist, 0, static_cast<size_t>(bucket_size) * kS6Bins * sizeof(unsigned), st));
+             const int hist_want = hist_cols_env > 0 ? hist_cols_env : hist_cols_env < 0 ? pool_size : pool_size / 2;
+             const int hist_hi = std::min(pool_size, std::max(hist_want, bucket_size));
+             scan(hist, thr, 0, hist_hi);
+-            s6_hist_thr_kernel<<<(bucket_size + 127) / 128, 128, 0, st>>>(hist, thr, norms, bucket_size, K_OUT, thr_emit);
++            s6_hist_thr_kernel<<<(bucket_size + 127) / 128, 128, 0, st>>>(hist, thr, norms, bucket_size, K_OUT, thr_emit, bin_scale);
+         } else {
+             CUDA_CHECK(cudaMemcpyAsync(thr_emit, thr, static_cast<size_t>(bucket_size) * sizeof(float),
+                                        cudaMemcpyDeviceToDevice, st));
