@@ -1,0 +1,188 @@
+diff --git a/bucketDemo/buildBucket/src/bucket.cu b/bucketDemo/buildBucket/src/bucket.cu
+index 51730c1..1a5fbc0 100644
+--- a/bucketDemo/buildBucket/src/bucket.cu
++++ b/bucketDemo/buildBucket/src/bucket.cu
+@@ -5246,13 +5246,107 @@ struct ChunkedKnnAccumulator {
+     static constexpr size_t record_bytes(int M) {
+         return sizeof(int64_t) + static_cast<size_t>(M) * (sizeof(int32_t) + sizeof(float));
+     }
+-    // arrival 文件里的变长记录: [int64 gid][uint32 cnt][cnt × int32 nbr][cnt × float dist]，
+-    // cnt = 最后一个有效 (nbr ≥ 0) 位置 + 1。后面全是 -1/+inf sentinel，merge 读回时补齐成 M 宽，
+-    // 合并结果跟定长记录完全一样。round 2..t 的 top-M 用 running 第 M 个距离做阈值，大部分行
+-    // 只剩少数有效候选 → 写盘量大减 (SIFT100M round 2 的 scatter 卡在 ~250 MB/s 的盘写上)。
+-    static constexpr size_t kVarHdr = sizeof(int64_t) + sizeof(uint32_t);
+-    static size_t var_record_bytes(uint32_t cnt) {
+-        return kVarHdr + static_cast<size_t>(cnt) * (sizeof(int32_t) + sizeof(float));
++    // arrival 文件里的记录只写到最后一个有效 (nbr ≥ 0) 位置，后面的 -1/+inf sentinel 由 merge 读回时
++    // 补齐成 M 宽，合并结果跟定长记录完全一样。round 2..t 的 top-M 用 running 第 M 个距离做阈值，
++    // 大部分行只剩少数有效候选 → 写盘量大减 (SIFT100M round 2 的 scatter 卡在 ~250 MB/s 的盘写上)。
++    // #74 紧凑 arrival 记录 (无损, merge 读回后逐位相同): 100M 规模整条流水线卡在 ~250 MB/s 的
++    // 盘写上 (msTuring100M 每轮 arrival 40–52 GB)。格式:
++    //   [uint32 gid - chunk 起点][uint16 cnt | 0x8000 = 距离原样存]
++    //   cnt × varint(zigzag(nbr - gid))      重排后近邻的 id 跟 gid 很近
++    //   距离: 升序时第一个 4 B 原样，其余为保序 key 的差 (varint)；不升序就 cnt × 4 B 原样
++    static constexpr size_t kCHdr = sizeof(uint32_t) + sizeof(uint16_t);
++    static constexpr uint16_t kRawDists = 0x8000;
++    static size_t compact_record_max(int M) { return kCHdr + static_cast<size_t>(M) * (5 + 5); }
++    static uint32_t dist_key(float f) {   // 保序映射: a < b ⇔ key(a) < key(b) (非 NaN)
++        uint32_t u; std::memcpy(&u, &f, sizeof(u));
++        return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
++    }
++    static float dist_from_key(uint32_t k) {
++        uint32_t u = (k & 0x80000000u) ? (k & 0x7fffffffu) : ~k;
++        float f; std::memcpy(&f, &u, sizeof(f));
++        return f;
++    }
++    static char* put_varint(char* p, uint32_t v) {
++        while (v >= 0x80) { *p++ = static_cast<char>(v | 0x80); v >>= 7; }
++        *p++ = static_cast<char>(v);
++        return p;
++    }
++    // end 之前读不完一个 varint 就返回 nullptr
++    static const char* get_varint(const char* p, const char* end, uint32_t& v) {
++        v = 0;
++        for (int sh = 0; sh < 35; sh += 7) {
++            if (p >= end) return nullptr;
++            const uint32_t b = static_cast<uint8_t>(*p++);
++            v |= (b & 0x7f) << sh;
++            if (!(b & 0x80)) return p;
++        }
++        return nullptr;
++    }
++    static char* encode_compact(char* dst, uint32_t rel, int64_t gid, uint32_t cnt,
++                                const int32_t* nbrs, const float* dists) {
++        bool sorted = true;
++        for (uint32_t m = 1; m < cnt && sorted; ++m) sorted = dist_key(dists[m - 1]) <= dist_key(dists[m]);
++        const uint16_t hdr = static_cast<uint16_t>(cnt | (sorted ? 0 : kRawDists));
++        std::memcpy(dst, &rel, sizeof(uint32_t));
++        std::memcpy(dst + sizeof(uint32_t), &hdr, sizeof(uint16_t));
++        char* p = dst + kCHdr;
++        for (uint32_t m = 0; m < cnt; ++m) {
++            const int64_t dlt = static_cast<int64_t>(nbrs[m]) - gid;   // |dlt| < 2^31 (N < 2^31)
++            const uint32_t z = static_cast<uint32_t>((static_cast<uint64_t>(dlt) << 1) ^ static_cast<uint64_t>(dlt >> 63));
++            p = put_varint(p, z);
++        }
++        if (!sorted || cnt == 0) {
++            std::memcpy(p, dists, static_cast<size_t>(cnt) * sizeof(float));
++            return p + static_cast<size_t>(cnt) * sizeof(float);
++        }
++        std::memcpy(p, &dists[0], sizeof(float));
++        p += sizeof(float);
++        uint32_t prev = dist_key(dists[0]);
++        for (uint32_t m = 1; m < cnt; ++m) {
++            const uint32_t k = dist_key(dists[m]);
++            p = put_varint(p, k - prev);
++            prev = k;
++        }
++        return p;
++    }
++    // 解出一条记录 (nbrs/dists 补齐到 M 宽)，返回下一条的位置；格式不对返回 nullptr
++    static const char* decode_compact(const char* p, const char* end, int64_t chunk_start, int M,
++                                      int64_t& gid, int32_t* nbrs, float* dists) {
++        if (end - p < static_cast<std::ptrdiff_t>(kCHdr)) return nullptr;
++        uint32_t rel; uint16_t hdr;
++        std::memcpy(&rel, p, sizeof(uint32_t));
++        std::memcpy(&hdr, p + sizeof(uint32_t), sizeof(uint16_t));
++        p += kCHdr;
++        const uint32_t cnt = hdr & ~kRawDists;
++        if (cnt > static_cast<uint32_t>(M)) return nullptr;
++        gid = chunk_start + static_cast<int64_t>(rel);
++        for (uint32_t m = 0; m < cnt; ++m) {
++            uint32_t z;
++            if (!(p = get_varint(p, end, z))) return nullptr;
++            const int64_t dlt = static_cast<int64_t>(z >> 1) ^ -static_cast<int64_t>(z & 1);
++            nbrs[m] = static_cast<int32_t>(gid + dlt);
++        }
++        if ((hdr & kRawDists) || cnt == 0) {
++            if (end - p < static_cast<std::ptrdiff_t>(cnt * sizeof(float))) return nullptr;
++            std::memcpy(dists, p, static_cast<size_t>(cnt) * sizeof(float));
++            p += static_cast<size_t>(cnt) * sizeof(float);
++        } else {
++            if (end - p < static_cast<std::ptrdiff_t>(sizeof(float))) return nullptr;
++            std::memcpy(&dists[0], p, sizeof(float));
++            p += sizeof(float);
++            uint32_t k = dist_key(dists[0]);
++            for (uint32_t m = 1; m < cnt; ++m) {
++                uint32_t dk;
++                if (!(p = get_varint(p, end, dk))) return nullptr;
++                k += dk;
++                dists[m] = dist_from_key(k);
++            }
++        }
++        for (int m = static_cast<int>(cnt); m < M; ++m) {
++            nbrs[m] = -1;
++            dists[m] = std::numeric_limits<float>::infinity();
++        }
++        return p;
+     }
+     uint64_t arrival_bytes = 0;   // 本轮写出的 arrival 字节 (统计；只在写 arrival 的线程上累加)
+ 
+@@ -5315,6 +5409,8 @@ struct ChunkedKnnAccumulator {
+         acc.dir = dir;
+         acc.N = N;
+         acc.M = M;
++        if (M <= 0 || M >= static_cast<int>(kRawDists))
++            throw std::runtime_error("ChunkedKnnAccumulator: M out of range for the compact arrival record");
+ 
+         // ---- chunk 数量/大小：由内存预算 + 本机核心数反推，不再写死常量 ----
+         //
+@@ -5372,7 +5468,7 @@ struct ChunkedKnnAccumulator {
+         acc.bufs.resize(static_cast<size_t>(acc.num_chunks));
+         for (auto& b : acc.bufs) {
+             b.capacity_records = cap_records;
+-            b.data.resize(std::max(cap_records * rec_bytes, var_record_bytes(static_cast<uint32_t>(M))));
++            b.data.resize(std::max(cap_records * rec_bytes, compact_record_max(M)));
+         }
+ 
+         std::cout << "[ChunkedKNN] N=" << N << " M=" << M
+@@ -5412,15 +5508,11 @@ struct ChunkedKnnAccumulator {
+         auto& b = bufs[static_cast<size_t>(c)];
+         uint32_t cnt = static_cast<uint32_t>(M);
+         while (cnt > 0 && nbrs[cnt - 1] < 0) --cnt;
+-        const size_t need = var_record_bytes(cnt);
+-        if (b.count + need > b.data.size()) flush_chunk(c);
++        if (b.count + compact_record_max(M) > b.data.size()) flush_chunk(c);
+         char* dst = b.data.data() + b.count;
+-        std::memcpy(dst, &gid, sizeof(int64_t));
+-        std::memcpy(dst + sizeof(int64_t), &cnt, sizeof(uint32_t));
+-        std::memcpy(dst + kVarHdr, nbrs, static_cast<size_t>(cnt) * sizeof(int32_t));
+-        std::memcpy(dst + kVarHdr + static_cast<size_t>(cnt) * sizeof(int32_t), dists,
+-                    static_cast<size_t>(cnt) * sizeof(float));
+-        b.count += need;
++        const uint32_t rel = static_cast<uint32_t>(gid - c * chunk_size);
++        char* e = encode_compact(dst, rel, gid, cnt, nbrs, dists);
++        b.count += static_cast<size_t>(e - dst);
+     }
+ 
+     void finish_iteration_writes() {
+@@ -5650,22 +5742,15 @@ struct ChunkedKnnAccumulator {
+                 tm.read_arrival += secs_between(ta0, ta1);
+                 t3 = ta1;
+ 
+-                for (size_t off = 0; off < arrival_buf.size(); ++n_file) {
+-                    // 变长记录 (见 var_record_bytes)，读回后补齐成 M 宽 (-1/+inf)
+-                    if (off + kVarHdr > arrival_buf.size())   // bounds check
+-                        throw std::runtime_error("ChunkedKnnAccumulator: truncated arrival record in chunk " + std::to_string(c));
+-                    const char* rp = arrival_buf.data() + off;
+-                    int64_t gid; uint32_t cnt;
+-                    std::memcpy(&gid, rp, sizeof(int64_t));
+-                    std::memcpy(&cnt, rp + sizeof(int64_t), sizeof(uint32_t));
+-                    if (cnt > static_cast<uint32_t>(M) || off + var_record_bytes(cnt) > arrival_buf.size())   // bounds check
++                const char* rp = arrival_buf.data();
++                const char* const rend = rp + arrival_buf.size();
++                while (rp < rend) {
++                    ++n_file;
++                    // 紧凑记录 (见 encode_compact)，读回后补齐成 M 宽 (-1/+inf)；解码带边界检查
++                    int64_t gid;
++                    rp = decode_compact(rp, rend, chunk_start, M, gid, new_nbrs.data(), new_dists.data());
++                    if (!rp)
+                         throw std::runtime_error("ChunkedKnnAccumulator: bad arrival record in chunk " + std::to_string(c));
+-                    std::memcpy(new_nbrs.data(), rp + kVarHdr, static_cast<size_t>(cnt) * sizeof(int32_t));
+-                    std::memcpy(new_dists.data(), rp + kVarHdr + static_cast<size_t>(cnt) * sizeof(int32_t),
+-                                static_cast<size_t>(cnt) * sizeof(float));
+-                    std::fill(new_nbrs.begin() + cnt, new_nbrs.end(), -1);
+-                    std::fill(new_dists.begin() + cnt, new_dists.end(), std::numeric_limits<float>::infinity());
+-                    off += var_record_bytes(cnt);
+                     int64_t pos = gid - chunk_start;
+                     if (pos < 0 || pos >= chunk_c_size) continue;  // 不应该发生，保险起见
+                     merge_one_record(
