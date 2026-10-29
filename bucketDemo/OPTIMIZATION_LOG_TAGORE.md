@@ -30,7 +30,7 @@ Rules (user, 2026-10-22) — **goal: faster SIFT100M build**:
 
 ## Current best
 
-After **#86 (fp32 Step 6 pool gather split over 4 blocks per bucket)**, 2026-10-28 (`runs/tagore99`; full bench set + msTuring100M ×3, re-recorded by `judge.py --update`; the vs-best column is against the #72 best). This is the first accepted bench since #72, so it also records the kept-on-top changes #75 (compact arrival records, parallel encoders), #77 (Step 4.5 reorder window), #83 (8-bit gather split), #84 (fp32 gather writes the s6 fp16 pool), #85 (s6 round-1 counting scan over half the pool). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
+After **#86 (fp32 Step 6 pool gather split over 4 blocks per bucket)**, 2026-10-28 (`runs/tagore99`; full bench set + msTuring100M ×3, re-recorded by `judge.py --update`; the vs-best column is against the #72 best). Kept on top since: #89 (optimize_chunked Phase 1 parallel pread; sift100M Phase 1 −6.5 s; `runs/tagore104` judge REJECT on load noise, sift100M 491.30 s). This is the first accepted bench since #72, so it also records the kept-on-top changes #75 (compact arrival records, parallel encoders), #77 (Step 4.5 reorder window), #83 (8-bit gather split), #84 (fp32 gather writes the s6 fp16 pool), #85 (s6 round-1 counting scan over half the pool). Per-dataset references: `.claude/skills/optimize-bucket2-tagore/docs/summary_2026-10-24.md`.
 
 **Build time (s, median of reps; sum of all stages)**
 
@@ -1671,3 +1671,11 @@ User priority 1 (2026-10-24, "fp16 TC + exact re-rank, Step 6 first"); implement
 - A/B (`runs/tagore98`, msTuring10M bench params, 4 rounds, interleaved): bucket loop r1 — split 1: 12.06 / 12.04 s, 4: 11.88 / 11.82 s, 8: 11.92 / 11.94 s; r2 — 8.32 / 8.59, 7.99 / 7.94, 8.08 / 7.85 s; r4 — 7.26 / 7.61, 7.27 / 7.05, 7.29 / 7.26 s (r3 overlaps the round-1 merge write).
 - Equivalence (`runs/tagore98/eq`, OMP 1, large path, 3 rounds): msTuring1M and msTuring10M `vector_knn` / `vector_dists` identical in every row. Side-run intermediates deleted by the scripts (see the 2026-10-28 disk incident in #85).
 - Bench `runs/tagore99`: **ACCEPT** — sift1M_auto −0.4 %, sift1M_large +0.8 %, sift10M +1.1 %, msTuring1M +1.1 %, msTuring10M −0.6 %, **sift100M 495.61 s (+5.8 %)**, **msTuring100M 806.02 s (+7.1 %)**; recall within margins; max RSS sift100M 38.07 GB, msTuring100M 52.63 GB (best 73.1). best.json updated (`--update`).
+
+### #89 — optimize_chunked Method E Phase 1: forward-graph batches read with `parallel_pread_file` instead of one `ifstream` (2026-10-28) — KEPT (judge REJECT on load noise; sift100M Phase 1 39.9 → 33.4 s)
+
+- Why: Method E Phase 1 handles the forward graph in batches (SIFT100M 7 × 14.6M rows = 1.87 GB each) strictly in series: single-thread `ifstream::read` → sync H2D → scatter kernel → top-K reverse store insert. The read was single-threaded (page-cache copy at ~1–2 GB/s).
+- Change (`src/optimize_chunked.cu`): the multi-batch path reads each batch with the existing `parallel_pread_file` into the same pinned `h_fwd_batch`. Same bytes, same order of everything after.
+- Equivalence + timing (`runs/tagore103/oc.out`, kept sift100M intermediate, interleaved, caches dropped): output **byte-identical**; Phase 1 old 39.83 / 39.95 s, new 33.02 / 33.76 s; optimize_chunked total 73.20 / 72.96 → 65.54 / 67.46 s. Intermediate deleted by the script.
+- Bench `runs/tagore104` (load ~30): sift100M 491.30 s (+0.9 %; Phase 1 30.9 / 32.9 / 26.9 s), msTuring100M 805.76 s (+0.0 %), msTuring10M −6.1 % and sift1M_large −3.3 % (optimize_chunked unchanged there: 3.02 / 0.75 s; bucket2 noise). Recall within margins.
+- Decision per #58/#60/#66/#68: kept (byte-identical output, stage gain real); best.json not updated.

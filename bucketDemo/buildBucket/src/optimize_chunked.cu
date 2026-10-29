@@ -1641,10 +1641,10 @@ static void run_method_E(
                 stg.h2d(d_fwd_batch, h_fwd_page.get(), n_elems * sizeof(uint32_t));
                 h_fwd_page.reset();
             } else {
-            fwd_in.read(reinterpret_cast<char*>(h_fwd_batch),
-                        static_cast<std::streamsize>(n_elems * sizeof(uint32_t)));
-            if (!fwd_in.good())
-                throw std::runtime_error("Method E: failed to read forward graph batch at row " + std::to_string(bs));
+            // #89: 多线程 pread 进 pinned 批缓冲 (原来单线程 ifstream 顺序读，SIFT100M 7 批 × 1.87 GB)；字节相同
+            parallel_pread_file(fwd_path, static_cast<off_t>(sizeof(int64_t) + sizeof(int32_t)) +
+                                              static_cast<off_t>(bs) * K_out * static_cast<off_t>(sizeof(uint32_t)),
+                                n_elems * sizeof(uint32_t), h_fwd_batch);
 
             CUDA_CHECK(cudaMemcpy(d_fwd_batch, h_fwd_batch,
                 n_elems * sizeof(uint32_t), cudaMemcpyHostToDevice));
