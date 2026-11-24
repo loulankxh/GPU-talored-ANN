@@ -19,8 +19,19 @@ struct Sim {
     explicit Sim(int64_t n) : cnt(static_cast<size_t>(n)) { for (auto& c : cnt) c = 0; }
 };
 
+// 批大小是位置 u 的确定性函数 (跟真实系统的 batch_end_of(batch_start) 一样只依赖起点，不依赖历史 /
+// 哪个 worker / 第几次经过)。这对 segment-restart 是必须的: 重放 [lease_begin, 旧 cursor) 时，切出来的
+// 批边界必须跟原来那次完全一样，才能保证 no_resubmit_before 正好落在一个批边界上 (commit() 里有 assert
+// 检查这件事; 这里如果用真随机 rng()，同一个 u 在原始 pass 和重放 pass 会切出不同的批，assert 就会炸)。
+static int64_t det_batch_len(int64_t u, int maxb) {
+    uint64_t h = static_cast<uint64_t>(u) * 2654435761ULL;
+    h ^= h >> 13; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+    return 1 + static_cast<int64_t>(h % static_cast<uint64_t>(maxb));
+}
+
 static void proc_units(SegmentScheduler& S, const Lease& L, Sim& sim, int maxb, int us_per_unit, bool pipelined,
                        std::mt19937& rng) {
+    (void)rng;   // 批大小已经是 u 的确定性函数 (见上)，这个 rng 留着只是不想改调用处的签名
     std::deque<std::pair<int64_t, int64_t>> inflight;
     int64_t u = L.begin;
     const int depth = pipelined ? 6 : 1;
@@ -33,9 +44,9 @@ static void proc_units(SegmentScheduler& S, const Lease& L, Sim& sim, int maxb, 
     for (;;) {
         const int64_t e = S.end_of(L);
         if (u >= e) break;
-        int64_t b = std::min<int64_t>(e, u + 1 + static_cast<int64_t>(rng() % static_cast<unsigned>(maxb)));
+        int64_t b = std::min<int64_t>(e, u + det_batch_len(u, maxb));
         if (g_clip) {   // prune 风格: 先按旧 end 规划一个可能越界的块，may_start_clip 截断
-            b = u + 1 + static_cast<int64_t>(rng() % static_cast<unsigned>(maxb));
+            b = u + det_batch_len(u, maxb);
             b = S.may_start_clip(L, u, b);
             if (b <= u) break;
             if (b > S.end_of(L)) { std::cerr << "FAIL: clip beyond end\n"; ++g_fail; }
@@ -48,12 +59,13 @@ static void proc_units(SegmentScheduler& S, const Lease& L, Sim& sim, int maxb, 
 }
 
 static void run_case(const char* name, int G, bool spot_on, const char* mode, int64_t n, bool pipelined, int events,
-                     bool hard_only = false, bool epochs = false) {
+                     bool hard_only = false, bool epochs = false, const char* recovery = "cursor") {
     std::cout << "=== " << name << " ===\n";
     Client& cl = Client::get();
     if (spot_on) cl.test_enable(G);
     if (mode) setenv("BUCKET2_SPOT_MODE", mode, 1); else unsetenv("BUCKET2_SPOT_MODE");
     setenv("BUCKET2_SPOT_QUIET", "1", 1);
+    setenv("BUCKET2_SPOT_RECOVERY", recovery, 1);   // exp2: "cursor" (默认) 或 "restart"
     bool shared = false;
     auto ws = make_workers(G, &shared);
     auto opt = options_from_env(shared);
@@ -142,9 +154,16 @@ static void run_case(const char* name, int G, bool spot_on, const char* mode, in
     for (auto& c : sim.cnt) { if (c == 0) ++zero; else if (c > 1) ++dup; if (c != 1) ++bad; }
     std::string why;
     CHECK(S.verify_complete(&why), name << ": verify_complete: " << why);
+    // 核心正确性断言 (对两种恢复策略都成立，不止 cursor-resume): 每个单元的 fn 恰好跑一次。segment-restart
+    // 下真的会重算 [lease_begin, 旧 cursor)，但 commit() 必须拦住重复的那一次 fn 调用 —— 这里的 bad==0
+    // 就是在验证这件事：如果拦截逻辑 (no_resubmit_before) 有 bug，某个单元会被数成 2，dup 就会 > 0。
     CHECK(bad == 0, name << ": units committed != 1: missing=" << zero << " duplicated=" << dup);
     CHECK(setups == teardowns, name << ": setup/teardown mismatch");
     CHECK(dev_overlap == 0, name << ": two workers held the same device at once");
+    if (std::string(recovery) == "restart" && spot_on && events > 0)
+        CHECK(S.redone_units() > 0, name << ": segment-restart ran with " << events << " events but redone_units == 0 (mechanism never exercised -- is BUCKET2_SPOT_RECOVERY wired up?)");
+    if (std::string(recovery) != "restart")
+        CHECK(S.redone_units() == 0, name << ": cursor-resume must never suppress a commit (redone_units should stay 0)");
     S.print_stats(std::cout);
 }
 
@@ -173,6 +192,24 @@ int main() {
     unsetenv("BUCKET2_SPOT_MIN_STEAL_S");
     // 7) n = 0
     run_case("empty", 2, true, nullptr, 0, false, 0);
+
+    // --- exp2: segment-restart (BUCKET2_SPOT_RECOVERY=restart). 同样的事件驱动场景，换恢复策略；
+    // run_case 的 bad==0 断言 (每个单元 fn 恰好一次) 和新加的 redone_units 断言一起验证: 重放真的发生了
+    // (redone_units > 0) 且没有重复写 (bad == 0, 即没有一个单元被 fn 算了两次)。
+    run_case("restart_dedicated_g4", 4, true, nullptr, 40000, false, 12, false, false, "restart");
+    run_case("restart_dedicated_g4_pipe", 4, true, nullptr, 40000, true, 12, false, false, "restart");
+    run_case("restart_dedicated_g2", 2, true, nullptr, 30000, true, 8, false, false, "restart");
+    run_case("restart_shared_g1", 1, true, nullptr, 20000, true, 6, false, false, "restart");
+    run_case("restart_shared_g4_hard", 4, true, "shared", 40000, true, 10, true, false, "restart");
+    run_case("restart_epochs_dedicated_g4", 4, true, nullptr, 40000, true, 12, false, true, "restart");
+    run_case("restart_epochs_shared_g1", 1, true, nullptr, 20000, true, 8, false, true, "restart");
+    g_clip = true;
+    setenv("BUCKET2_SPOT_MIN_STEAL_S", "0.002", 1);
+    run_case("restart_clip_dedicated_g4", 4, true, nullptr, 40000, true, 12, false, false, "restart");
+    run_case("restart_clip_epochs_shared_g1", 1, true, nullptr, 20000, true, 8, false, true, "restart");
+    g_clip = false;
+    unsetenv("BUCKET2_SPOT_MIN_STEAL_S");
+
     if (g_fail) { std::cerr << g_fail << " check(s) failed\n"; return 1; }
     std::cout << "ALL PASS\n";
     return 0;

@@ -54,7 +54,9 @@ for rd in sorted(glob.glob(os.path.join(out, "rep*"))):
         ev = open(f).read()
         sp["events"] = {e: len(re.findall(r" inst=\d+ " + e + r" ", ev)) for e in ("notice", "preempt", "join")}
     if sp["stages"] or "events" in sp:
-        for key in ("rejected_units", "preempts", "steals", "setups", "reaped", "drains"):
+        # redone_units: exp2 segment-restart (spot_sched.hpp) -- 0 always under the default cursor-resume
+        # recovery, since nothing is ever replayed/suppressed there.
+        for key in ("rejected_units", "redone_units", "preempts", "steals", "setups", "reaped", "drains"):
             sp[key] = sum(int(x.get(key, 0)) for x in sp["stages"])
         r["spot"] = sp
     reps.append(r)

@@ -247,6 +247,15 @@ struct Options {
     double min_steal_s = 0.0;       // 只偷预计剩余时间 (从 issued 起，按 victim 本租约的每单元 EWMA) ≥ 这么多秒的段
                                     // (每个租约有固定开销的阶段: 小段来回偷比不偷还慢)。victim 还没有提交 (EWMA 未知) → 按代价照偷
     bool   verbose = true;
+
+    // 恢复粒度 (实验: exp2 segment-restart, 2026-11-24)。CursorResume (默认，原行为): 被抢占 / 回收后
+    // [cursor, end) 放回池子，下次从 cursor 继续。SegmentRestart: 放回 [本租约的 begin, end)，下次从本
+    // 租约开始重新计算 — [本租约 begin, 旧 cursor) 这一段会真的在 GPU 上重算一遍，但 commit() 发现这段
+    // 已经提交过 (no_resubmit_before 门槛) 就不再调用 fn，不会重复写入 host 结构 (Step 6 的 append 尤其
+    // 要靠这个门槛，因为它是只增不查重的)。两种策略共用同一个 may_start / steal / commit 路径，唯一区别
+    // 是 grant_locked 发出的 Lease.begin 和 reap/release 时段的回退点。
+    enum class Recovery { CursorResume, SegmentRestart };
+    Recovery recovery = Recovery::CursorResume;
 };
 
 struct Lease {
@@ -284,6 +293,8 @@ public:
             auto s = std::make_unique<Seg>();
             s->begin = s->cursor = s->issued = init_cuts[i];
             s->end = init_cuts[i + 1];
+            s->lease_begin = s->begin;
+            s->no_resubmit_before = s->begin;   // 没有重放过, 门槛就是段起点: 永不触发
             const int o = init_owner[i];
             if (o >= 0 && o < static_cast<int>(workers_.size())) s->reserved_for = o;   // 预留: o 第一次 acquire 时领走
             push_seg(std::move(s));
@@ -295,6 +306,8 @@ public:
     const std::string& stage() const { return stage_; }
     const std::vector<WorkerSpec>& workers() const { return workers_; }
     bool spot_enabled() const { return cl_.enabled(); }
+    // 重放时 commit() 发现已经提交过而跳过 fn 的单元总数 (segment-restart 才会 > 0；cursor-resume 恒 0)
+    int64_t redone_units() const { return redone_units_.load(); }
 
     bool done() const {
         std::lock_guard<std::mutex> lk(gm_);
@@ -402,6 +415,7 @@ public:
         auto& ws = wst_[static_cast<size_t>(L.worker)];
         std::lock_guard<std::mutex> ck(s.cm);   // 提交锁: 回收 (reap) 要等正在进行的提交做完
         int64_t old_cursor;
+        bool suppress;
         {
             std::lock_guard<std::mutex> lk(s.m);
             const auto v = cl_.view(workers_[static_cast<size_t>(L.worker)].inst);
@@ -413,8 +427,19 @@ public:
                 return false;
             }
             old_cursor = s.cursor;
+            // segment-restart 重放: [old_cursor, new_cursor) 之前已经提交过一次 (no_resubmit_before 是上次
+            // 提交时的 cursor)。真的发生了 GPU 重算 (调用方一定跑到这里才能 commit)，但不能让 fn 把同一批
+            // 结果再写一遍 (Step 6 append 只增不查重)。单元粒度在两次经过时确定性相同 (重放从同一个
+            // lease_begin 起步，批 / bucket 边界只是位置的函数)，所以 new_cursor 要么 ≤ no_resubmit_before
+            // 要么 == 它 (不会跨过去)；用 assert 兜底，防止未来某个 proc() 实现违反这个前提却被默默吞掉。
+            suppress = (new_cursor <= s.no_resubmit_before);
+            if (!suppress && old_cursor < s.no_resubmit_before)
+                throw std::runtime_error("spot: commit straddles no_resubmit_before (" + stage_ +
+                                          "): [" + std::to_string(old_cursor) + "," + std::to_string(new_cursor) +
+                                          ") vs " + std::to_string(s.no_resubmit_before));
         }
-        if (fn) fn();
+        if (fn && !suppress) fn();
+        if (suppress) redone_units_.fetch_add(new_cursor - old_cursor);
         const int64_t t = now_ns();
         bool finished;
         {
@@ -445,6 +470,15 @@ public:
         std::lock_guard<std::mutex> ck(s.cm);
         std::lock_guard<std::mutex> sl(s.m);
         if (s.owner == L.worker && s.token == L.token) {
+            // s.cursor < s.end: 这个租约还有没做完的工作就被收回了 (抢占 / 通知期 drain / shared 模式救场
+            // 让出)，不是正常做完一段去领下一段。segment-restart 时把 [本租约 begin, 旧 cursor) 也退回去重算。
+            if (opt_.recovery == Options::Recovery::SegmentRestart && s.cursor < s.end) {
+                if (opt_.verbose && cl_.enabled())
+                    log_line("release: segment-restart redo [" + std::to_string(s.lease_begin) + "," +
+                             std::to_string(s.cursor) + ") (already-committed prefix, output suppressed)");
+                s.no_resubmit_before = std::max(s.no_resubmit_before, s.cursor);
+                s.cursor = s.lease_begin;
+            }
             s.owner = -1;
             s.issued = s.cursor;
             s.drain_logged = false;
@@ -558,8 +592,8 @@ public:
         for (const auto& w : wst_) { rej += w.rejected_units.load(); setups += w.setups.load(); pre += w.preempts.load(); }
         os << "[spot] stage=" << stage_ << " units=" << n_units_ << " segments=" << nsegs_.load()
            << " steals=" << steals_ << " drains=" << drains_ << " reaped=" << reaped_
-           << " preempts=" << pre << " rejected_units=" << rej << " setups=" << setups
-           << std::fixed << std::setprecision(3) << " wall=" << wall << "s\n";
+           << " preempts=" << pre << " rejected_units=" << rej << " redone_units=" << redone_units_.load()
+           << " setups=" << setups << std::fixed << std::setprecision(3) << " wall=" << wall << "s\n";
         for (size_t i = 0; i < wst_.size(); ++i) {
             const auto& w = wst_[i];
             os << "[spot]   " << stage_ << " w" << i << " dev=" << workers_[i].device << (workers_[i].ondemand ? " ondemand" : " spot")
@@ -603,6 +637,9 @@ private:
         int64_t lease_t0 = 0, last_commit_ns = 0;
         double ewma_unit_s = 0;
         bool drain_logged = false;
+        int64_t lease_begin = 0;          // 当前 (或最近一次) 租约的起点; grant_locked 每次授予都重设
+        int64_t no_resubmit_before = 0;   // < 这个位置的 commit 只推进 cursor, 不调用 fn (已经真提交过一次了);
+                                           // segment-restart 回退时设成回退前的 cursor, 偷/切分时原样传给新段
         mutable std::mutex m;    // 段状态
         std::mutex cm;           // 提交锁
     };
@@ -676,6 +713,13 @@ private:
             if (opt_.verbose)
                 log_line("reap w" + std::to_string(owner) + ": [" + std::to_string(s.cursor) + "," + std::to_string(s.end) +
                          ") back to the pool (issued-uncommitted " + std::to_string(s.issued - s.cursor) + " units dropped)");
+            if (opt_.recovery == Options::Recovery::SegmentRestart && s.cursor < s.end) {
+                if (opt_.verbose)
+                    log_line("reap: segment-restart redo [" + std::to_string(s.lease_begin) + "," +
+                             std::to_string(s.cursor) + ") (already-committed prefix, output suppressed)");
+                s.no_resubmit_before = std::max(s.no_resubmit_before, s.cursor);
+                s.cursor = s.lease_begin;
+            }
             s.owner = -1; s.issued = s.cursor; s.drain_logged = false; s.ewma_unit_s = 0; s.last_commit_ns = 0;
             ++reaped_;
         }
@@ -714,11 +758,17 @@ private:
         }
         if (best) {
             std::lock_guard<std::mutex> sl(best->m);
-            if (od && best->end - best->cursor > od_cap + opt_.min_split_units && can_split()) {
+            // segment-restart 重放中的段 (cursor < no_resubmit_before) 不切: 切点是代价/固定份额算出来的，
+            // 不保证落在这个 stage 的"单元"边界上 (Step 4 的 batch_end_of 只是 batch_start 的函数, 不知道
+            // no_resubmit_before 在哪)，切出来的新段可能跟已提交门槛错位。等重放追上 no_resubmit_before
+            // 再切——通常很快 (重放的只是上次被抢占时丢的那一小段)。
+            if (od && best->cursor >= best->no_resubmit_before &&
+                best->end - best->cursor > od_cap + opt_.min_split_units && can_split()) {
                 // on-demand 只拿头部一小段，剩下的仍空闲 (另起一段)
                 auto rest = std::make_unique<Seg>();
                 rest->begin = rest->cursor = rest->issued = best->cursor + od_cap;
                 rest->end = best->end;
+                rest->no_resubmit_before = best->no_resubmit_before;   // 门槛是绝对位置, 跨切分点也要带过去
                 best->end = rest->begin;
                 push_seg(std::move(rest));
             }
@@ -732,6 +782,7 @@ private:
             Seg& s = seg(i);
             std::lock_guard<std::mutex> sl(s.m);
             if (s.owner < 0 || s.owner == w) continue;
+            if (s.cursor < s.no_resubmit_before) continue;   // 同上: 重放中的段不偷, 切点可能跟门槛错位
             const int64_t from = std::max(s.issued, s.cursor);
             if (s.end - from < 2 * opt_.min_split_units) continue;
             if (opt_.min_steal_s > 0) {   // 剩下的预计时间太少，不值得偷 (新租约有固定开销)
@@ -761,6 +812,7 @@ private:
             auto ns = std::make_unique<Seg>();
             ns->begin = ns->cursor = ns->issued = mid;
             ns->end = vic->end;
+            ns->no_resubmit_before = vic->no_resubmit_before;   // 同上: 偷的切点可能落在 victim 的重放门槛之前
             vic->end = mid;
             new_idx = push_seg(std::move(ns));
         }
@@ -777,6 +829,7 @@ private:
     void grant_locked(Seg& s, size_t idx, int w, int64_t t, Lease& L) {   // s.m 已锁
         s.owner = w; s.token = ++token_ctr_; s.lease_t0 = t; s.last_commit_ns = 0; s.ewma_unit_s = 0;
         s.issued = s.cursor; s.drain_logged = false;
+        s.lease_begin = s.cursor;   // 这次租约的起点 (segment-restart 回退目标; cursor-resume 不用这个字段)
         L.seg = static_cast<int>(idx); L.worker = w; L.token = s.token; L.begin = s.cursor;
     }
 
@@ -808,6 +861,7 @@ private:
     int n_spot_ = 0;
     int waiting_spot_ = 0;
     int64_t steals_ = 0, drains_ = 0, reaped_ = 0;
+    std::atomic<int64_t> redone_units_{0};   // 写在 commit() 里, 不持 gm_ 锁 (各段提交并行): 必须是原子的
     mutable std::mutex rate_m_;
     double rate_time_s_ = 0, rate_cost_ = 0;
     int64_t t0_ = 0, last_spot_alive_ns_ = 0;
@@ -851,6 +905,9 @@ inline Options options_from_env(bool shared_mode) {
     if (const char* e = std::getenv("BUCKET2_SPOT_RESCUE_S")) o.rescue_after_s = std::atof(e);
     if (const char* e = std::getenv("BUCKET2_SPOT_QUIET")) o.verbose = e[0] != '1';
     if (const char* e = std::getenv("BUCKET2_SPOT_MIN_STEAL_S")) o.min_steal_s = std::atof(e);
+    // exp2 (segment-restart ablation, 2026-11-24): "cursor" (默认, 不设或设别的值都一样) / "restart"
+    if (const char* e = std::getenv("BUCKET2_SPOT_RECOVERY"))
+        o.recovery = (std::string(e) == "restart") ? Options::Recovery::SegmentRestart : Options::Recovery::CursorResume;
     return o;
 }
 
